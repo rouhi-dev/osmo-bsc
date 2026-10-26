@@ -1,0 +1,133 @@
+
+test_bind
+ osmo_sccp_user_bind(inst, name='msc-0', ssn=254)
+ backend 'local', wraps the bound SCCP user, registered as its priv
+ one allocation (the bsc_sccp_user) below the given ctx
+ get_sccp() and get_bsc_sccp() resolve through the SCCP user and instance
+
+test_bind_fails
+ osmo_sccp_user_bind() failure -> NULL, nothing allocated, priv not touched
+
+test_find
+ bound user found: returns the same bsc_sccp_user (ssn=254 pc=0x123 passed through)
+ no user: returns NULL
+
+test_tx_unitdata_msg
+ library rc=0 -> rc=0; __wrap_osmo_sccp_tx_unitdata_msg called 1 time(s)
+  calling_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  called_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-107 -> rc=-107; __wrap_osmo_sccp_tx_unitdata_msg called 1 time(s)
+  calling_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  called_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-90 -> rc=-90; __wrap_osmo_sccp_tx_unitdata_msg called 1 time(s)
+  calling_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  called_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-22 -> rc=-22; __wrap_osmo_sccp_tx_unitdata_msg called 1 time(s)
+  calling_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  called_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+
+test_tx_conn_req_msg
+ library rc=0 -> rc=0; __wrap_osmo_sccp_tx_conn_req_msg called 1 time(s)
+  conn_id: 0xfffffe
+  calling_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  called_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-107 -> rc=-107; __wrap_osmo_sccp_tx_conn_req_msg called 1 time(s)
+  conn_id: 0xfffffe
+  calling_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  called_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-90 -> rc=-90; __wrap_osmo_sccp_tx_conn_req_msg called 1 time(s)
+  conn_id: 0xfffffe
+  calling_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  called_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-22 -> rc=-22; __wrap_osmo_sccp_tx_conn_req_msg called 1 time(s)
+  conn_id: 0xfffffe
+  calling_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  called_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+
+test_tx_conn_resp
+ library rc=0 -> rc=0; __wrap_osmo_sccp_tx_conn_resp called 1 time(s)
+  resp_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  data: NULL, len 0, passed through
+  resp_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  payload: 6 bytes, equal
+  no allocation left behind
+ library rc=-107 -> rc=-107; __wrap_osmo_sccp_tx_conn_resp called 1 time(s)
+  resp_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  data: NULL, len 0, passed through
+  resp_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  payload: 6 bytes, equal
+  no allocation left behind
+ library rc=-90 -> rc=-90; __wrap_osmo_sccp_tx_conn_resp called 1 time(s)
+  resp_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  data: NULL, len 0, passed through
+  resp_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  payload: 6 bytes, equal
+  no allocation left behind
+ library rc=-22 -> rc=-22; __wrap_osmo_sccp_tx_conn_resp called 1 time(s)
+  resp_addr: same pointer, all 76 bytes equal (presence=0x16 pc=0x3fff ssn=252 gt='123')
+  data: NULL, len 0, passed through
+  resp_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  payload: 6 bytes, equal
+  no allocation left behind
+
+test_tx_data_msg
+ library rc=0 -> rc=0; __wrap_osmo_sccp_tx_data_msg called 1 time(s)
+  conn_id: 0x0
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-107 -> rc=-107; __wrap_osmo_sccp_tx_data_msg called 1 time(s)
+  conn_id: 0x0
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-90 -> rc=-90; __wrap_osmo_sccp_tx_data_msg called 1 time(s)
+  conn_id: 0x0
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+ library rc=-22 -> rc=-22; __wrap_osmo_sccp_tx_data_msg called 1 time(s)
+  conn_id: 0x0
+  payload: 6 bytes, equal
+  msgb: consumed exactly once
+
+test_tx_disconn
+ library rc=0 -> rc=0; __wrap_osmo_sccp_tx_disconn called 1 time(s)
+  conn_id: 0x123456 cause: 0x5a
+  resp_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  resp_addr: NULL, passed through
+ library rc=-107 -> rc=-107; __wrap_osmo_sccp_tx_disconn called 1 time(s)
+  conn_id: 0x123456 cause: 0x5a
+  resp_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  resp_addr: NULL, passed through
+ library rc=-90 -> rc=-90; __wrap_osmo_sccp_tx_disconn called 1 time(s)
+  conn_id: 0x123456 cause: 0x5a
+  resp_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  resp_addr: NULL, passed through
+ library rc=-22 -> rc=-22; __wrap_osmo_sccp_tx_disconn called 1 time(s)
+  conn_id: 0x123456 cause: 0x5a
+  resp_addr: same pointer, all 76 bytes equal (presence=0xf pc=0x123 ssn=254 gt='4912345678')
+  resp_addr: NULL, passed through
+
+test_upcall
+ N-DATA.ind delivered once to the bsc_sccp_user's callback, same primitive, rc=42 returned
+ msgb ownership passed to the callback (freed there, exactly once)
+
+test_unbind
+ osmo_sccp_user_unbind() called once on the wrapped user; bsc_sccp_user freed
+ unbind(NULL) is a no-op
+
+done

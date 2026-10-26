@@ -245,6 +245,7 @@ AC_OUTPUT(
     tests/handover/Makefile
     tests/nanobts_omlattr/Makefile
     tests/paging/Makefile
+    tests/sccp_backend/Makefile
     tests/subscr/Makefile
     doc/Makefile
     doc/examples/Makefile

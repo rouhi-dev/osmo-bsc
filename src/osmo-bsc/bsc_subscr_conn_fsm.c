@@ -49,6 +49,7 @@
 #include <osmocom/mgcp_client/mgcp_client_pool.h>
 #include <osmocom/core/byteswap.h>
 #include <osmocom/bsc/lb.h>
+#include <osmocom/bsc/bsc_sccp_backend.h>
 #include <osmocom/bsc/lcs_loc_req.h>
 #include <osmocom/bsc/vgcs_fsm.h>
 
@@ -395,8 +396,8 @@ static void handle_sccp_n_connect(struct osmo_fsm_inst *fi, struct osmo_scu_prim
 	}
 
 	/* accept the new conn. */
-	if (osmo_sccp_tx_conn_resp(conn->sccp.msc->a.sccp_user, scu_prim->u.connect.conn_id,
-				   &scu_prim->u.connect.called_addr, NULL, 0)) {
+	if (bsc_sccp_tx_conn_resp(conn->sccp.msc->a.sccp_user, scu_prim->u.connect.conn_id,
+				  &scu_prim->u.connect.called_addr, NULL, 0)) {
 		LOGPFSML(fi, LOGL_ERROR, "Cannot send SCCP CONN RESP\n");
 		osmo_fsm_inst_term(fi, OSMO_FSM_TERM_REGULAR, NULL);
 		return;
@@ -1149,7 +1150,7 @@ static void gscon_cleanup(struct osmo_fsm_inst *fi, enum osmo_fsm_term_cause cau
 		LOGPFSML(fi, LOGL_DEBUG, "Disconnecting SCCP\n");
 		struct bsc_msc_data *msc = conn->sccp.msc;
 		/* FIXME: include a proper cause value / error message? */
-		osmo_sccp_tx_disconn(msc->a.sccp_user, conn->sccp.conn.conn_id, &msc->a.bsc_addr, 0);
+		bsc_sccp_tx_disconn(msc->a.sccp_user, conn->sccp.conn.conn_id, &msc->a.bsc_addr, 0);
 		conn->sccp.state = SUBSCR_SCCP_ST_NONE;
 	}
 	if (conn->sccp.conn.conn_id != SCCP_CONN_ID_UNSET && conn->sccp.msc) {

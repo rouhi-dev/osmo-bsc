@@ -7,6 +7,7 @@ SUBDIRS = \
 	handover \
 	nanobts_omlattr \
 	paging \
+	sccp_backend \
 	subscr \
 	$(NULL)
 

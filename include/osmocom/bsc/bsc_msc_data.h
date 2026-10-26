@@ -49,6 +49,7 @@
 
 struct osmo_bsc_rf;
 struct gsm_network;
+struct bsc_sccp_user;
 
 /* Constants for the MSC rate counters */
 enum {
@@ -174,7 +175,7 @@ struct bsc_msc_data {
 		uint32_t cs7_instance;
 		bool cs7_instance_valid;
 		struct osmo_sccp_instance *sccp;
-		struct osmo_sccp_user *sccp_user;
+		struct bsc_sccp_user *sccp_user;
 		struct osmo_ss7_user *mtp_user;
 
 		/* IPA or M3UA or SUA? */

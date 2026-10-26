@@ -40,6 +40,7 @@
 #include <osmocom/bsc/bts.h>
 #include <osmocom/bsc/paging.h>
 #include <osmocom/bsc/bssmap_reset.h>
+#include <osmocom/bsc/bsc_sccp_backend.h>
 #include <osmocom/mgcp_client/mgcp_common.h>
 #include <osmocom/netif/ipa.h>
 
@@ -73,8 +74,8 @@ void osmo_bsc_sigtran_tx_reset(const struct bsc_msc_data *msc)
 		_gsm0808_extend_announce_osmux(msg);
 
 	rate_ctr_inc(rate_ctr_group_get_ctr(msc->msc_ctrs, MSC_CTR_BSSMAP_TX_UDT_RESET));
-	osmo_sccp_tx_unitdata_msg(msc->a.sccp_user, &msc->a.bsc_addr,
-				  &msc->a.msc_addr, msg);
+	bsc_sccp_tx_unitdata_msg(msc->a.sccp_user, &msc->a.bsc_addr,
+				 &msc->a.msc_addr, msg);
 }
 
 /* Send reset-ack to MSC */
@@ -93,8 +94,8 @@ void osmo_bsc_sigtran_tx_reset_ack(const struct bsc_msc_data *msc)
 		_gsm0808_extend_announce_osmux(msg);
 
 	rate_ctr_inc(rate_ctr_group_get_ctr(msc->msc_ctrs, MSC_CTR_BSSMAP_TX_UDT_RESET_ACK));
-	osmo_sccp_tx_unitdata_msg(msc->a.sccp_user, &msc->a.bsc_addr,
-				  &msc->a.msc_addr, msg);
+	bsc_sccp_tx_unitdata_msg(msc->a.sccp_user, &msc->a.bsc_addr,
+				 &msc->a.msc_addr, msg);
 }
 
 /* Find an MSC by its remote SCCP address */
@@ -135,7 +136,7 @@ static int handle_data_from_msc(struct gsm_subscriber_connection *conn, struct m
 
 /* Received unitdata from MSC, use the point code to determine which MSC it is */
 static int handle_unitdata_from_msc(const struct osmo_sccp_addr *msc_addr, struct msgb *msg,
-				    const struct osmo_sccp_user *scu)
+				    const struct bsc_sccp_user *user)
 {
 	struct osmo_ss7_instance *ss7;
 	struct bsc_msc_data *msc = get_msc_by_addr(msc_addr);
@@ -145,7 +146,7 @@ static int handle_unitdata_from_msc(const struct osmo_sccp_addr *msc_addr, struc
 		msg->l3h = msgb_l2(msg);
 		rc = bsc_handle_udt(msc, msg, msgb_l2len(msg));
 	} else {
-		ss7 = osmo_sccp_get_ss7(osmo_sccp_get_sccp(scu));
+		ss7 = osmo_sccp_get_ss7(bsc_sccp_user_get_sccp(user));
 		OSMO_ASSERT(ss7);
 		LOGP(DMSC, LOGL_NOTICE, "incoming unitdata data from unknown remote address: %s\n",
 		     osmo_sccp_addr_name(ss7, msc_addr));
@@ -184,11 +185,10 @@ static int handle_notice_ind(struct osmo_ss7_instance *cs7, const struct osmo_sc
 	return rc;
 }
 
-static int handle_n_connect_from_msc(struct osmo_sccp_user *scu, struct osmo_scu_prim *scu_prim)
+static int handle_n_connect_from_msc(struct bsc_sccp_user *user, struct osmo_scu_prim *scu_prim)
 {
 	struct bsc_msc_data *msc = get_msc_by_addr(&scu_prim->u.connect.calling_addr);
-	struct osmo_sccp_instance *sccp = osmo_sccp_get_sccp(scu);
-	struct bsc_sccp_inst *bsc_sccp = osmo_sccp_get_priv(sccp);
+	struct bsc_sccp_inst *bsc_sccp = bsc_sccp_user_get_bsc_sccp(user);
 	struct gsm_subscriber_connection *conn;
 	int rc = 0;
 
@@ -234,7 +234,7 @@ static int handle_n_connect_from_msc(struct osmo_sccp_user *scu, struct osmo_scu
 
 	return 0;
 refuse:
-	osmo_sccp_tx_disconn(scu, scu_prim->u.connect.conn_id, &scu_prim->u.connect.called_addr, 0);
+	bsc_sccp_tx_disconn(user, scu_prim->u.connect.conn_id, &scu_prim->u.connect.called_addr, 0);
 	return rc;
 }
 
@@ -328,12 +328,11 @@ static void handle_pcstate_ind(struct osmo_ss7_instance *cs7, const struct osmo_
 }
 
 /* Callback function, called by the SCCP stack when data arrives */
-static int sccp_sap_up(struct osmo_prim_hdr *oph, void *_scu)
+static int sccp_sap_up(struct bsc_sccp_user *user, struct osmo_prim_hdr *oph)
 {
 	struct osmo_scu_prim *scu_prim = (struct osmo_scu_prim *)oph;
-	struct osmo_sccp_user *scu = _scu;
-	struct osmo_sccp_instance *sccp = osmo_sccp_get_sccp(scu);
-	struct bsc_sccp_inst *bsc_sccp = osmo_sccp_get_priv(sccp);
+	struct osmo_sccp_instance *sccp = bsc_sccp_user_get_sccp(user);
+	struct bsc_sccp_inst *bsc_sccp = bsc_sccp_user_get_bsc_sccp(user);
 	struct gsm_subscriber_connection *conn;
 	int rc = 0;
 
@@ -341,7 +340,7 @@ static int sccp_sap_up(struct osmo_prim_hdr *oph, void *_scu)
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_UNITDATA, PRIM_OP_INDICATION):
 		/* Handle inbound UNITDATA */
 		DEBUGP(DMSC, "N-UNITDATA.ind(%s)\n", osmo_hexdump(msgb_l2(oph->msg), msgb_l2len(oph->msg)));
-		rc = handle_unitdata_from_msc(&scu_prim->u.unitdata.calling_addr, oph->msg, scu);
+		rc = handle_unitdata_from_msc(&scu_prim->u.unitdata.calling_addr, oph->msg, user);
 		break;
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_NOTICE, PRIM_OP_INDICATION):
@@ -352,7 +351,7 @@ static int sccp_sap_up(struct osmo_prim_hdr *oph, void *_scu)
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_CONNECT, PRIM_OP_INDICATION):
 		/* Handle inbound connections */
 		DEBUGP(DMSC, "N-CONNECT.ind(X->%u)\n", scu_prim->u.connect.conn_id);
-		rc = handle_n_connect_from_msc(scu, scu_prim);
+		rc = handle_n_connect_from_msc(user, scu_prim);
 		break;
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_CONNECT, PRIM_OP_CONFIRM):
@@ -588,8 +587,8 @@ __attribute__((weak)) int osmo_bsc_sigtran_open_conn(struct gsm_subscriber_conne
 	LOG_MSC(msc, LOGL_INFO, "Opening new SCCP connection (id=%u): %s\n",
 		conn_id, osmo_sccp_addr_name(ss7, &msc->a.msc_addr));
 
-	rc = osmo_sccp_tx_conn_req_msg(msc->a.sccp_user, conn_id, &msc->a.bsc_addr,
-				       &msc->a.msc_addr, msg);
+	rc = bsc_sccp_tx_conn_req_msg(msc->a.sccp_user, conn_id, &msc->a.bsc_addr,
+				      &msc->a.msc_addr, msg);
 	if (rc >= 0)
 		conn->sccp.state = SUBSCR_SCCP_ST_WAIT_CONN_CONF;
 
@@ -652,7 +651,7 @@ int osmo_bsc_sigtran_send(struct gsm_subscriber_connection *conn, struct msgb *m
 	LOG_MSC(msc, LOGL_DEBUG, "Sending connection (id=%d) oriented data to MSC: %s (%s)\n",
 		conn_id, osmo_sccp_addr_name(ss7, &msc->a.msc_addr), osmo_hexdump(msg->data, msg->len));
 
-	rc = osmo_sccp_tx_data_msg(msc->a.sccp_user, conn_id, msg);
+	rc = bsc_sccp_tx_data_msg(msc->a.sccp_user, conn_id, msg);
 	if (rc >= 0)
 		rate_ctr_inc(rate_ctr_group_get_ctr(msc->msc_ctrs, MSC_CTR_BSSMAP_TX_SUCCESS));
 	else
@@ -873,11 +872,12 @@ int osmo_bsc_sigtran_init(struct llist_head *mscs)
 				inst_name, osmo_sccp_inst_addr_name(sccp, &msc->a.msc_addr));
 
 			/* Bind SCCP user. Bind only one user per sccp_instance and bsc_addr. */
-			msc->a.sccp_user = osmo_sccp_user_find(sccp, msc->a.bsc_addr.ssn, msc->a.bsc_addr.pc);
+			msc->a.sccp_user = bsc_sccp_user_find(sccp, msc->a.bsc_addr.ssn, msc->a.bsc_addr.pc);
 			LOG_MSC(msc, LOGL_NOTICE, "%s: %s\n", inst_name,
 			     msc->a.sccp_user ? "user already bound for this SCCP instance" : "binding SCCP user");
 			if (!msc->a.sccp_user)
-				msc->a.sccp_user = osmo_sccp_user_bind(sccp, msc_name, sccp_sap_up, msc->a.bsc_addr.ssn);
+				msc->a.sccp_user = bsc_sccp_user_bind(tall_bsc_ctx, sccp, msc_name, sccp_sap_up,
+								      msc->a.bsc_addr.ssn);
 			if (!msc->a.sccp_user)
 				return -EINVAL;
 

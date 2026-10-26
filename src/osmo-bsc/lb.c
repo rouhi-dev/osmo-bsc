@@ -33,6 +33,7 @@
 #include <osmocom/bsc/osmo_bsc_sigtran.h>
 #include <osmocom/bsc/lcs_loc_req.h>
 #include <osmocom/bsc/bssmap_reset.h>
+#include <osmocom/bsc/bsc_sccp_backend.h>
 #include <osmocom/bsc/gsm_data.h>
 
 /* Send reset to SMLC */
@@ -59,8 +60,8 @@ int bssmap_le_tx_reset(void)
 	msg = osmo_bssap_le_enc(&reset);
 
 	rate_ctr_inc(rate_ctr_group_get_ctr(bsc_gsmnet->smlc->ctrs, SMLC_CTR_BSSMAP_LE_TX_UDT_RESET));
-	return osmo_sccp_tx_unitdata_msg(bsc_gsmnet->smlc->sccp_user, &bsc_gsmnet->smlc->bsc_addr,
-					 &bsc_gsmnet->smlc->smlc_addr, msg);
+	return bsc_sccp_tx_unitdata_msg(bsc_gsmnet->smlc->sccp_user, &bsc_gsmnet->smlc->bsc_addr,
+					&bsc_gsmnet->smlc->smlc_addr, msg);
 }
 
 /* Send reset-ack to SMLC */
@@ -81,19 +82,19 @@ int bssmap_le_tx_reset_ack(void)
 	msg = osmo_bssap_le_enc(&reset_ack);
 
 	rate_ctr_inc(rate_ctr_group_get_ctr(bsc_gsmnet->smlc->ctrs, SMLC_CTR_BSSMAP_LE_TX_UDT_RESET_ACK));
-	return osmo_sccp_tx_unitdata_msg(bsc_gsmnet->smlc->sccp_user, &bsc_gsmnet->smlc->bsc_addr,
-					 &bsc_gsmnet->smlc->smlc_addr, msg);
+	return bsc_sccp_tx_unitdata_msg(bsc_gsmnet->smlc->sccp_user, &bsc_gsmnet->smlc->bsc_addr,
+					&bsc_gsmnet->smlc->smlc_addr, msg);
 }
 
 static int handle_unitdata_from_smlc(const struct osmo_sccp_addr *smlc_addr, struct msgb *msg,
-				     const struct osmo_sccp_user *scu)
+				     const struct bsc_sccp_user *user)
 {
 	struct osmo_ss7_instance *ss7;
 	struct bssap_le_pdu bssap_le;
 	struct osmo_bssap_le_err *err = NULL;
 	struct rate_ctr_group *ctrg = bsc_gsmnet->smlc->ctrs;
 
-	ss7 = osmo_sccp_get_ss7(osmo_sccp_get_sccp(scu));
+	ss7 = osmo_sccp_get_ss7(bsc_sccp_user_get_sccp(user));
 	OSMO_ASSERT(ss7);
 
 	if (osmo_sccp_addr_cmp(smlc_addr, &bsc_gsmnet->smlc->smlc_addr, OSMO_SCCP_ADDR_T_MASK)) {
@@ -275,12 +276,11 @@ static void handle_pcstate_ind(struct osmo_ss7_instance *cs7, const struct osmo_
 	}
 }
 
-static int sccp_sap_up(struct osmo_prim_hdr *oph, void *_scu)
+static int sccp_sap_up(struct bsc_sccp_user *user, struct osmo_prim_hdr *oph)
 {
 	struct osmo_scu_prim *scu_prim = (struct osmo_scu_prim *)oph;
-	struct osmo_sccp_user *scu = _scu;
-	struct osmo_sccp_instance *sccp = osmo_sccp_get_sccp(scu);
-	struct bsc_sccp_inst *bsc_sccp = osmo_sccp_get_priv(sccp);
+	struct osmo_sccp_instance *sccp = bsc_sccp_user_get_sccp(user);
+	struct bsc_sccp_inst *bsc_sccp = bsc_sccp_user_get_bsc_sccp(user);
 	struct gsm_subscriber_connection *conn;
 	int rc = 0;
 
@@ -288,7 +288,7 @@ static int sccp_sap_up(struct osmo_prim_hdr *oph, void *_scu)
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_UNITDATA, PRIM_OP_INDICATION):
 		/* Handle inbound UnitData */
 		DEBUGP(DLCS, "N-UNITDATA.ind(%s)\n", osmo_hexdump(msgb_l2(oph->msg), msgb_l2len(oph->msg)));
-		rc = handle_unitdata_from_smlc(&scu_prim->u.unitdata.calling_addr, oph->msg, scu);
+		rc = handle_unitdata_from_smlc(&scu_prim->u.unitdata.calling_addr, oph->msg, user);
 		break;
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_NOTICE, PRIM_OP_INDICATION):
@@ -302,7 +302,7 @@ static int sccp_sap_up(struct osmo_prim_hdr *oph, void *_scu)
 		 * direction: N-CONNECT from SMLC -> BSC, which should never happen. */
 		LOGP(DLCS, LOGL_ERROR, "N-CONNECT.ind(X->%u): inbound connect from SMLC is not expected to happen\n",
 		     scu_prim->u.connect.conn_id);
-		rc = osmo_sccp_tx_disconn(scu, scu_prim->u.connect.conn_id, &scu_prim->u.connect.called_addr, 0);
+		rc = bsc_sccp_tx_disconn(user, scu_prim->u.connect.conn_id, &scu_prim->u.connect.called_addr, 0);
 		break;
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_CONNECT, PRIM_OP_CONFIRM):
@@ -403,8 +403,8 @@ static int lb_open_conn(struct gsm_subscriber_connection *conn, struct msgb *msg
 	LOGPFSMSL(conn->fi, DLCS, LOGL_INFO, "Opening new SCCP connection (id=%u) to SMLC: %s\n", conn_id,
 		  osmo_sccp_addr_name(ss7, &bsc_gsmnet->smlc->smlc_addr));
 
-	rc = osmo_sccp_tx_conn_req_msg(bsc_gsmnet->smlc->sccp_user, conn_id, &bsc_gsmnet->smlc->bsc_addr,
-				       &bsc_gsmnet->smlc->smlc_addr, msg);
+	rc = bsc_sccp_tx_conn_req_msg(bsc_gsmnet->smlc->sccp_user, conn_id, &bsc_gsmnet->smlc->bsc_addr,
+				      &bsc_gsmnet->smlc->smlc_addr, msg);
 	if (rc >= 0) {
 		rate_ctr_inc(rate_ctr_group_get_ctr(bsc_gsmnet->smlc->ctrs, SMLC_CTR_BSSMAP_LE_TX_SUCCESS));
 		conn->lcs.lb.state = SUBSCR_SCCP_ST_WAIT_CONN_CONF;
@@ -428,7 +428,7 @@ void lb_close_conn(struct gsm_subscriber_connection *conn)
 		return;
 	OSMO_ASSERT(conn->lcs.lb.conn.conn_id != SCCP_CONN_ID_UNSET);
 
-	osmo_sccp_tx_disconn(bsc_gsmnet->smlc->sccp_user, conn->lcs.lb.conn.conn_id, &bsc_gsmnet->smlc->bsc_addr, 0);
+	bsc_sccp_tx_disconn(bsc_gsmnet->smlc->sccp_user, conn->lcs.lb.conn.conn_id, &bsc_gsmnet->smlc->bsc_addr, 0);
 
 	conn->lcs.lb.state = SUBSCR_SCCP_ST_NONE;
 	bsc_sccp = osmo_sccp_get_priv(bsc_gsmnet->smlc->sccp);
@@ -466,7 +466,7 @@ int lb_send(struct gsm_subscriber_connection *conn, const struct bssap_le_pdu *b
 	}
 
 	LOGPFSMSL(conn->fi, DLCS, LOGL_DEBUG, "Tx %s\n", osmo_bssap_le_pdu_to_str_c(OTC_SELECT, bssap_le));
-	rc = osmo_sccp_tx_data_msg(bsc_gsmnet->smlc->sccp_user, conn->lcs.lb.conn.conn_id, msg);
+	rc = bsc_sccp_tx_data_msg(bsc_gsmnet->smlc->sccp_user, conn->lcs.lb.conn.conn_id, msg);
 	if (rc >= 0)
 		rate_ctr_inc(rate_ctr_group_get_ctr(bsc_gsmnet->smlc->ctrs, SMLC_CTR_BSSMAP_LE_TX_SUCCESS));
 	else
@@ -644,7 +644,8 @@ static int lb_start(void)
 	LOGP(DLCS, LOGL_NOTICE, "Lb: %s %s: remote (SMLC) SCCP address: %s\n",
 	     inst_name, smlc_name, osmo_sccp_inst_addr_name(sccp, &bsc_gsmnet->smlc->smlc_addr));
 
-	bsc_gsmnet->smlc->sccp_user = osmo_sccp_user_bind(sccp, smlc_name, sccp_sap_up, bsc_gsmnet->smlc->bsc_addr.ssn);
+	bsc_gsmnet->smlc->sccp_user = bsc_sccp_user_bind(tall_bsc_ctx, sccp, smlc_name, sccp_sap_up,
+							 bsc_gsmnet->smlc->bsc_addr.ssn);
 	if (!bsc_gsmnet->smlc->sccp_user)
 		return -EINVAL;
 
@@ -662,7 +663,7 @@ static int lb_stop(void)
 
 	lb_cancel_all();
 	lb_stop_reset_fsm();
-	osmo_sccp_user_unbind(bsc_gsmnet->smlc->sccp_user);
+	bsc_sccp_user_unbind(bsc_gsmnet->smlc->sccp_user);
 	bsc_gsmnet->smlc->sccp_user = NULL;
 	return 0;
 }

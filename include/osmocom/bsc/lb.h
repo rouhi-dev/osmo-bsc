@@ -8,6 +8,7 @@
 
 struct bssap_le_pdu;
 struct gsm_subscriber_connection;
+struct bsc_sccp_user;
 
 enum {
 	SMLC_CTR_BSSMAP_LE_RX_UNKNOWN_PEER,
@@ -40,7 +41,7 @@ struct smlc_config {
 	uint32_t cs7_instance;
 	bool cs7_instance_valid;
 	struct osmo_sccp_instance *sccp;
-	struct osmo_sccp_user *sccp_user;
+	struct bsc_sccp_user *sccp_user;
 
 	struct osmo_sccp_addr bsc_addr;
 	char *bsc_addr_name;

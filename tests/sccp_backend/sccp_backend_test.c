@@ -577,5 +577,7 @@ int main(int argc, char **argv)
 	test_unbind();
 
 	printf("\ndone\n");
+	/* Release the root context, so that a run under LeakSanitizer reports nothing at exit. */
+	talloc_free(ctx);
 	return 0;
 }

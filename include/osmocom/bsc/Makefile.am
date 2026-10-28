@@ -6,6 +6,8 @@ noinst_HEADERS = \
 	abis_rsl.h \
 	acc.h \
 	assignment_fsm.h \
+	aworker_ipc.h \
+	aworker_ipc_link.h \
 	bsc_rll.h \
 	bsc_sccp_backend.h \
 	bsc_stats.h \

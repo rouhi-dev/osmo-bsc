@@ -1,0 +1,247 @@
+C1: main->worker round trips
+  TX_UNITDATA len=0: 162 octets
+  TX_CONN_REQ calling=present len=0: 167 octets
+  TX_CONN_REQ calling=absent len=0: 167 octets
+  TX_CONN_RESP len=0: 94 octets
+  TX_DATA len=0: 22 octets
+  TX_UNITDATA len=1: 163 octets
+  TX_CONN_REQ calling=present len=1: 168 octets
+  TX_CONN_REQ calling=absent len=1: 168 octets
+  TX_CONN_RESP len=1: 95 octets
+  TX_DATA len=1: 23 octets
+  TX_UNITDATA len=2048: 2210 octets
+  TX_CONN_REQ calling=present len=2048: 2215 octets
+  TX_CONN_REQ calling=absent len=2048: 2215 octets
+  TX_CONN_RESP len=2048: 2142 octets
+  TX_DATA len=2048: 2070 octets
+  TX_DISCONN resp=present: 97 octets
+  TX_DISCONN resp=absent: 97 octets
+  USER_BIND: 28 octets
+  USER_UNBIND: 16 octets
+  ECHO_REQ, GOODBYE: decoded by both roles
+C2: worker->main round trips and rebuilt primitives
+  N-CONNECT.ind len=100: 350 octets, primitive rebuilt (connection-oriented allocation)
+  N-CONNECT.cnf len=0: 250 octets, primitive rebuilt (connection-oriented allocation)
+  N-DATA.ind len=255: 285 octets, primitive rebuilt (connection-oriented allocation)
+  N-DISCONNECT.ind len=3: 113 octets, primitive rebuilt (connection-oriented allocation)
+  N-UNITDATA.ind len=2048: 2226 octets, primitive rebuilt (connectionless allocation)
+  N-NOTICE.ind len=7: 181 octets, primitive rebuilt (connectionless allocation)
+  N-STATE.ind len=0: 35 octets, primitive rebuilt (connectionless allocation)
+  N-PCSTATE.ind len=0: 38 octets, primitive rebuilt (connectionless allocation)
+C3: golden vectors
+  HELLO main idx=3 (37):
+    41 57 01 01 00 00 00 15 00 00 00 01 00 00 00 00 01 00 00 03 10 00 08 00 01 02 03 04 08 6f 73 6d
+    6f 2d 62 73 63
+  TX_DATA (25):
+    41 57 01 23 00 00 00 09 00 00 00 02 0a 0b 0c 0d 00 ab cd ef 00 03 01 02 03
+  TX_DISCONN (97):
+    41 57 01 24 00 00 00 51 ff ff ff fe 00 00 00 05 00 00 01 02 01 00 00 00 07 01 04 07 00 00 00 01
+    00 00 00 04 1f 34 39 33 30 31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 36 37 38 39 30 31 32 33
+    34 35 36 37 00 00 12 34 56 00 00 00 fe 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    80
+  SCU_UP N-PCSTATE.ind (38):
+    41 57 01 30 00 00 00 16 00 00 00 00 00 00 00 07 0a 02 00 00 00 00 43 21 00 00 00 06 00 00 00 03
+    00 00 00 05 00 00
+  TX_FAILED (36):
+    41 57 01 31 00 00 00 14 00 00 00 00 00 00 00 09 01 02 03 04 21 02 00 10 00 ab cd ef ff ff ff ea
+    02 00 00 00
+C4: boundaries and C7: msgb ownership on error paths
+  TX_DATA len=2049: -EMSGSIZE
+  TX_UNITDATA len=2049: -EMSGSIZE
+  TX_CONN_REQ len=2049: -EMSGSIZE
+  TX_CONN_RESP len=2049: -EMSGSIZE
+  TX_DATA conn_id=0xffffff: -EINVAL
+  TX_DATA user_ref=0: -EINVAL
+  TX_CONN_RESP without responding address: -EINVAL
+  address with 32 GT digits: -EINVAL
+  address with ssn 256: -EINVAL
+  address with pc 0x1000000: -EINVAL
+  address with unknown presence bit: -EINVAL
+  SCU_UP N-DATA.req: -ENOTSUP
+  SCU_UP N-RESET.ind: -ENOTSUP
+  SCU_UP N-PCSTATE.ind with data: -EINVAL
+  invalid HELLO ident, USER_BIND ssn/name, GOODBYE reason, BIND_RESULT: -EINVAL
+  conn_id 0xfffffe with 2048 octets of data: accepted
+  talloc blocks after error paths: unchanged
+C5/C8/C9: malformed records
+  all 171 truncations of TX_CONN_REQ rejected: yes
+  15 octet record: frame-too-short
+  4097 octet record: frame-too-long
+  bad magic: bad-magic
+  version 0: bad-version
+  version 2: bad-version
+  flags 1: bad-flags
+  body_len + 1: bad-body-len
+  unknown type 0x7f: unknown-type
+  TX_CONN_REQ received by main: wrong-direction
+  SCU_UP received by worker: wrong-direction
+  TX_CONN_REQ with user_ref 0: bad-user-ref
+  HELLO with user_ref 1: bad-user-ref
+  trailing octet: trailing-data
+  USER_BIND body cut at 3 (consistent body_len): truncated
+  conn_id 0xffffff: bad-conn-id
+  address flags 0x03: bad-reserved
+  calling absent but address octets non-zero: bad-addr
+  calling absent, one non-zero octet: bad-addr
+  ADDR unknown presence bit: bad-addr
+  ADDR ri 4: bad-addr
+  ADDR gti 5: bad-addr
+  ADDR digits_len 32: bad-addr
+  ADDR NUL inside digits: bad-addr
+  ADDR digit after digits_len: bad-addr
+  ADDR pc > 0xffffff: bad-addr
+  ADDR ssn 256 + 254: bad-addr
+  ADDR ip octet without IP presence: bad-addr
+  ADDR IPv4 with non-zero octet 5: bad-addr
+  DATA len 2049: data-too-long
+  DATA len beyond record: truncated
+  SCU_UP N-DATA.req: bad-prim
+  SCU_UP N-RESET.ind: bad-prim
+  SCU_UP reserved 1: bad-reserved
+  SCU_UP N-PCSTATE.ind with data: unexpected-data
+  SCU_UP N-STATE.ind user_in_service 2: bad-value
+  SCU_UP N-DISCONNECT.ind originator 3: bad-value
+  HELLO role 3: bad-value
+  HELLO reserved 1: bad-reserved
+  HELLO ident with control character: bad-string
+  HELLO ident_len 65: bad-string
+  HELLO ident_len beyond record: truncated
+  USER_BIND ssn 510: bad-value
+  USER_BIND empty name: bad-string
+  TX_FAILED NOT_EXECUTED/CONN_UNKNOWN for TX_DATA (valid): none
+  TX_FAILED ref_type USER_BIND: bad-value
+  TX_FAILED disposition 3: bad-value
+  TX_FAILED CONN_ID_IN_USE for TX_DATA: bad-value
+  TX_FAILED NOT_EXECUTED with lib_rc != 0: bad-value
+  TX_FAILED NOT_EXECUTED with post_conn: bad-value
+  TX_FAILED EXECUTED_ERROR with lib_rc 0: bad-value
+  TX_FAILED for TX_UNITDATA with a conn_id: bad-conn-id
+  TX_FAILED reserved: bad-reserved
+  TX_FAILED encoder enforces the same contract
+  GOODBYE reason 2: bad-value
+  USER_BIND_RESULT 4: bad-value
+C6: mutation sweep
+  200000 mutated records: 36640 accepted, 163360 rejected, 0 not canonical
+C10: libosmo-sigtran per-operation data limits
+  TX_UNITDATA: max 1139; 1139: 0, 1140: -EMSGSIZE
+  TX_CONN_REQ: max 255; 255: 0, 256: -EMSGSIZE
+  TX_CONN_RESP: max 255; 255: 0, 256: -EMSGSIZE
+  TX_DATA: max 255; 255: 0, 256: -EMSGSIZE
+  TX_DISCONN: max 0; 0: 0, 1: -EMSGSIZE
+  HELLO: -EINVAL, -EINVAL
+  IPA transmit buffer: 1200 octets; SCCP LUDT overhead with two 23 octet addresses: 61 octets
+C11: CS7_INFO
+  count=1: 29 octets, round trip ok
+  count=2: 41 octets, round trip ok
+  count=3: 53 octets, round trip ok
+  count=4: 65 octets, round trip ok
+  count=5: 77 octets, round trip ok
+  count=6: 89 octets, round trip ok
+  count=7: 101 octets, round trip ok
+  count=8: 113 octets, round trip ok
+  direction: worker->main only
+  CS7_INFO 1 entry (29):
+    41 57 01 08 00 00 00 0d 00 00 00 02 00 00 00 00 01 00 00 00 00 00 11 22 00 02 01 00 00
+  encoder refuses: count 0 and 9, proto none and 4, num_as 0, pc > 24 bit, duplicate cs7 id, NULL
+  decoder rejects 8 field violations
+  decoder rejects: truncated body, trailing octets, non-zero user_ref
+L1/L2: handshake, send gating, traffic, ECHO
+  send before handshake: -EBUSY
+  main ready=1, worker ready=1 (idents differ: warning only)
+  main->worker TX_DATA: seq=2, worker rx=1, conn_id=99, len=5, data[0]=0x40
+  worker->main SCU_UP: seq=2, main rx=1, primitive=1, conn_id=99
+  main ECHO_REQ answered by the worker link: main rx type=ECHO_RSP token=0xabcd, worker rx=1
+  main sending SCU_UP (wrong direction): -EINVAL, state ready: yes
+  main sending a HELLO itself: -EINVAL
+  main sending 4 garbage octets: -EINVAL
+  main stats: rx=3 tx_queued=3 tx_written=3 last_written_seq=3
+  talloc blocks after free: unchanged
+L3-L5: incompatible and malformed peers (raw socket peer)
+ peer HELLO with the same role
+  main closed 1 time(s): incompatible, err=0, last_written_seq=0, last_queued_seq=1
+  raw peer: 0 record(s) then EOF
+ peer HELLO with worker index 4
+  main closed 1 time(s): incompatible, err=0, last_written_seq=0, last_queued_seq=1
+  raw peer: 0 record(s) then EOF
+ peer HELLO with different limits
+  main closed 1 time(s): incompatible, err=0, last_written_seq=0, last_queued_seq=1
+  raw peer: 0 record(s) then EOF
+ first record is not a HELLO
+  main closed 1 time(s): no-hello, err=2, last_written_seq=0, last_queued_seq=1
+  raw peer: 0 record(s) then EOF
+ HELLO with seq 2
+  main closed 1 time(s): bad-seq, err=2, last_written_seq=0, last_queued_seq=1
+  raw peer: 0 record(s) then EOF
+ HELLO with version 2
+  main closed 1 time(s): protocol, err=bad-version, last_written_seq=0, last_queued_seq=1
+  raw peer: 0 record(s) then EOF
+ second HELLO
+  main closed 1 time(s): dup-hello, err=0, last_written_seq=1, last_queued_seq=1
+  raw peer: 1 record(s) then EOF
+ sequence gap
+  main closed 1 time(s): bad-seq, err=3, last_written_seq=1, last_queued_seq=1
+  raw peer: 1 record(s) then EOF
+ 4097 octet record
+  main closed 1 time(s): rx-oversize, err=4097, last_written_seq=1, last_queued_seq=1
+  raw peer: 1 record(s) then EOF
+ 6000 octet record (truncated by the kernel)
+  main closed 1 time(s): rx-oversize, err=4097, last_written_seq=1, last_queued_seq=1
+  raw peer: 1 record(s) then EOF
+ 4096 octet malformed record
+  main closed 1 time(s): protocol, err=bad-magic, last_written_seq=1, last_queued_seq=1
+  raw peer: 1 record(s) then EOF
+ record for the wrong direction
+  main closed 1 time(s): protocol, err=wrong-direction, last_written_seq=1, last_queued_seq=1
+  raw peer: 1 record(s) then EOF
+ peer shuts down after its HELLO
+  main closed 1 time(s): peer-eof, err=0, last_written_seq=1, last_queued_seq=1
+  raw peer: 1 record(s) then EOF
+L6/L7: largest valid record, 1000 records in order
+  largest valid record (SCU_UP N-CONNECT.ind + 2048 octets): 2298 octets, received intact: yes
+  1000 records: worker rx=1000, in order: yes, main tx_queued=1001 tx_written=1001
+L8/L9: peer EOF, send after close
+  main closed 1 time(s): peer-eof, err=0, last_written_seq=2, last_queued_seq=2
+  send after close: -ENOTCONN
+  aworker_ipc_link_close() on a closed link: closed_cb not called again
+L10: transmit queue full
+  5th record with a queue of 4: -ENOSPC
+  main closed 1 time(s): tx-queue-full, err=-ENOSPC, last_written_seq=1, last_queued_seq=5
+  worker received 0 of the 4 queued records, then: peer-eof
+  talloc blocks after free: unchanged
+L11: close and free from inside call-backs
+  worker freed itself in rx_cb: worker rx=1, closed_cb=0; main: rx-error (ECONNRESET)
+  worker closed in rx_cb and freed in closed_cb: worker rx=1, closed_cb=1 (local); main: rx-error (ECONNRESET)
+  talloc blocks after free: unchanged
+L12: SIGPIPE
+  alloc with SIGPIPE not ignored: -EPIPE, fd still open: yes
+  main closed 1 time(s): tx-error, err=-EPIPE, last_written_seq=1, last_queued_seq=2
+L13: unsuitable file descriptors
+  AF_UNIX SOCK_STREAM: -EPROTOTYPE, fd open: yes
+  AF_INET SOCK_DGRAM: -EPROTOTYPE, fd open: yes
+  pipe: -ENOTSOCK, fd open: yes
+  invalid role: -EINVAL
+  ident with a control character: -EINVAL
+L14-L19: send failures injected below osmo_io
+ L14: sendmsg() accepts all but one octet
+  injected=1, sendmsg() calls on the fd=1, record seq 3
+  main closed 1 time(s): tx-partial, err=24, last_written_seq=2, last_queued_seq=4
+  worker received 0 of the 2 records
+  worker closed 1 time(s): peer-eof, err=0, last_written_seq=1, last_queued_seq=1
+ L15: sendmsg() returns 0 once
+  injected=1, sendmsg() calls on the fd=3, record seq 3
+  main still ready
+  worker received 2 of the 2 records
+  worker last record: seq=4 data[0]=0x30
+ L16: sendmsg() fails with EAGAIN once
+  injected=1, sendmsg() calls on the fd=3, record seq 3
+  main still ready
+  worker received 2 of the 2 records
+  worker last record: seq=4 data[0]=0x30
+ L17: sendmsg() fails with EMSGSIZE
+  injected=1, sendmsg() calls on the fd=1, record seq 3
+  main closed 1 time(s): tx-error, err=-EMSGSIZE, last_written_seq=2, last_queued_seq=4
+  worker received 0 of the 2 records
+  worker closed 1 time(s): peer-eof, err=0, last_written_seq=1, last_queued_seq=1
+  L19: fault injection active: yes
+talloc blocks at the end: unchanged
+PASSED

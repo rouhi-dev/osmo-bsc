@@ -1,6 +1,7 @@
 SUBDIRS = \
 	abis \
 	acc \
+	aworker_ipc \
 	bsc \
 	codec_pref \
 	gsm0408 \

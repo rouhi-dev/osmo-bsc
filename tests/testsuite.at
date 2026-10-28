@@ -13,6 +13,12 @@ cat $abs_srcdir/acc/acc_test.ok > experr
 AT_CHECK([$abs_top_builddir/tests/acc/acc_test], [], [ignore], [experr])
 AT_CLEANUP
 
+AT_SETUP([aworker_ipc])
+AT_KEYWORDS([aworker_ipc])
+cat $abs_srcdir/aworker_ipc/aworker_ipc_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_ipc/aworker_ipc_test], [], [expout], [ignore])
+AT_CLEANUP
+
 AT_SETUP([bsc])
 AT_KEYWORDS([bsc])
 cat $abs_srcdir/bsc/bsc_test.ok > expout

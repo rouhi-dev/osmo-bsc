@@ -1154,7 +1154,7 @@ static void gscon_cleanup(struct osmo_fsm_inst *fi, enum osmo_fsm_term_cause cau
 		conn->sccp.state = SUBSCR_SCCP_ST_NONE;
 	}
 	if (conn->sccp.conn.conn_id != SCCP_CONN_ID_UNSET && conn->sccp.msc) {
-		struct bsc_sccp_inst *bsc_sccp = osmo_sccp_get_priv(conn->sccp.msc->a.sccp);
+		struct bsc_sccp_inst *bsc_sccp = bsc_sccp_user_get_bsc_sccp(conn->sccp.msc->a.sccp_user);
 		bsc_sccp_inst_unregister_gscon(bsc_sccp, &conn->sccp.conn);
 		conn->sccp.conn.conn_id = SCCP_CONN_ID_UNSET;
 	}

@@ -13,10 +13,22 @@ cat $abs_srcdir/acc/acc_test.ok > experr
 AT_CHECK([$abs_top_builddir/tests/acc/acc_test], [], [ignore], [experr])
 AT_CLEANUP
 
+AT_SETUP([aworker_cfg_scan])
+AT_KEYWORDS([aworker_cfg_scan])
+cat $abs_srcdir/aworker_cfg_scan/aworker_cfg_scan_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_cfg_scan/aworker_cfg_scan_test], [], [expout], [ignore])
+AT_CLEANUP
+
 AT_SETUP([aworker_ipc])
 AT_KEYWORDS([aworker_ipc])
 cat $abs_srcdir/aworker_ipc/aworker_ipc_test.ok > expout
 AT_CHECK([$abs_top_builddir/tests/aworker_ipc/aworker_ipc_test], [], [expout], [ignore])
+AT_CLEANUP
+
+AT_SETUP([aworker_pool])
+AT_KEYWORDS([aworker_pool])
+cat $abs_srcdir/aworker_pool/aworker_pool_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_pool/aworker_pool_test], [], [expout], [ignore])
 AT_CLEANUP
 
 AT_SETUP([bsc])

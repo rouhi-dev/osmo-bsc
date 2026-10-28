@@ -634,9 +634,12 @@ static int msc_signal_handler(unsigned int subsys, unsigned int signal,
 
 int bsc_sccplite_msc_send(struct bsc_msc_data *msc, struct msgb *msg)
 {
-	struct osmo_ss7_instance *ss7 = osmo_sccp_get_ss7(msc->a.sccp);
+	/* SCCPlite only, where the SIGTRAN stack always runs in this process. */
+	struct osmo_ss7_instance *ss7 = osmo_ss7_instance_find(msc->a.cs7_instance);
 	struct osmo_mtp_prim *omp;
 	struct osmo_mtp_transfer_param *param;
+
+	OSMO_ASSERT(ss7);
 
 	/* Wrap into MTP-TRANSFER.req primitive */
 	omp = osmo_mtp_prim_xfer_req_prepend(NULL, msg);

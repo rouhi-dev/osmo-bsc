@@ -40,6 +40,8 @@ include::{srcdir}/chapters/smscb.adoc[]
 
 include::{srcdir}/chapters/mscpool.adoc[]
 
+include::{srcdir}/chapters/aworker-pool.adoc[]
+
 include::./common/chapters/mgwpool.adoc[]
 
 include::{srcdir}/chapters/smlc.adoc[]

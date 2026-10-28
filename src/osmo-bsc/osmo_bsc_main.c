@@ -40,6 +40,8 @@
 #include <osmocom/bsc/smscb.h>
 #include <osmocom/bsc/lb.h>
 #include <osmocom/bsc/meas_feed.h>
+#include <osmocom/bsc/aworker.h>
+#include <osmocom/bsc/aworker_pool.h>
 
 #include <osmocom/ctrl/control_cmd.h>
 #include <osmocom/ctrl/control_if.h>
@@ -79,6 +81,7 @@
 #define _GNU_SOURCE
 #include <getopt.h>
 
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,6 +94,11 @@
 static const char *config_file = "osmo-bsc.cfg";
 static const char *rf_ctrl = NULL;
 static int daemonize = 0;
+
+/* Set by --aworker-*: this process is an A-worker started by an osmo-bsc main process, not a BSC. */
+static int aworker_fd = -1;
+static unsigned int aworker_index;
+static const char *aworker_config = NULL;
 
 static void print_usage(void)
 {
@@ -109,6 +117,12 @@ static void print_help(void)
 	printf("  -c --config-file filename	The config file to use.\n");
 	printf("  -e --log-level number		Set a global loglevel.\n");
 	printf("  -r --rf-ctl NAME		A unix domain socket to listen for cmds.\n");
+
+	printf("\nA-interface worker processes (not for manual use; the osmo-bsc main process passes these\n"
+	       "when it starts a worker of the 'a-worker-pool'):\n");
+	printf("     --aworker-fd N		Run as an A-worker on this IPC socket.\n");
+	printf("     --aworker-index N		Index of this worker in the pool.\n");
+	printf("     --aworker-config file	Config file of this worker (cs7 instances only).\n");
 
 	printf("\nVTY reference generation:\n");
 	printf("     --vty-ref-mode MODE	VTY reference generation mode (e.g. 'expert').\n");
@@ -134,6 +148,24 @@ static void handle_long_options(const char *prog_name, const int long_option)
 			get_value_string(vty_ref_gen_mode_desc, vty_ref_mode));
 		vty_dump_xml_ref_mode(stdout, (enum vty_ref_gen_mode) vty_ref_mode);
 		exit(0);
+	case 3: {
+		char *end = NULL;
+		long fd = strtol(optarg, &end, 10);
+		/* 0, 1 and 2 are the standard streams; the main process always passes a socket above them. */
+		if (!end || *end || fd < 3 || fd > INT_MAX) {
+			fprintf(stderr, "%s: --aworker-fd needs a file descriptor above 2, not '%s'\n",
+				prog_name, optarg);
+			exit(2);
+		}
+		aworker_fd = (int)fd;
+		break;
+	}
+	case 4:
+		aworker_index = atoi(optarg);
+		break;
+	case 5:
+		aworker_config = optarg;
+		break;
 	default:
 		fprintf(stderr, "%s: error parsing cmdline options\n", prog_name);
 		exit(2);
@@ -157,6 +189,9 @@ static void handle_options(int argc, char **argv)
 			{"rf-ctl", 1, 0, 'r'},
 			{"vty-ref-mode", 1, &long_option, 1},
 			{"vty-ref-xml", 0, &long_option, 2},
+			{"aworker-fd", 1, &long_option, 3},
+			{"aworker-index", 1, &long_option, 4},
+			{"aworker-config", 1, &long_option, 5},
 			{0, 0, 0, 0}
 		};
 
@@ -511,9 +546,8 @@ static int inp_sig_cb(unsigned int subsys, unsigned int signal,
 	return 0;
 }
 
-static int bsc_network_configure(const char *config_file)
+static int bsc_read_config(const char *config_file)
 {
-	struct gsm_bts *bts;
 	int rc;
 
 	rc = vty_read_config_file(config_file, NULL);
@@ -521,6 +555,15 @@ static int bsc_network_configure(const char *config_file)
 		LOGP(DNM, LOGL_FATAL, "Failed to parse the config file: '%s' (%s)\n", config_file, strerror(-rc));
 		return rc;
 	}
+	return 0;
+}
+
+/* Everything that opens a socket of this process. The A-workers are started before this, so that they cannot
+ * inherit any of it. */
+static int bsc_network_bootstrap(void)
+{
+	struct gsm_bts *bts;
+	int rc;
 
 	/* start telnet after reading config for vty_get_bind_addr() */
 	rc = telnet_init_default(tall_bsc_ctx, bsc_gsmnet, OSMO_VTY_PORT_NITB_BSC);
@@ -827,6 +870,11 @@ static const struct log_info_cat osmo_bsc_categories[] = {
 		.color = "\033[0;34m",
 		.enabled = 1, .loglevel = LOGL_NOTICE,
 	},
+	[DAWORKER] = {
+		.name = "DAWORKER",
+		.description = "A-interface worker pool (SIGTRAN worker processes and their IPC)",
+		.enabled = 1, .loglevel = LOGL_NOTICE,
+	},
 };
 
 static int filter_fn(const struct log_context *ctx, struct log_target *tar)
@@ -941,9 +989,24 @@ int main(int argc, char **argv)
 	OSMO_ASSERT(osmo_ss7_init() == 0);
 	osmo_ss7_vty_init_asp(tall_bsc_ctx);
 	osmo_sccp_vty_init();
+	aworker_pool_vty_init();
 
 	/* parse options */
 	handle_options(argc, argv);
+
+	/* An A-worker shares nothing with the main process: it reads its own config file (cs7 instances only),
+	 * owns their SIGTRAN stacks and does not open any of the BSC's own sockets. This never returns. */
+	if (aworker_fd >= 0) {
+		if (!aworker_config) {
+			fprintf(stderr, "--aworker-fd requires --aworker-config\n");
+			exit(2);
+		}
+		aworker_run(aworker_fd, aworker_index, aworker_config);
+	}
+	if (aworker_config) {
+		fprintf(stderr, "--aworker-config requires --aworker-fd\n");
+		exit(2);
+	}
 
 	/* seed the PRNG */
 	srand(time(NULL));
@@ -954,8 +1017,47 @@ int main(int argc, char **argv)
 	smscb_global_init();
 	meas_feed_txqueue_max_length_set(MEAS_FEED_TXQUEUE_MAX_LEN_DEFAULT);
 
+	/* Refuse a configuration that would make the main process open the SCTP associations the A-workers own.
+	 * This runs before the file is parsed, because parsing an 'asp' node is what starts it. */
+	rc = aworker_pool_prescan_config(config_file);
+	if (rc == -EINVAL) {
+		exit(1);
+	} else if (rc < 0) {
+		fprintf(stderr, "Cannot read the config file '%s': %s\n", config_file, strerror(-rc));
+		exit(1);
+	}
+
 	/* Read the config */
-	rc = bsc_network_configure(config_file);
+	rc = bsc_read_config(config_file);
+	if (rc < 0) {
+		fprintf(stderr, "Bootstrapping the network failed. exiting.\n");
+		exit(1);
+	}
+
+	/* Start the A-workers now: this process has not opened any socket of its own yet, so a worker -- which
+	 * is fork()ed and exec()ed here -- cannot inherit one. */
+	if (aworker_pool_enabled()) {
+		if (daemonize) {
+			fprintf(stderr, "'a-worker-pool' cannot be used with -D / --daemonize: daemonizing"
+					" forks away the parent process of the workers, which could then"
+					" neither be collected nor restarted. Run osmo-bsc in the foreground"
+					" (systemd 'Type=simple'). exiting.\n");
+			exit(1);
+		}
+		if (aworker_pool_check_main_cs7() < 0) {
+			fprintf(stderr, "The A-worker pool configuration is inconsistent. exiting.\n");
+			exit(1);
+		}
+		/* The IPC link refuses to run unless SIGPIPE is ignored. */
+		osmo_init_ignore_signals();
+		aworker_pool_set_exec(argv[0], argc, argv);
+		if (aworker_pool_start(tall_bsc_ctx) < 0) {
+			fprintf(stderr, "Failed to start the A-worker pool. exiting.\n");
+			exit(1);
+		}
+	}
+
+	rc = bsc_network_bootstrap();
 	if (rc < 0) {
 		fprintf(stderr, "Bootstrapping the network failed. exiting.\n");
 		exit(1);
@@ -1056,5 +1158,9 @@ int main(int argc, char **argv)
 		osmo_select_main_ctx(0);
 	}
 
-	return 0;
+	/* Send GOODBYE to the A-workers and collect them, so that no worker outlives osmo-bsc. */
+	aworker_pool_stop();
+
+	/* A shutdown forced by a worker that could not be kept running is a failure, not a clean stop. */
+	return aworker_pool_shutdown_was_fatal() ? 1 : 0;
 }

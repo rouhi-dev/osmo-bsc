@@ -3266,11 +3266,14 @@ DEFUN(show_mscs,
 {
 	struct bsc_msc_data *msc;
 	llist_for_each_entry(msc, &bsc_gsmnet->mscs, entry) {
+		/* Take the cs7 instance from the configuration: with an A-worker pool the SCCP instance of this
+		 * cs7 instance lives in a worker process, not here. */
+		const struct osmo_ss7_instance *ss7 = osmo_ss7_instance_find(msc->a.cs7_instance);
 		vty_out(vty, "MSC %d: %s <-> ",
 			msc->a.cs7_instance,
-			osmo_sccp_inst_addr_name(msc->a.sccp, &msc->a.bsc_addr));
+			osmo_sccp_addr_name(ss7, &msc->a.bsc_addr));
 		vty_out(vty, "%s%s",
-			osmo_sccp_inst_addr_name(msc->a.sccp, &msc->a.msc_addr),
+			osmo_sccp_addr_name(ss7, &msc->a.msc_addr),
 			VTY_NEWLINE);
 		vty_out(vty, "       ASP protocol: %s%s",
 			osmo_ss7_asp_protocol_name(msc->a.asp_proto),

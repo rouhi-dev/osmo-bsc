@@ -31,6 +31,7 @@ enum {
 	DASCI,
 	DRESET,
 	DLOOP,
+	DAWORKER,
 	Debug_LastEntry,
 };
 

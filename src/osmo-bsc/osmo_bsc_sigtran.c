@@ -41,6 +41,7 @@
 #include <osmocom/bsc/paging.h>
 #include <osmocom/bsc/bssmap_reset.h>
 #include <osmocom/bsc/bsc_sccp_backend.h>
+#include <osmocom/bsc/aworker_pool.h>
 #include <osmocom/mgcp_client/mgcp_common.h>
 #include <osmocom/netif/ipa.h>
 
@@ -146,7 +147,7 @@ static int handle_unitdata_from_msc(const struct osmo_sccp_addr *msc_addr, struc
 		msg->l3h = msgb_l2(msg);
 		rc = bsc_handle_udt(msc, msg, msgb_l2len(msg));
 	} else {
-		ss7 = osmo_sccp_get_ss7(bsc_sccp_user_get_sccp(user));
+		ss7 = bsc_sccp_user_get_ss7(user);
 		OSMO_ASSERT(ss7);
 		LOGP(DMSC, LOGL_NOTICE, "incoming unitdata data from unknown remote address: %s\n",
 		     osmo_sccp_addr_name(ss7, msc_addr));
@@ -331,7 +332,6 @@ static void handle_pcstate_ind(struct osmo_ss7_instance *cs7, const struct osmo_
 static int sccp_sap_up(struct bsc_sccp_user *user, struct osmo_prim_hdr *oph)
 {
 	struct osmo_scu_prim *scu_prim = (struct osmo_scu_prim *)oph;
-	struct osmo_sccp_instance *sccp = bsc_sccp_user_get_sccp(user);
 	struct bsc_sccp_inst *bsc_sccp = bsc_sccp_user_get_bsc_sccp(user);
 	struct gsm_subscriber_connection *conn;
 	int rc = 0;
@@ -345,7 +345,7 @@ static int sccp_sap_up(struct bsc_sccp_user *user, struct osmo_prim_hdr *oph)
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_NOTICE, PRIM_OP_INDICATION):
 		DEBUGP(DMSC, "N-NOTICE.ind(%s)\n", osmo_hexdump(msgb_l2(oph->msg), msgb_l2len(oph->msg)));
-		rc = handle_notice_ind(osmo_sccp_get_ss7(sccp), &scu_prim->u.notice);
+		rc = handle_notice_ind(bsc_sccp_user_get_ss7(user), &scu_prim->u.notice);
 		break;
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_CONNECT, PRIM_OP_INDICATION):
@@ -399,7 +399,7 @@ static int sccp_sap_up(struct bsc_sccp_user *user, struct osmo_prim_hdr *oph)
 		break;
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_PCSTATE, PRIM_OP_INDICATION):
-		handle_pcstate_ind(osmo_sccp_get_ss7(sccp), &scu_prim->u.pcstate);
+		handle_pcstate_ind(bsc_sccp_user_get_ss7(user), &scu_prim->u.pcstate);
 		break;
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_STATE, PRIM_OP_INDICATION):
@@ -571,7 +571,7 @@ __attribute__((weak)) int osmo_bsc_sigtran_open_conn(struct gsm_subscriber_conne
 		return -EINVAL;
 	}
 
-	bsc_sccp = osmo_sccp_get_priv(msc->a.sccp);
+	bsc_sccp = bsc_sccp_user_get_bsc_sccp(msc->a.sccp_user);
 	conn->sccp.conn.conn_id = conn_id = bsc_sccp_inst_next_conn_id(bsc_sccp);
 	if (conn->sccp.conn.conn_id == SCCP_CONN_ID_UNSET) {
 		LOG_MSC(msc, LOGL_ERROR, "Unable to allocate SCCP Connection ID\n");
@@ -683,6 +683,110 @@ void osmo_bsc_sigtran_reset(struct bsc_msc_data *msc)
 	}
 }
 
+/***********************************************************************
+ * A-worker pool: reacting to what a worker reports
+ ***********************************************************************/
+
+/* Forget the SCCP connections of this MSC without disconnecting them: the SCCP connection state they refer to
+ * lives in the worker and is gone with it, and an SCCP operation whose delivery is uncertain must never be
+ * repeated. Clearing sccp.state keeps gscon_cleanup() from sending an N-DISCONNECT.req for them. */
+static void msc_forget_sccp_conns(const struct bsc_msc_data *msc)
+{
+	struct gsm_subscriber_connection *conn;
+
+	llist_for_each_entry(conn, &bsc_gsmnet->subscr_conns, entry) {
+		if (conn->sccp.msc != msc)
+			continue;
+		conn->sccp.state = SUBSCR_SCCP_ST_NONE;
+	}
+}
+
+/* The worker that owns this user's cs7 instance is gone (crash, IPC failure or a refused bind). */
+static void a_worker_unavailable(struct bsc_sccp_user *user)
+{
+	uint32_t cs7_id = osmo_ss7_instance_get_id(bsc_sccp_user_get_ss7(user));
+	struct bsc_msc_data *msc;
+
+	llist_for_each_entry(msc, msc_list, entry) {
+		if (msc->a.sccp_user != user)
+			continue;
+		LOG_MSC(msc, LOGL_ERROR, "the A-worker of cs7 instance %u is gone: dropping all SCCP"
+			" connections and restarting the BSSMAP RESET procedure\n", cs7_id);
+		bssmap_reset_set_disconnected(msc->a.bssmap_reset);
+		msc_forget_sccp_conns(msc);
+		osmo_bsc_sigtran_reset(msc);
+	}
+}
+
+/* The user is bound in its worker. Check that the worker's cs7 instance really is the one this MSC is
+ * configured for: the main process and the worker read separate configuration files, so a mismatch of the local
+ * point code or of the ASP protocol is a configuration error that would otherwise only show up as traffic that
+ * the MSC does not answer. */
+static void a_worker_available(struct bsc_sccp_user *user)
+{
+	struct osmo_ss7_instance *ss7 = bsc_sccp_user_get_ss7(user);
+	uint32_t cs7_id = osmo_ss7_instance_get_id(ss7);
+	struct aworker_ipc_cs7_entry info;
+	struct bsc_msc_data *msc;
+	bool have_info;
+
+	have_info = aworker_pool_cs7_info(cs7_id, &info);
+
+	llist_for_each_entry(msc, msc_list, entry) {
+		if (msc->a.sccp_user != user)
+			continue;
+		if (have_info) {
+			if (msc->a.bsc_addr.pc != info.primary_pc)
+				LOG_MSC(msc, LOGL_ERROR,
+					"local (BSC) SCCP address uses point-code %s, but the A-worker's"
+					" cs7 instance %u has primary point-code %s. Make the 'point-code' of"
+					" cs7 instance %u identical in both configuration files.\n",
+					osmo_ss7_pointcode_print(ss7, msc->a.bsc_addr.pc), cs7_id,
+					osmo_ss7_pointcode_print2(ss7, info.primary_pc), cs7_id);
+			if (msc->a.asp_proto != (enum osmo_ss7_asp_protocol)info.asp_proto)
+				LOG_MSC(msc, LOGL_ERROR,
+					"configured for %s, but the A-worker's cs7 instance %u runs %s\n",
+					osmo_ss7_asp_protocol_name(msc->a.asp_proto), cs7_id,
+					osmo_ss7_asp_protocol_name(info.asp_proto));
+		}
+		LOG_MSC(msc, LOGL_NOTICE, "A-worker of cs7 instance %u is ready\n", cs7_id);
+		/* We would send a RESET anyway when the timer fires; do it now to connect faster. */
+		bssmap_reset_resend_reset(msc->a.bssmap_reset);
+	}
+}
+
+/* A transmit request could not be executed by the worker. See the TX_FAILED contract in aworker_ipc.h. */
+static void a_worker_tx_failed(struct bsc_sccp_user *user, const struct aworker_ipc_tx_failed *f)
+{
+	struct bsc_sccp_inst *bsc_sccp = bsc_sccp_user_get_bsc_sccp(user);
+	struct gsm_subscriber_connection *conn;
+
+	if (f->ref_type == AWORKER_IPC_MT_TX_UNITDATA || f->conn_id == AWORKER_IPC_CONN_ID_NONE) {
+		/* Connectionless: the BSSMAP RESET FSM repeats its own RESET, and a lost RESET ACK or paging
+		 * message needs no action here beyond the log message the pool already wrote. */
+		return;
+	}
+
+	conn = bsc_sccp_inst_get_gscon_by_conn_id(bsc_sccp, f->conn_id);
+	if (!conn)
+		return;
+
+	/* Whether the request reached the network is either known to be "no" (NOT_EXECUTED) or unknown
+	 * (EXECUTED_ERROR). In both cases this SCCP connection cannot be used any more, and in neither case may
+	 * the operation be repeated. Drop the connection locally; the MSC will clear its side. */
+	LOGPFSML(conn->fi, LOGL_ERROR, "A-worker could not send %s on this SCCP connection (conn_id %u);"
+		 " releasing the connection without repeating the operation\n",
+		 aworker_ipc_msg_type_name(f->ref_type), f->conn_id);
+	conn->sccp.state = SUBSCR_SCCP_ST_NONE;
+	osmo_fsm_inst_term(conn->fi, OSMO_FSM_TERM_ERROR, NULL);
+}
+
+static const struct aworker_sccp_user_ops a_worker_ops = {
+	.tx_failed = a_worker_tx_failed,
+	.unavailable = a_worker_unavailable,
+	.available = a_worker_available,
+};
+
 /* Default point-code to be used as local address (BSC) */
 #define BSC_DEFAULT_PC "0.23.3"
 
@@ -719,6 +823,15 @@ int osmo_bsc_sigtran_init(struct llist_head *mscs)
 			msc->a.cs7_instance_valid = true;
 		} else {
 			s7i = osmo_ss7_instance_find(msc->a.cs7_instance);
+			if (!s7i && aworker_pool_enabled()) {
+				/* With a worker pool nothing else creates the instance: the main process has no
+				 * SCCP client, and it needs the instance for the point-code format, the address
+				 * book and as the key of the cs7 instance -> worker routing. */
+				LOG_MSC(msc, LOGL_NOTICE, "creating cs7 instance %u implicitly\n",
+					msc->a.cs7_instance);
+				s7i = osmo_ss7_instance_find_or_create(tall_bsc_ctx, msc->a.cs7_instance);
+				OSMO_ASSERT(s7i);
+			}
 		}
 
 		/* User didn't configure an 'msc-addr' in VTY for this msc, add
@@ -813,21 +926,47 @@ int osmo_bsc_sigtran_init(struct llist_head *mscs)
 		}
 
 		snprintf(inst_name, sizeof(inst_name), "A-%u-%s", inst_id, osmo_ss7_asp_protocol_name(used_proto));
-		LOGP(DMSC, LOGL_NOTICE, "Initializing SCCP connection for A/%s on cs7 instance %u\n",
-		     osmo_ss7_asp_protocol_name(used_proto), inst_id);
 
-		/* SS7 Protocol stack */
-		default_pc = osmo_ss7_pointcode_parse(NULL, BSC_DEFAULT_PC);
-		sccp = osmo_sccp_simple_client_on_ss7_id(tall_bsc_ctx, inst_id, inst_name,
-							 default_pc, used_proto,
-							 0, DEFAULT_ASP_LOCAL_IP,
-							 0, DEFAULT_ASP_REMOTE_IP);
-		if (!sccp)
-			return -EINVAL;
+		if (aworker_pool_enabled()) {
+			/* The A-worker owns the SIGTRAN stack of this cs7 instance: there is no SCCP instance in
+			 * this process. The main process keeps the conn_id registry, because it is the side that
+			 * allocates connection ids and knows the subscriber connections. */
+			LOGP(DAWORKER, LOGL_NOTICE, "A/%s on cs7 instance %u is owned by an A-worker\n",
+			     osmo_ss7_asp_protocol_name(used_proto), inst_id);
+			if (used_proto == OSMO_SS7_ASP_PROT_IPA) {
+				LOGP(DAWORKER, LOGL_FATAL,
+				     "cs7 instance %u runs SCCPlite (IPA), which the A-worker pool does not"
+				     " support: SCCPlite carries MGCP and CTRL inside the SIGTRAN multiplex,"
+				     " so those would have to be proxied through the workers as well."
+				     " Use AoIP (M3UA), or do not configure 'a-worker-pool'.\n", inst_id);
+				return -ENOTSUP;
+			}
+			if (!osmo_ss7_pc_is_valid(osmo_ss7_instance_get_primary_pc(inst))) {
+				LOGP(DAWORKER, LOGL_FATAL,
+				     "cs7 instance %u has no valid 'point-code'. With an A-worker pool the main"
+				     " configuration file must set it, so that the local (BSC) SCCP address can"
+				     " be derived without an SCCP instance.\n", inst_id);
+				return -EINVAL;
+			}
+			sccp = NULL;
+			bsc_sccp = bsc_sccp_inst_alloc(tall_bsc_ctx);
+		} else {
+			LOGP(DMSC, LOGL_NOTICE, "Initializing SCCP connection for A/%s on cs7 instance %u\n",
+			     osmo_ss7_asp_protocol_name(used_proto), inst_id);
 
-		bsc_sccp = bsc_sccp_inst_alloc(tall_bsc_ctx);
-		bsc_sccp->sccp = sccp;
-		osmo_sccp_set_priv(sccp, bsc_sccp);
+			/* SS7 Protocol stack */
+			default_pc = osmo_ss7_pointcode_parse(NULL, BSC_DEFAULT_PC);
+			sccp = osmo_sccp_simple_client_on_ss7_id(tall_bsc_ctx, inst_id, inst_name,
+								 default_pc, used_proto,
+								 0, DEFAULT_ASP_LOCAL_IP,
+								 0, DEFAULT_ASP_REMOTE_IP);
+			if (!sccp)
+				return -EINVAL;
+
+			bsc_sccp = bsc_sccp_inst_alloc(tall_bsc_ctx);
+			bsc_sccp->sccp = sccp;
+			osmo_sccp_set_priv(sccp, bsc_sccp);
+		}
 
 		/* Now that the SCCP client is set up, configure all MSCs on this cs7 instance to use it */
 		llist_for_each_entry(msc, msc_list, entry) {
@@ -850,34 +989,58 @@ int osmo_bsc_sigtran_init(struct llist_head *mscs)
 				msc->x_osmo_ign |= MGCP_X_OSMO_IGN_CALLID;
 
 			/* If unset, use default local SCCP address */
-			if (!msc->a.bsc_addr.presence)
-				osmo_sccp_local_addr_by_instance(&msc->a.bsc_addr, sccp,
-								 OSMO_SCCP_SSN_BSSAP);
+			if (!msc->a.bsc_addr.presence) {
+				if (sccp)
+					osmo_sccp_local_addr_by_instance(&msc->a.bsc_addr, sccp,
+									 OSMO_SCCP_SSN_BSSAP);
+				else
+					/* Same address osmo_sccp_local_addr_by_instance() would build, but
+					 * taken from the cs7 instance directly: in worker mode there is no
+					 * SCCP instance here. */
+					osmo_sccp_make_addr_pc_ssn(&msc->a.bsc_addr,
+								   osmo_ss7_instance_get_primary_pc(inst),
+								   OSMO_SCCP_SSN_BSSAP);
+			}
 
 			if (!osmo_sccp_check_addr(&msc->a.bsc_addr, OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC)) {
 				LOG_MSC(msc, LOGL_ERROR, "%s: invalid local (BSC) SCCP address: %s\n",
-					inst_name, osmo_sccp_inst_addr_name(sccp, &msc->a.bsc_addr));
+					inst_name, osmo_sccp_addr_name(inst, &msc->a.bsc_addr));
 				return -EINVAL;
 			}
 
 			if (!osmo_sccp_check_addr(&msc->a.msc_addr, OSMO_SCCP_ADDR_T_SSN | OSMO_SCCP_ADDR_T_PC)) {
 				LOG_MSC(msc, LOGL_ERROR, "%s: invalid remote (MSC) SCCP address: %s\n",
-					inst_name, osmo_sccp_inst_addr_name(sccp, &msc->a.msc_addr));
+					inst_name, osmo_sccp_addr_name(inst, &msc->a.msc_addr));
 				return -EINVAL;
 			}
 
 			LOG_MSC(msc, LOGL_NOTICE, "%s: local (BSC) SCCP address: %s\n",
-				inst_name, osmo_sccp_inst_addr_name(sccp, &msc->a.bsc_addr));
+				inst_name, osmo_sccp_addr_name(inst, &msc->a.bsc_addr));
 			LOG_MSC(msc, LOGL_NOTICE, "%s: remote (MSC) SCCP address: %s\n",
-				inst_name, osmo_sccp_inst_addr_name(sccp, &msc->a.msc_addr));
+				inst_name, osmo_sccp_addr_name(inst, &msc->a.msc_addr));
 
-			/* Bind SCCP user. Bind only one user per sccp_instance and bsc_addr. */
-			msc->a.sccp_user = bsc_sccp_user_find(sccp, msc->a.bsc_addr.ssn, msc->a.bsc_addr.pc);
-			LOG_MSC(msc, LOGL_NOTICE, "%s: %s\n", inst_name,
-			     msc->a.sccp_user ? "user already bound for this SCCP instance" : "binding SCCP user");
-			if (!msc->a.sccp_user)
-				msc->a.sccp_user = bsc_sccp_user_bind(tall_bsc_ctx, sccp, msc_name, sccp_sap_up,
-								      msc->a.bsc_addr.ssn);
+			/* Bind SCCP user. Bind only one user per cs7 instance and bsc_addr. */
+			if (aworker_pool_enabled()) {
+				msc->a.sccp_user = aworker_sccp_user_find(inst_id, msc->a.bsc_addr.ssn);
+				LOG_MSC(msc, LOGL_NOTICE, "%s: %s\n", inst_name,
+					msc->a.sccp_user ? "user already registered for this cs7 instance"
+							 : "registering SCCP user with the A-worker pool");
+				if (!msc->a.sccp_user)
+					msc->a.sccp_user = aworker_sccp_user_bind(tall_bsc_ctx, inst, bsc_sccp,
+										  msc_name, sccp_sap_up,
+										  msc->a.bsc_addr.ssn,
+										  &a_worker_ops);
+			} else {
+				msc->a.sccp_user = bsc_sccp_user_find(sccp, msc->a.bsc_addr.ssn,
+								      msc->a.bsc_addr.pc);
+				LOG_MSC(msc, LOGL_NOTICE, "%s: %s\n", inst_name,
+					msc->a.sccp_user ? "user already bound for this SCCP instance"
+							 : "binding SCCP user");
+				if (!msc->a.sccp_user)
+					msc->a.sccp_user = bsc_sccp_user_bind(tall_bsc_ctx, sccp, msc_name,
+									      sccp_sap_up,
+									      msc->a.bsc_addr.ssn);
+			}
 			if (!msc->a.sccp_user)
 				return -EINVAL;
 

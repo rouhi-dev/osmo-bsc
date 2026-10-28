@@ -55,8 +55,17 @@ struct bsc_sccp_backend_ops {
 struct bsc_sccp_user {
 	const struct bsc_sccp_backend_ops *ops;
 	bsc_sccp_user_prim_cb prim_cb;
-	/*! In-process backend: the libosmo-sigtran SCCP User this wraps. */
+	/*! In-process backend: the libosmo-sigtran SCCP User this wraps. NULL in the worker backend, where this
+	 * process has no SCCP instance at all. */
 	struct osmo_sccp_user *scu;
+	/*! Worker backend: the cs7 instance this user belongs to (configuration only, no ASP). The in-process
+	 * backend leaves this NULL and derives it from the SCCP instance. */
+	struct osmo_ss7_instance *ss7;
+	/*! Worker backend: the conn_id registry of that cs7 instance, kept by the main process. The in-process
+	 * backend leaves this NULL and uses the SCCP instance's priv, as before. */
+	struct bsc_sccp_inst *bsc_sccp;
+	/*! Worker backend: private state of the A-worker pool (struct aworker_user). */
+	void *worker_priv;
 };
 
 /*! The in-process backend: every operation calls the corresponding libosmo-sigtran helper unchanged. */
@@ -67,7 +76,10 @@ struct bsc_sccp_user *bsc_sccp_user_bind(void *ctx, struct osmo_sccp_instance *s
 struct bsc_sccp_user *bsc_sccp_user_find(struct osmo_sccp_instance *sccp, uint16_t ssn, uint32_t pc);
 void bsc_sccp_user_unbind(struct bsc_sccp_user *user);
 
+/*! The libosmo-sigtran SCCP instance the user is bound on; NULL in the worker backend. */
 struct osmo_sccp_instance *bsc_sccp_user_get_sccp(const struct bsc_sccp_user *user);
+/*! The cs7 instance of the user, in both backends. */
+struct osmo_ss7_instance *bsc_sccp_user_get_ss7(const struct bsc_sccp_user *user);
 struct bsc_sccp_inst *bsc_sccp_user_get_bsc_sccp(const struct bsc_sccp_user *user);
 
 int bsc_sccp_tx_unitdata_msg(struct bsc_sccp_user *user,

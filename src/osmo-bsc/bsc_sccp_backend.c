@@ -18,6 +18,7 @@
 
 #include <osmocom/core/talloc.h>
 #include <osmocom/core/utils.h>
+#include <osmocom/sigtran/osmo_ss7.h>
 #include <osmocom/sigtran/sccp_sap.h>
 #include <osmocom/sigtran/sccp_helpers.h>
 
@@ -131,16 +132,32 @@ void bsc_sccp_user_unbind(struct bsc_sccp_user *user)
 	talloc_free(user);
 }
 
-/*! The SCCP instance the user is bound on. */
+/*! The SCCP instance the user is bound on, or NULL if the backend has none (worker backend). */
 struct osmo_sccp_instance *bsc_sccp_user_get_sccp(const struct bsc_sccp_user *user)
 {
+	if (!user->scu)
+		return NULL;
 	return osmo_sccp_get_sccp(user->scu);
 }
 
-/*! The osmo-bsc conn_id registry currently attached to the user's SCCP instance.
- * Like the code this replaces, this looks up the SCCP instance's priv at the time of the call. */
+/*! The cs7 instance of the user: the one of its SCCP instance in the in-process backend, and the one the user
+ * was bound on in the worker backend (where this process has no SCCP instance). */
+struct osmo_ss7_instance *bsc_sccp_user_get_ss7(const struct bsc_sccp_user *user)
+{
+	struct osmo_sccp_instance *sccp;
+
+	if (user->ss7)
+		return user->ss7;
+	sccp = bsc_sccp_user_get_sccp(user);
+	return sccp ? osmo_sccp_get_ss7(sccp) : NULL;
+}
+
+/*! The osmo-bsc conn_id registry of the user's cs7 instance.
+ * Like the code this replaces, the in-process backend looks up the SCCP instance's priv at the time of the call. */
 struct bsc_sccp_inst *bsc_sccp_user_get_bsc_sccp(const struct bsc_sccp_user *user)
 {
+	if (user->bsc_sccp)
+		return user->bsc_sccp;
 	return osmo_sccp_get_priv(bsc_sccp_user_get_sccp(user));
 }
 

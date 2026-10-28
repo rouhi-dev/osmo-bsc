@@ -34,6 +34,7 @@
 #include <osmocom/bsc/lcs_loc_req.h>
 #include <osmocom/bsc/bssmap_reset.h>
 #include <osmocom/bsc/bsc_sccp_backend.h>
+#include <osmocom/bsc/aworker_pool.h>
 #include <osmocom/bsc/gsm_data.h>
 
 /* Send reset to SMLC */
@@ -94,7 +95,7 @@ static int handle_unitdata_from_smlc(const struct osmo_sccp_addr *smlc_addr, str
 	struct osmo_bssap_le_err *err = NULL;
 	struct rate_ctr_group *ctrg = bsc_gsmnet->smlc->ctrs;
 
-	ss7 = osmo_sccp_get_ss7(bsc_sccp_user_get_sccp(user));
+	ss7 = bsc_sccp_user_get_ss7(user);
 	OSMO_ASSERT(ss7);
 
 	if (osmo_sccp_addr_cmp(smlc_addr, &bsc_gsmnet->smlc->smlc_addr, OSMO_SCCP_ADDR_T_MASK)) {
@@ -279,7 +280,6 @@ static void handle_pcstate_ind(struct osmo_ss7_instance *cs7, const struct osmo_
 static int sccp_sap_up(struct bsc_sccp_user *user, struct osmo_prim_hdr *oph)
 {
 	struct osmo_scu_prim *scu_prim = (struct osmo_scu_prim *)oph;
-	struct osmo_sccp_instance *sccp = bsc_sccp_user_get_sccp(user);
 	struct bsc_sccp_inst *bsc_sccp = bsc_sccp_user_get_bsc_sccp(user);
 	struct gsm_subscriber_connection *conn;
 	int rc = 0;
@@ -358,7 +358,7 @@ static int sccp_sap_up(struct bsc_sccp_user *user, struct osmo_prim_hdr *oph)
 		break;
 
 	case OSMO_PRIM(OSMO_SCU_PRIM_N_PCSTATE, PRIM_OP_INDICATION):
-		handle_pcstate_ind(osmo_sccp_get_ss7(sccp), &scu_prim->u.pcstate);
+		handle_pcstate_ind(bsc_sccp_user_get_ss7(user), &scu_prim->u.pcstate);
 		break;
 
 	default:
@@ -587,6 +587,17 @@ static int lb_start(void)
 	/* Already set up? */
 	if (bsc_gsmnet->smlc->sccp_user)
 		return -EALREADY;
+
+	/* The Lb interface runs its own ASP and SCTP association through osmo_sccp_simple_client_on_ss7_id()
+	 * below. With an A-worker pool the SIGTRAN stack belongs to the workers, and the main process must not
+	 * open an association of its own; routing Lb through a worker would additionally need the SCCP user to
+	 * be bound and unbound while the pool is running, which the A interface does not do. Reject the
+	 * combination instead of silently opening an association here. */
+	if (aworker_pool_enabled()) {
+		LOGP(DLCS, LOGL_ERROR, "Cannot start the Lb interface: it is not supported together with"
+		     " 'a-worker-pool', which gives the SIGTRAN stack to the A-worker processes.\n");
+		return -ENOTSUP;
+	}
 
 	LOGP(DLCS, LOGL_INFO, "Starting Lb link\n");
 

@@ -33,8 +33,12 @@ libbsc_la_SOURCES = \
 	abis_rsl.c \
 	acc.c \
 	assignment_fsm.c \
+	aworker.c \
+	aworker_cfg_scan.c \
 	aworker_ipc.c \
 	aworker_ipc_link.c \
+	aworker_pool.c \
+	aworker_vty.c \
 	bsc_ctrl.c \
 	bsc_ctrl_lookup.c \
 	bsc_init.c \

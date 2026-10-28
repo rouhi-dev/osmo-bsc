@@ -239,7 +239,9 @@ AC_OUTPUT(
     tests/atlocal
     tests/abis/Makefile
     tests/acc/Makefile
+    tests/aworker_cfg_scan/Makefile
     tests/aworker_ipc/Makefile
+    tests/aworker_pool/Makefile
     tests/bsc/Makefile
     tests/codec_pref/Makefile
     tests/gsm0408/Makefile

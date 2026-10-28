@@ -1,0 +1,82 @@
+
+=== in-process config (asp, no pool) ===
+rc=0
+pool section=0 workers=0 cs7 sections=1 overflow=0
+  cs7 instance 0 (line 3): asp=1 as=0 listen=0 proto=m3ua conflict=0 first-node='asp' (line 5)
+first sigtran section: yes
+  -> cs7 instance 0, node 'asp' on line 5
+find(0)=yes find(3)=no find(9)=no
+
+=== worker-mode main config (no asp) ===
+rc=0
+pool section=1 workers=2 cs7 sections=1 overflow=0
+  cs7 instance 0 (line 1): asp=0 as=0 listen=0 proto=none conflict=0 first-node='' (line 0)
+first sigtran section: none
+find(0)=yes find(3)=no find(9)=no
+
+=== worker-mode main config with an asp (must be refused) ===
+rc=0
+pool section=1 workers=1 cs7 sections=1 overflow=0
+  cs7 instance 0 (line 3): asp=1 as=0 listen=0 proto=m3ua conflict=0 first-node='asp' (line 5)
+first sigtran section: yes
+  -> cs7 instance 0, node 'asp' on line 5
+find(0)=yes find(3)=no find(9)=no
+
+=== as node ===
+rc=0
+pool section=1 workers=1 cs7 sections=1 overflow=0
+  cs7 instance 1 (line 3): asp=1 as=1 listen=0 proto=m3ua conflict=0 first-node='as' (line 4)
+first sigtran section: yes
+  -> cs7 instance 1, node 'as' on line 4
+find(0)=no find(3)=no find(9)=no
+
+=== listen node ===
+rc=0
+pool section=1 workers=1 cs7 sections=1 overflow=0
+  cs7 instance 2 (line 3): asp=0 as=0 listen=1 proto=m3ua conflict=0 first-node='listen' (line 4)
+first sigtran section: yes
+  -> cs7 instance 2, node 'listen' on line 4
+find(0)=no find(3)=no find(9)=no
+
+=== worker config with two cs7 instances ===
+rc=0
+pool section=0 workers=0 cs7 sections=2 overflow=0
+  cs7 instance 0 (line 1): asp=2 as=1 listen=0 proto=m3ua conflict=0 first-node='asp' (line 3)
+  cs7 instance 3 (line 9): asp=1 as=0 listen=0 proto=ipa conflict=0 first-node='asp' (line 11)
+first sigtran section: yes
+  -> cs7 instance 0, node 'asp' on line 3
+find(0)=yes find(3)=yes find(9)=no
+
+=== protocol conflict ===
+rc=0
+pool section=0 workers=0 cs7 sections=1 overflow=0
+  cs7 instance 0 (line 1): asp=2 as=0 listen=0 proto=m3ua conflict=1 first-node='asp' (line 2)
+first sigtran section: yes
+  -> cs7 instance 0, node 'asp' on line 2
+find(0)=yes find(3)=no find(9)=no
+
+=== comments, blank lines and indentation ===
+rc=0
+pool section=1 workers=1 cs7 sections=1 overflow=0
+  cs7 instance 0 (line 4): asp=1 as=0 listen=0 proto=m3ua conflict=0 first-node='asp' (line 6)
+first sigtran section: yes
+  -> cs7 instance 0, node 'asp' on line 6
+find(0)=yes find(3)=no find(9)=no
+
+=== workers outside the a-worker-pool section ===
+rc=0
+pool section=0 workers=0 cs7 sections=1 overflow=0
+  cs7 instance 0 (line 1): asp=0 as=0 listen=0 proto=none conflict=0 first-node='' (line 0)
+first sigtran section: none
+find(0)=yes find(3)=no find(9)=no
+
+=== missing file ===
+rc=-2 (ENOENT)
+
+=== empty file ===
+rc=0
+pool section=0 workers=0 cs7 sections=0 overflow=0
+first sigtran section: none
+find(0)=no find(3)=no find(9)=no
+
+Done

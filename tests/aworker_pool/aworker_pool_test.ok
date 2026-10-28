@@ -1,0 +1,41 @@
+T1: bind handshake and cs7 instance -> worker routing
+  before the handshake: not ready, transmit gives -ENOTCONN
+  duplicate bind refused, find() by cs7 instance and SSN works
+  handshake alone does not bind anything: no USER_BIND before CS7_INFO
+  worker 1 ready: USER_BIND for cs7 instance 1 only (user_ref 1)
+  bind result OK: user 'msc-1' available, 'msc-0' still waiting
+  worker 0 ready: both users bound, pool reports all workers ready
+  CS7_INFO of both workers is available to the A interface
+T2: transmit operations
+  TX_UNITDATA: addresses and 20 octets of data
+  TX_CONN_REQ: conn_id 257, calling address present
+  TX_CONN_REQ without a calling address, empty data
+  TX_CONN_RESP: conn_id 259, responding address, 8 octets
+  TX_DATA: conn_id 260, 40 octets
+  TX_DISCONN: conn_id 261, cause 66
+  TX_DISCONN without a responding address
+  a user of cs7 instance 1 is served by worker 1, not worker 0
+T3: per-operation data limits
+  TX_UNITDATA: 1139 octets accepted, 1140 rejected with -EMSGSIZE
+  connection-oriented: 255 octets accepted, 256 rejected on all three operations
+  rejected transmit requests free their msgb: talloc blocks unchanged
+T4: SCU_UP and TX_FAILED
+  N-DATA.ind delivered to the user: conn_id 769, 6 octets
+  N-DISCONNECT.ind delivered, no user data
+  SCU_UP with an unknown user_ref is dropped, the link stays up
+  TX_FAILED NOT_EXECUTED reported to the A interface (conn_id 768)
+  TX_FAILED EXECUTED_ERROR reported with lib_rc -1 (delivery unknown)
+T5: losing a worker
+  worker 1 gone: its user is unavailable and cannot transmit; worker 0 unaffected
+  cs7 instance 1 has no owner any more, cs7 instance 0 still has one
+  a USER_BIND from a worker closes the link: its user is unavailable
+  each 'available' was followed by exactly one 'unavailable'
+T6: unbind and pool shutdown
+  unbind removes the user from the pool
+  after aworker_pool_stop() the users are detached, inert and can be freed
+T7: two workers claiming the same cs7 instance
+  the second claim is refused; the first worker keeps cs7 instance 0
+T8: a bind the worker refuses
+  a refused bind leaves the user unusable and is not retried on a running worker
+talloc blocks at the end: unchanged
+PASSED

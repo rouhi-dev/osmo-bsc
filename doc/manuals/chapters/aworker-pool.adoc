@@ -1,0 +1,198 @@
+== A-worker pool: running the A interface SIGTRAN stack in separate processes
+
+By default OsmoBSC runs everything in one process: the Abis side, the subscriber connection state
+machines, the MGW control and the complete SIGTRAN stack of the A interface (SCTP, M3UA, the ASP and AS
+state machines, SCCP and its connection state).
+
+With an _A-worker pool_ the SIGTRAN stack moves into a fixed number of separate _A-worker_ processes.
+Each worker owns one or more complete `cs7` instances: their ASPs, ASs, routes, SCTP associations, the
+M3UA encoding, the SCCP instance, the SCCP connection state and the SCCP timers. The OsmoBSC main
+process keeps everything else: BSSAP/BSSMAP/DTAP, the subscriber connection FSMs, paging, the MSC pool,
+the BSSMAP RESET procedure, Abis/RSL/lchan and the MGW state. In particular the main process still
+allocates the SCCP connection identifiers and keeps the mapping from connection identifier to
+subscriber connection, so the handling of the A interface above SCCP is unchanged.
+
+Main process and workers talk over one `AF_UNIX` `SOCK_SEQPACKET` socket pair per worker, with an
+explicitly encoded, versioned protocol. Nothing else is shared: a worker is started with `fork()` and
+`execv()`, reads its own configuration file and inherits no socket, no timer and no state of the main
+process.
+
+The feature is off by default. Without an `a-worker-pool` section OsmoBSC behaves exactly as before.
+
+=== What it is good for, and what it is not
+
+An A-worker isolates the SIGTRAN stack. If a worker dies, the main process keeps its Abis links, its
+lchans and its MGW endpoints, tears down only the SCCP connections of that worker's `cs7` instances and
+rebuilds the MSC relationship with a new BSSMAP RESET. A failure in the SCTP, M3UA or SCCP code can no
+longer take the whole BSC down with it, and the worker can be restarted without restarting the BSC.
+
+It is not a way to scale one MSC relationship over several processes. A `cs7` instance is owned by
+exactly one worker, because the SCCP local reference space of a `cs7` instance has exactly one
+allocator (the main process) and exactly one SCCP instance (that worker's). Spreading one `cs7`
+instance over several ASPs in several processes would make inbound messages arrive at a process that
+does not know the connection. Configure one worker per `cs7` instance, i.e. per group of MSCs that
+share a `cs7` instance.
+
+=== Configuration
+
+The configuration is split in two:
+
+* The *main configuration file* keeps the `msc` nodes, and in its `cs7` sections only the inert
+  configuration the main process needs itself: `point-code`, `point-code format` and the
+  `sccp-address` book that `msc-addr` and `bsc-addr` refer to.
+* One *worker configuration file* per worker holds the `cs7` instance(s) that worker owns, with their
+  `asp`, `as` and `route` nodes.
+
+OsmoBSC refuses to start if the main configuration file has an `asp`, `as` or `listen` node inside a
+`cs7 instance` while `a-worker-pool` is configured, and says which line is at fault. This is not a
+style rule: reading such a node is what creates the ASP and opens its SCTP association, so the main
+process would hold a transport that belongs to a worker. The check runs before the file is parsed, so
+no association is ever opened.
+
+.Main configuration file, `/etc/osmocom/osmo-bsc.cfg`
+----
+cs7 instance 0
+ point-code 0.23.3
+ sccp-address msc
+  routing-indicator PC
+  point-code 0.23.1
+a-worker-pool
+ workers 1
+ worker 0 config-file /etc/osmocom/osmo-bsc-aworker0.cfg
+network
+ ! ... network, bts, ... as usual ...
+msc 0
+ msc-addr msc
+----
+
+.Worker configuration file, `/etc/osmocom/osmo-bsc-aworker0.cfg`
+----
+log stderr
+ logging level set-all notice
+cs7 instance 0
+ point-code 0.23.3
+ asp asp-bsc-to-stp 2905 0 m3ua
+  remote-ip 127.0.0.1
+  local-ip 127.0.0.1
+  role asp
+  transport-role client
+  no shutdown
+----
+
+The `point-code` of a `cs7` instance must be the same in both files. The worker reports the point code
+and the ASP protocol of every instance it owns, and OsmoBSC logs an error on the `DAWORKER` category if
+they disagree with its own configuration.
+
+A worker configuration file should contain nothing but `cs7` instances and `log` settings. The worker
+refuses to start if it finds an `a-worker-pool` section, and it does not open the VTY, the CTRL
+interface, Abis or any MGW connection.
+
+==== VTY commands
+
+The `a-worker-pool` node has these commands. All of them take effect at the next start of OsmoBSC:
+the workers are started before the main process opens any socket of its own, and the ownership of a
+running SIGTRAN stack cannot be moved.
+
+`workers <0-16>`::
+  Number of worker processes. `0`, the default, disables worker mode and runs the SIGTRAN stack inside
+  OsmoBSC as before.
+
+`worker <0-15> config-file FILE`::
+  Configuration file of one worker. Every worker below `workers` needs one.
+
+`startup-timeout <1-600>`::
+  Seconds to wait for the workers to complete their handshake and report their `cs7` instances. On
+  expiry the workers that are not ready are treated as failed, and an error names every SCCP user
+  whose `cs7` instance no worker claimed. The default is 20.
+
+`on-worker-failure (restart|shutdown)`::
+  What to do when a worker dies or its IPC link breaks: restart it after `restart-delay` seconds (the
+  default), or terminate OsmoBSC. In both cases the SCCP connections of that worker are dropped first,
+  see <<aworker_failure>>.
+
+`restart-delay <0-600>`::
+  Seconds between the loss of a worker and its restart. The default is 5.
+
+==== Operation
+
+`show a-worker-pool` reports the configuration, the state, process id, restart count and configuration
+file of every worker, the `cs7` instances each worker reported, the IPC link counters, and for every
+SCCP user whether it is bound in its worker.
+
+----
+OsmoBSC# show a-worker-pool
+A-worker pool: 1 worker(s), on-worker-failure restart, startup-timeout 20 s, restart-delay 5 s
+ worker 0: state READY, pid 2048, starts 1, config file /etc/osmocom/osmo-bsc-aworker0.cfg
+  cs7 instance 0: point-code 187, m3ua, 1 AS(s)
+  IPC link: ready, rx 6 records, tx 4 queued / 4 written, last seq queued 4 / written 4
+ SCCP user 'msc-0': cs7 instance 0, SSN 254, bound
+----
+
+The ASP and SCCP state of the A interface is no longer visible in the main process: `show cs7 instance
+0 asp` in OsmoBSC shows nothing, because the ASP lives in the worker. The worker has no VTY of its own,
+so use its log output (category `DAWORKER` in the main process, plus the usual `DLSS7`, `DLM3UA` and
+`DLSCCP` categories in the worker) to follow the transport.
+
+A worker is a child process of OsmoBSC and is terminated with it. `SIGTERM` to OsmoBSC sends GOODBYE to
+every worker and collects them; a worker that does not exit is killed.
+
+[[aworker_failure]]
+=== Failure handling
+
+A transmit request handed to a worker is *never repeated*. When a worker reports that it could not send
+an SCCP message, or when the worker or its IPC link dies after the request was queued, the affected
+SCCP connection is released locally instead:
+
+* The worker reports `TX_FAILED` with disposition `NOT_EXECUTED` when it did not call the SCCP
+  transmit function at all (no such SCCP user, connection identifier unknown or already in use, or more
+  user data than the A interface can carry). Nothing reached the network.
+* It reports `EXECUTED_ERROR` when the transmit function was called and returned an error. Whether
+  anything reached the network is then unknown.
+
+In both cases OsmoBSC logs the failure and releases that subscriber connection. It does not retry,
+because a repeated SCCP operation on a connection whose state is unknown can duplicate a message, a
+connection release, or a connection setup towards the MSC.
+
+When a whole worker is lost, every SCCP connection of its `cs7` instances is terminated, the BSSMAP
+RESET FSM of every MSC on them goes back to its disconnected state, and pending paging requests of
+those MSCs are flushed. With `on-worker-failure restart` the worker is then restarted, binds its SCCP
+users again, and the MSC relationship is rebuilt with a fresh BSSMAP RESET. Lchans and MGW endpoints of
+the released subscriber connections are cleaned up by the ordinary connection teardown.
+
+A worker that cannot start with its configuration at all (for example a `cs7` instance OsmoBSC cannot
+use, see <<aworker_limits>>) is not restarted in a loop: OsmoBSC logs the reason and shuts down with a
+failure exit code, whatever `on-worker-failure` says.
+
+The IPC link itself fails closed. A malformed, truncated, oversized or out-of-sequence record, a
+partial send, a full transmit queue or an allocation failure closes the link rather than guessing, so a
+half-written record can never be followed by its remainder.
+
+[[aworker_limits]]
+=== Limitations
+
+SUA:: Not usable, in worker mode or without it. The installed libosmo-sigtran only encodes M3UA and
+IPA on the transmit path (`xua_as_encode_msg()` in `src/xua_as_fsm.c` asserts for an SUA Application
+Server), so the first message sent towards an SUA peer aborts the process. A worker whose `cs7`
+instance is configured for SUA refuses to start and says so, instead of failing later at the first
+message.
+
+SCCPlite (IPA):: Not supported with an A-worker pool. SCCPlite carries MGCP and CTRL inside the
+SIGTRAN multiplex, so those would have to be proxied through the workers too. OsmoBSC refuses to start
+if an `msc` using `asp-protocol ipa` runs on a `cs7` instance that a worker would own. Use AoIP (M3UA),
+or run without `a-worker-pool`.
+
+Lb interface (SMLC):: Not supported with an A-worker pool. The Lb interface opens an SCTP association
+of its own, which the main process must not do in worker mode, and it is started and stopped from the
+VTY at runtime. Enabling `smlc` while `a-worker-pool` is configured is refused with an error.
+
+Per-message user data:: The A interface carries at most 1139 octets of user data in a connectionless
+message and 255 octets in a connection-oriented one, which is what the installed libosmo-sigtran
+transmit path encodes correctly. Larger messages are rejected before anything is sent, in the main
+process and again in the worker.
+
+Daemonizing:: `-D` / `--daemonize` cannot be used with an A-worker pool. Daemonizing forks away the
+process that started the workers, which could then neither be collected nor restarted. Run OsmoBSC in
+the foreground, for example with a systemd unit of `Type=simple`. OsmoBSC refuses to start if both are
+configured.
+
+Dynamic scaling:: Out of scope. The number of workers is fixed by the configuration.

@@ -37,6 +37,7 @@ enum bsc_vty_node {
 	CBC_CLIENT_NODE,
 	SMLC_NODE,
 	POWER_CTRL_NODE,
+	AWORKER_POOL_NODE,
 };
 
 struct log_info;

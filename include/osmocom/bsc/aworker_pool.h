@@ -146,8 +146,10 @@ void aworker_pool_set_exec(const char *argv0, int argc, char **argv);
  * \returns 0 if all workers were started, negative errno otherwise (nothing is left running on error). */
 int aworker_pool_start(void *ctx);
 /*! Send GOODBYE to all workers, stop them and free the pool. Idempotent. Runs when osmo-bsc exits, after its
- * event loop: it signals all workers at once and waits a bounded time for them (never forever). A process that
- * cannot be collected (stuck in the kernel) is reported, not assumed gone. */
+ * event loop: it polls the event loop (without blocking, at most 500 ms) until GOODBYE is written, gives the workers
+ * the grace period to exit by themselves, then signals whatever is left and waits a bounded time for it (never
+ * forever). A process that cannot be collected (stuck in the kernel) is reported, not assumed gone. Must not be
+ * called from an osmo_select call-back. */
 void aworker_pool_stop(void);
 bool aworker_pool_all_ready(void);
 /*! True if the pool requested the shutdown of osmo-bsc because a worker could not be kept running. main()

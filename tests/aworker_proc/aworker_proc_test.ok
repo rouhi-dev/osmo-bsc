@@ -15,4 +15,9 @@ P3: the main process dies between fork() and PR_SET_PDEATHSIG
   the child noticed it was orphaned and exited before exec: no worker without its main process
 P4: the executable file is replaced while the main process runs
   a worker restarted after its executable was deleted and replaced still runs the original image
+P5: osmo-bsc shuts down; GOODBYE reaches every worker, which exits 0 by itself
+  each worker received GOODBYE although the event loop had already ended, and exited 0: no EOF, no SIGTERM
+  aworker_pool_stop() returned well within the grace period
+P6: the workers take a while to exit after GOODBYE
+  aworker_pool_stop() waited for them to exit by themselves (no SIGTERM), well within the grace period
 PASSED

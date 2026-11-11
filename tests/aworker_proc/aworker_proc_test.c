@@ -173,6 +173,11 @@ static struct {
 	bool stay_on_eof;
 	char report[PATH_MAX];
 	char heartbeat[PATH_MAX];
+	char exitlog[PATH_MAX];		/*!< if set: how this worker ended ("goodbye" or "eof") */
+	char termlog[PATH_MAX + 8];		/*!< with exitlog: created if SIGTERM arrives */
+	unsigned int linger_ms;		/*!< on GOODBYE, exit only after this long (a worker shutting down) */
+	struct osmo_timer_list exit_timer;
+	bool got_goodbye;
 	struct aworker_ipc_link *link;
 	volatile sig_atomic_t sever;
 	unsigned long beats;
@@ -194,13 +199,23 @@ static void fw_ready_cb(struct aworker_ipc_link *link, const struct aworker_ipc_
 
 static void fw_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m)
 {
-	if (m->type == AWORKER_IPC_MT_GOODBYE)
-		exit(AWORKER_EXIT_OK);
+	if (m->type == AWORKER_IPC_MT_GOODBYE) {
+		fw.got_goodbye = true;
+		if (fw.exitlog[0])
+			write_file(fw.exitlog, "goodbye\n");
+		if (!fw.linger_ms)
+			exit(AWORKER_EXIT_OK);
+		osmo_timer_schedule(&fw.exit_timer, fw.linger_ms / 1000, (fw.linger_ms % 1000) * 1000);
+	}
 }
 
 static void fw_closed_cb(struct aworker_ipc_link *link, const struct aworker_ipc_link_close_info *info)
 {
 	fw.link = NULL;
+	if (fw.got_goodbye)
+		return;	/* exiting anyway (like aworker.c, which is done with the link once it has GOODBYE) */
+	if (fw.exitlog[0])
+		write_file(fw.exitlog, "eof\n");
 	if (!fw.stay_on_eof)
 		exit(AWORKER_EXIT_LINK);
 }
@@ -210,6 +225,19 @@ static const struct aworker_ipc_link_ops fw_ops = {
 	.rx_cb = fw_rx_cb,
 	.closed_cb = fw_closed_cb,
 };
+
+static void fw_exit_cb(void *data)
+{
+	exit(AWORKER_EXIT_OK);
+}
+
+static void fw_sigterm(int sig)
+{
+	int fd = open(fw.termlog, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+	if (fd >= 0)
+		close(fd);
+	_exit(128 + SIGTERM);
+}
 
 static void fw_sigusr1(int sig)
 {
@@ -276,6 +304,10 @@ static int fake_worker_main(int argc, char **argv)
 			osmo_strlcpy(fw.report, line + 7, sizeof(fw.report));
 		else if (!strncmp(line, "heartbeat=", 10))
 			osmo_strlcpy(fw.heartbeat, line + 10, sizeof(fw.heartbeat));
+		else if (!strncmp(line, "exitlog=", 8))
+			osmo_strlcpy(fw.exitlog, line + 8, sizeof(fw.exitlog));
+		else if (!strncmp(line, "linger=", 7))
+			fw.linger_ms = atoi(line + 7);
 	}
 	fclose(f);
 
@@ -288,8 +320,12 @@ static int fake_worker_main(int argc, char **argv)
 		write_file(fw.report, text);
 	}
 
-	if (fw.ignore_term)
+	if (fw.ignore_term) {
 		signal(SIGTERM, SIG_IGN);
+	} else if (fw.exitlog[0]) {
+		snprintf(fw.termlog, sizeof(fw.termlog), "%s.term", fw.exitlog);
+		signal(SIGTERM, fw_sigterm);
+	}
 	signal(SIGUSR1, fw_sigusr1);
 	signal(SIGPIPE, SIG_IGN);
 
@@ -302,6 +338,7 @@ static int fake_worker_main(int argc, char **argv)
 
 	fw.hb_fd = fw.heartbeat[0] ? open(fw.heartbeat, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1;
 	osmo_timer_setup(&fw.timer, fw_timer_cb, NULL);
+	osmo_timer_setup(&fw.exit_timer, fw_exit_cb, NULL);
 	osmo_timer_schedule(&fw.timer, 0, 10000);
 	for (;;)
 		osmo_select_main_ctx(0);
@@ -817,6 +854,139 @@ static void test_p4_exe_replaced(void)
 }
 
 /***********************************************************************
+ * P5, P6: clean shutdown -- GOODBYE reaches the workers, which exit 0 by themselves
+ ***********************************************************************/
+
+static bool read_exitlog(unsigned int i, char *buf, size_t len)
+{
+	char path[PATH_MAX];
+	FILE *f;
+	bool ok;
+
+	snprintf(path, sizeof(path), "%s/exit%u", g_dir, i);
+	f = fopen(path, "r");
+	if (!f)
+		return false;
+	ok = fgets(buf, len, f) != NULL;
+	fclose(f);
+	if (ok)
+		buf[strcspn(buf, "\n")] = '\0';
+	return ok;
+}
+
+struct shutdown_result {
+	pid_t pids[2];
+	unsigned long stop_ms;	/*!< how long aworker_pool_stop() took */
+};
+
+/* Fork a main process with two workers (worker i gets "exitlog=..." plus extra[i] in its config) that shuts down
+ * exactly like osmo_bsc_main.c: a shutdown request (SIGTERM), the event loop until osmo_select_shutdown_done() --
+ * which, with nothing to write, ends at once -- then aworker_pool_stop(). */
+static void run_shutdown(char **argv, const char *const *extra, struct shutdown_result *res)
+{
+	int pp[2], status;
+	pid_t bsc;
+	unsigned int i;
+
+	OSMO_ASSERT(pipe(pp) == 0);
+	bsc = fork();
+	OSMO_ASSERT(bsc >= 0);
+	if (bsc == 0) {
+		char cfg[2][2 * PATH_MAX];
+		const char *files[2];
+		unsigned long t0;
+		int st;
+
+		close(pp[0]);
+		for (i = 0; i < 2; i++) {
+			snprintf(cfg[i], sizeof(cfg[i]), "exitlog=%s/exit%u\n%s", g_dir, i, extra[i]);
+			files[i] = worker_cfg(i, i, cfg[i]);
+		}
+		pool_configure(2, files);
+		aworker_pool_set_exec(argv[0], 1, argv);
+		if (aworker_pool_start(ctx) < 0 || !run_until(all_ready, NULL, 10000))
+			_exit(1);
+		res->pids[0] = winfo(0).pid;
+		res->pids[1] = winfo(1).pid;
+
+		osmo_select_shutdown_request();
+		while (!osmo_select_shutdown_done())
+			osmo_select_main_ctx(0);
+		t0 = now_ms();
+		aworker_pool_stop();
+		res->stop_ms = now_ms() - t0;
+		st = write(pp[1], res, sizeof(*res)) == sizeof(*res) ? 0 : 1;
+		_exit(st);
+	}
+	close(pp[1]);
+	CHECK(read(pp[0], res, sizeof(*res)) == sizeof(*res));
+	close(pp[0]);
+	CHECK(collect(bsc, &status, 10000) == bsc);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+/* Worker i received GOODBYE (and so exited 0, the fake worker's only way out after it) and was never sent SIGTERM;
+ * it is gone, collected by its main process. */
+static void check_goodbye_no_sigterm(const struct shutdown_result *res, unsigned int i)
+{
+	char how[32] = {}, path[PATH_MAX];
+	struct stat stbuf;
+
+	CHECK(read_exitlog(i, how, sizeof(how)));
+	CHECK(!strcmp(how, "goodbye"));
+	snprintf(path, sizeof(path), "%s/exit%u.term", g_dir, i);
+	CHECK(stat(path, &stbuf) < 0);
+	CHECK(res->pids[i] > 0 && pid_gone(res->pids[i]));
+}
+
+static void clear_exitlogs(void)
+{
+	char path[PATH_MAX];
+	unsigned int i;
+
+	for (i = 0; i < 2; i++) {
+		snprintf(path, sizeof(path), "%s/exit%u", g_dir, i);
+		unlink(path);
+		snprintf(path, sizeof(path), "%s/exit%u.term", g_dir, i);
+		unlink(path);
+	}
+}
+
+static void test_p5_clean_shutdown(char **argv)
+{
+	const char *extra[2] = { "", "" };
+	struct shutdown_result res = {};
+	unsigned int i;
+
+	printf("P5: osmo-bsc shuts down; GOODBYE reaches every worker, which exits 0 by itself\n");
+	clear_exitlogs();
+	run_shutdown(argv, extra, &res);
+	for (i = 0; i < 2; i++)
+		check_goodbye_no_sigterm(&res, i);
+	printf("  each worker received GOODBYE although the event loop had already ended, and exited 0: no EOF, no"
+	       " SIGTERM\n");
+	CHECK(res.stop_ms < AWORKER_TERM_GRACE_MS);
+	printf("  aworker_pool_stop() returned well within the grace period\n");
+}
+
+static void test_p6_stop_waits_for_goodbye(char **argv)
+{
+	/* Both workers run on for 300 ms after GOODBYE (like a worker that tears down its SCTP associations). */
+	const char *extra[2] = { "linger=300\n", "linger=300\n" };
+	struct shutdown_result res = {};
+	unsigned int i;
+
+	printf("P6: the workers take a while to exit after GOODBYE\n");
+	clear_exitlogs();
+	run_shutdown(argv, extra, &res);
+	for (i = 0; i < 2; i++)
+		check_goodbye_no_sigterm(&res, i);
+	CHECK(res.stop_ms >= 250 && res.stop_ms < AWORKER_TERM_GRACE_MS);
+	printf("  aworker_pool_stop() waited for them to exit by themselves (no SIGTERM), well within the grace"
+	       " period\n");
+}
+
+/***********************************************************************
  * main
  ***********************************************************************/
 
@@ -844,6 +1014,8 @@ int main(int argc, char **argv)
 	test_p2_main_killed(argv);
 	test_p3_pdeathsig_race(argv);
 	test_p4_exe_replaced();
+	test_p5_clean_shutdown(argv);
+	test_p6_stop_waits_for_goodbye(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

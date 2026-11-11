@@ -54,6 +54,8 @@
 /* aworker_pool_stop() runs after the event loop has ended (osmo-bsc is exiting), so it may wait, but only this long
  * after SIGKILL for processes that are still not collected. */
 #define STOP_KILL_WAIT_MS	2000
+/* aworker_pool_stop(): how long to keep the event loop going for a queued GOODBYE to be written. */
+#define STOP_FLUSH_MS		500
 #define STOP_POLL_MS		20
 
 extern char **environ;
@@ -98,6 +100,11 @@ struct aworker {
 	bool reap_stuck;			/*!< not collected AWORKER_REAP_STUCK_MS after SIGKILL */
 	pid_t last_pid;				/*!< the process that was lost, for the log after it is collected */
 	char lost_reason[160];			/*!< why it was lost, applied with the failure policy once collected */
+
+	/* Clean shutdown, see aworker_pool_stop(). */
+	bool goodbye_queued;
+	uint32_t goodbye_seq;			/*!< sequence number of the queued GOODBYE */
+	bool goodbye_written;			/*!< ... and the kernel took it: the worker is exiting by itself */
 
 	/*! cs7 instances this worker reported in CS7_INFO. */
 	struct aworker_ipc_cs7_info cs7;
@@ -1232,6 +1239,50 @@ int aworker_pool_start_with_fds(void *ctx, const int *fds, unsigned int num)
 	return 0;
 }
 
+/* aworker_pool_stop() only: queue GOODBYE on \a w's link, unless done before. \returns true if it is queued. May
+ * lose the worker (a link that cannot take the record closes), so the caller must re-read w->link. */
+static bool queue_goodbye(struct aworker_pool *pool, struct aworker *w)
+{
+	struct msgb *rec;
+
+	if (w->goodbye_queued)
+		return true;
+	if (!w->link || aworker_ipc_link_get_state(w->link) != AWORKER_IPC_LINK_READY)
+		return false;
+	if (aworker_ipc_enc_goodbye(pool->ctx, &rec, AWORKER_IPC_GOODBYE_SHUTDOWN) < 0)
+		return false;
+	if (aworker_ipc_link_send(w->link, rec, &w->goodbye_seq) < 0)
+		return false;
+	w->goodbye_queued = true;
+	LOGW(w, LOGL_INFO, "GOODBYE queued (seq %u)\n", w->goodbye_seq);
+	return true;
+}
+
+/* Has \a w's GOODBYE left this process? Records it in w->goodbye_written. */
+static bool goodbye_written(struct aworker *w)
+{
+	struct aworker_ipc_link_stats st;
+
+	if (!w->goodbye_written && w->goodbye_queued && w->link) {
+		aworker_ipc_link_get_stats(w->link, &st);
+		w->goodbye_written = st.last_written_seq >= w->goodbye_seq;
+	}
+	return w->goodbye_written;
+}
+
+/* A GOODBYE is queued but not written yet, on a link that is still open. */
+static bool goodbye_pending(const struct aworker_pool *pool)
+{
+	unsigned int i;
+
+	for (i = 0; i < pool->num; i++) {
+		struct aworker *w = pool->worker[i];
+		if (w->link && w->goodbye_queued && !goodbye_written(w))
+			return true;
+	}
+	return false;
+}
+
 /* aworker_pool_stop() only: collect whatever has exited, until all are collected or \a ms have passed. Runs after
  * the event loop has ended (osmo-bsc is exiting), so sleeping here blocks nothing; the wait is bounded.
  * \returns true if no process is left. */
@@ -1303,29 +1354,52 @@ void aworker_pool_stop(void)
 {
 	struct aworker_pool *pool = g_pool;
 	struct aworker_user *au;
+	bool goodbye_delivered = false;
 	unsigned int i;
 
 	if (!pool)
 		return;
+	/* No worker is (re)started from here on: neither the failure policy (see 'stopping') nor a timer that
+	 * fires while the event loop is polled below. */
 	pool->stopping = true;
 	osmo_timer_del(&pool->startup_timer);
+	for (i = 0; i < pool->num; i++)
+		osmo_timer_del(&pool->worker[i]->restart_timer);
+
+	/* Tell every worker GOODBYE, so that it exits by itself (status 0). Queueing is not enough: osmo-bsc's
+	 * event loop has ended, and freeing a link drops whatever it has not written yet. So keep polling the
+	 * event loop, without blocking and for a bounded time, until every GOODBYE is written. (Queueing it from
+	 * the main loop once a shutdown is requested would not do either: a request that arrives while the loop
+	 * dispatches ends the loop in that same iteration, as libosmocore only counts the writes pending then.)
+	 * A link that closes meanwhile loses its worker the usual way. */
+	for (i = 0; i < pool->num; i++)
+		queue_goodbye(pool, pool->worker[i]);
+	if (goodbye_pending(pool)) {
+		struct timespec t0;
+
+		osmo_clock_gettime(CLOCK_MONOTONIC, &t0);
+		while (goodbye_pending(pool) && ms_since(&t0) < STOP_FLUSH_MS) {
+			if (!osmo_select_main_ctx(1))
+				usleep(1000);
+		}
+	}
 
 	for (i = 0; i < pool->num; i++) {
 		struct aworker *w = pool->worker[i];
-		struct msgb *rec;
 
-		osmo_timer_del(&w->restart_timer);
 		osmo_timer_del(&w->reap_timer);
+		if (goodbye_written(w) && w->pid > 0)
+			goodbye_delivered = true;
 		if (w->link) {
-			if (aworker_ipc_link_get_state(w->link) == AWORKER_IPC_LINK_READY
-			    && aworker_ipc_enc_goodbye(pool->ctx, &rec, AWORKER_IPC_GOODBYE_SHUTDOWN) == 0)
-				aworker_ipc_link_send(w->link, rec, NULL);
 			aworker_ipc_link_free(w->link);
 			w->link = NULL;
 		}
 		w->main_fd = -1;
 		w->state = AWORKER_ST_STOPPED;
 	}
+	/* A worker that got GOODBYE exits 0 by itself: give it the grace period before anyone is signalled. */
+	if (goodbye_delivered)
+		stop_wait(pool, AWORKER_TERM_GRACE_MS);
 	stop_processes(pool);
 
 	/* The users outlive the pool (they are owned by the A interface code), so detach them explicitly. */

@@ -31,6 +31,12 @@ cat $abs_srcdir/aworker_pool/aworker_pool_test.ok > expout
 AT_CHECK([$abs_top_builddir/tests/aworker_pool/aworker_pool_test], [], [expout], [ignore])
 AT_CLEANUP
 
+AT_SETUP([aworker_proc])
+AT_KEYWORDS([aworker_proc])
+cat $abs_srcdir/aworker_proc/aworker_proc_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_proc/aworker_proc_test], [], [expout], [ignore])
+AT_CLEANUP
+
 AT_SETUP([bsc])
 AT_KEYWORDS([bsc])
 cat $abs_srcdir/bsc/bsc_test.ok > expout

@@ -811,6 +811,47 @@ static void test_t8_bind_refused(void)
 	fixture_down();
 }
 
+/***********************************************************************
+ * T9: the running pool owns its configuration strings
+ ***********************************************************************/
+
+/* Regression: the pool used to keep pointers into the VTY's configuration (a shallow struct copy), so that
+ * 'worker N config-file FILE' or 'no worker N config-file' at runtime freed a string the pool still used when it
+ * restarted that worker or ran 'show a-worker-pool'. Under AddressSanitizer this test failed with a
+ * heap-use-after-free on the old code path. */
+static void test_t9_cfg_ownership(void)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	struct aworker_pool_worker_info info;
+	const char *orig = "/etc/osmocom/osmo-bsc-aworker0.cfg";
+	int sp[2];
+
+	printf("T9: the running pool owns its configuration strings\n");
+	cfg->cfg_file[0] = talloc_strdup(ctx, orig);
+	OSMO_ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) == 0);
+	CHECK(aworker_pool_start_with_fds(ctx, &sp[0], 1) == 0);
+	CHECK(aworker_pool_num_workers() == 1);
+
+	CHECK(aworker_pool_worker_info(0, &info) == 0);
+	CHECK(info.cfg_file && info.cfg_file != cfg->cfg_file[0] && !strcmp(info.cfg_file, orig));
+	printf("  the pool uses its own copy of the config file name\n");
+
+	/* What 'worker 0 config-file FILE' does at runtime: the old string is freed. */
+	osmo_talloc_replace_string(ctx, &cfg->cfg_file[0], "/tmp/changed.cfg");
+	CHECK(aworker_pool_worker_info(0, &info) == 0 && !strcmp(info.cfg_file, orig));
+	/* What 'no worker 0 config-file' does at runtime. */
+	TALLOC_FREE(cfg->cfg_file[0]);
+	CHECK(aworker_pool_worker_info(0, &info) == 0 && !strcmp(info.cfg_file, orig));
+	printf("  replacing or removing the configured file at runtime leaves the running pool's copy intact\n");
+
+	CHECK(aworker_pool_worker_info(1, &info) == -EINVAL);
+	aworker_pool_stop();
+	CHECK(aworker_pool_worker_info(0, &info) == -ENODEV);
+	CHECK(aworker_pool_num_workers() == 0);
+	close(sp[1]);
+	printf("  the copy goes away with the pool\n");
+}
+
 int main(void)
 {
 	size_t blocks;
@@ -837,6 +878,7 @@ int main(void)
 	test_t6_unbind_and_stop();
 	test_t7_duplicate_cs7();
 	test_t8_bind_refused();
+	test_t9_cfg_ownership();
 
 	printf("talloc blocks at the end: %s\n", talloc_total_blocks(ctx) == blocks ? "unchanged" : "grown");
 	CHECK(talloc_total_blocks(ctx) == blocks);

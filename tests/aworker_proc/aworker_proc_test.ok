@@ -1,0 +1,18 @@
+P1: two real worker processes; one is lost, the other is not affected
+  both workers started (fork + exec) and reported their cs7 instance
+  with >300 descriptors (one above 1023) open in the main process, each worker holds only stdio and its IPC socket
+  worker 0 was taken down: SIGTERM ignored, SIGKILL after the grace period
+  its replacement started only after the old process was collected
+  worker 1 stayed READY with the same process, and its event loop kept running
+  the main event loop was never blocked while worker 0 was taken down
+  the restarted worker 0 also holds only stdio and its IPC socket
+  a process that cannot be collected keeps its worker TERMINATING and is reported as stuck; no second generation is started, worker 1 is unaffected
+  once it can be collected, the worker is restarted
+  stopping the pool collects every worker (the one ignoring SIGTERM via SIGKILL): no process, no zombie left
+P2: the main process is SIGKILLed; its workers do not survive it
+  both workers were terminated by the parent-death signal (SIGTERM) and collected
+P3: the main process dies between fork() and PR_SET_PDEATHSIG
+  the child noticed it was orphaned and exited before exec: no worker without its main process
+P4: the executable file is replaced while the main process runs
+  a worker restarted after its executable was deleted and replaced still runs the original image
+PASSED

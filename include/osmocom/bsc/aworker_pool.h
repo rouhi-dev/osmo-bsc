@@ -66,6 +66,14 @@ struct aworker;
 #define AWORKER_STARTUP_TIMEOUT_DEFAULT	20
 #define AWORKER_RESTART_DELAY_DEFAULT	5
 
+/* Taking a worker down never blocks the main process: SIGTERM, then waitpid(WNOHANG) from a timer, SIGKILL after
+ * the grace period, and polling again until the process is collected. A worker whose process has not been collected
+ * is never started again (see AWORKER_ST_TERMINATING). */
+#define AWORKER_TERM_GRACE_MS		1000	/*!< SIGTERM -> SIGKILL */
+#define AWORKER_REAP_POLL_MS		50	/*!< first waitpid(WNOHANG) poll interval; doubles up to the max */
+#define AWORKER_REAP_POLL_MAX_MS	1000
+#define AWORKER_REAP_STUCK_MS		10000	/*!< after SIGKILL: report the process as stuck (e.g. in D state) */
+
 /* Exit codes of a worker process, as seen by the main process through waitpid(). */
 #define AWORKER_EXIT_OK			0
 #define AWORKER_EXIT_CONFIG		66	/*!< unusable worker configuration; a restart cannot help */
@@ -81,6 +89,21 @@ enum aworker_state {
 	AWORKER_ST_STARTING,	/*!< process started, IPC handshake and/or CS7_INFO still pending */
 	AWORKER_ST_READY,	/*!< handshake done and cs7 instances reported */
 	AWORKER_ST_RESTARTING,	/*!< waiting for 'restart-delay' before the next start */
+	AWORKER_ST_TERMINATING,	/*!< lost: the process was signalled and has not been collected yet. A worker never
+				 *   leaves this state before waitpid() returned its status, so that two generations of
+				 *   one worker can never run at the same time. */
+};
+
+/*! A read-only snapshot of one worker, for status reporting and tests. */
+struct aworker_pool_worker_info {
+	unsigned int idx;
+	enum aworker_state state;
+	pid_t pid;			/*!< current process; 0 if none (not started, or collected) */
+	unsigned int starts;		/*!< number of processes started for this worker so far */
+	const char *cfg_file;		/*!< the config file the pool starts this worker with (the pool's own copy;
+					 *   valid until the pool stops) */
+	bool sigkill_sent;		/*!< TERMINATING: SIGTERM was not enough */
+	bool reap_stuck;		/*!< TERMINATING: still not collected AWORKER_REAP_STUCK_MS after SIGKILL */
 };
 
 struct aworker_pool_cfg {
@@ -109,7 +132,9 @@ int aworker_pool_prescan_config(const char *config_file);
  * has an Application Server. \returns 0 or -EINVAL (errors are logged). */
 int aworker_pool_check_main_cs7(void);
 /*! Record how to start a worker: the osmo-bsc executable and the command line it was started with (the logging
- * options are passed on to the workers). Must be called before aworker_pool_start(). */
+ * options are passed on to the workers). Must be called before aworker_pool_start(), early: it opens the running
+ * executable (/proc/self/exe) once, and every worker generation is executed from that descriptor with fexecve(),
+ * so a worker is always the same binary image as its main process, even if the file is replaced or deleted later. */
 void aworker_pool_set_exec(const char *argv0, int argc, char **argv);
 
 /* Life cycle, main process */
@@ -120,7 +145,9 @@ void aworker_pool_set_exec(const char *argv0, int argc, char **argv);
  * process is fully up and has its Abis, MGW, CTRL and VTY sockets open.
  * \returns 0 if all workers were started, negative errno otherwise (nothing is left running on error). */
 int aworker_pool_start(void *ctx);
-/*! Send GOODBYE to all workers, wait for them to exit and free the pool. Idempotent. */
+/*! Send GOODBYE to all workers, stop them and free the pool. Idempotent. Runs when osmo-bsc exits, after its
+ * event loop: it signals all workers at once and waits a bounded time for them (never forever). A process that
+ * cannot be collected (stuck in the kernel) is reported, not assumed gone. */
 void aworker_pool_stop(void);
 bool aworker_pool_all_ready(void);
 /*! True if the pool requested the shutdown of osmo-bsc because a worker could not be kept running. main()
@@ -130,6 +157,10 @@ bool aworker_pool_shutdown_was_fatal(void);
  * \returns true and fills *out, or false if no ready worker owns that instance. */
 bool aworker_pool_cs7_info(uint32_t cs7_id, struct aworker_ipc_cs7_entry *out);
 void aworker_pool_dump_vty(struct vty *vty);
+/*! Number of workers of the running pool (0 if no pool is running). */
+unsigned int aworker_pool_num_workers(void);
+/*! Snapshot of worker \a idx of the running pool. \returns 0, or -ENODEV / -EINVAL. */
+int aworker_pool_worker_info(unsigned int idx, struct aworker_pool_worker_info *out);
 
 /*! Testing seam: start the pool on already connected AF_UNIX SOCK_SEQPACKET sockets instead of forking. fds[i]
  * is the main-process end of the link to worker i and is owned by the pool afterwards. */

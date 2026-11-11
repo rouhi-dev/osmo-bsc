@@ -37,5 +37,9 @@ T7: two workers claiming the same cs7 instance
   the second claim is refused; the first worker keeps cs7 instance 0
 T8: a bind the worker refuses
   a refused bind leaves the user unusable and is not retried on a running worker
+T9: the running pool owns its configuration strings
+  the pool uses its own copy of the config file name
+  replacing or removing the configured file at runtime leaves the running pool's copy intact
+  the copy goes away with the pool
 talloc blocks at the end: unchanged
 PASSED

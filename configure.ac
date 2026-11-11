@@ -242,6 +242,7 @@ AC_OUTPUT(
     tests/aworker_cfg_scan/Makefile
     tests/aworker_ipc/Makefile
     tests/aworker_pool/Makefile
+    tests/aworker_proc/Makefile
     tests/bsc/Makefile
     tests/codec_pref/Makefile
     tests/gsm0408/Makefile

@@ -26,9 +26,12 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <limits.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <osmocom/core/linuxlist.h>
@@ -48,10 +51,12 @@
 #include <osmocom/bsc/bsc_sccp_backend.h>
 #include <osmocom/bsc/debug.h>
 
-/* How long worker_kill_and_reap() waits for a worker to exit before it sends SIGKILL. The main process blocks for
- * at most this long, and only when a worker is being taken down. */
-#define REAP_POLL_INTERVAL_US	50000
-#define REAP_POLL_ATTEMPTS	20
+/* aworker_pool_stop() runs after the event loop has ended (osmo-bsc is exiting), so it may wait, but only this long
+ * after SIGKILL for processes that are still not collected. */
+#define STOP_KILL_WAIT_MS	2000
+#define STOP_POLL_MS		20
+
+extern char **environ;
 
 struct aworker_pool;
 
@@ -84,6 +89,16 @@ struct aworker {
 	struct osmo_timer_list restart_timer;
 	unsigned int starts;			/*!< number of times this worker was started */
 
+	/* Taking the process down without blocking (AWORKER_ST_TERMINATING), see worker_begin_termination(). */
+	struct osmo_timer_list reap_timer;
+	struct timespec term_since;		/*!< when SIGTERM was sent */
+	struct timespec kill_since;		/*!< when SIGKILL was sent */
+	unsigned int reap_poll_ms;		/*!< next waitpid(WNOHANG) poll interval */
+	bool sigkill_sent;
+	bool reap_stuck;			/*!< not collected AWORKER_REAP_STUCK_MS after SIGKILL */
+	pid_t last_pid;				/*!< the process that was lost, for the log after it is collected */
+	char lost_reason[160];			/*!< why it was lost, applied with the failure policy once collected */
+
 	/*! cs7 instances this worker reported in CS7_INFO. */
 	struct aworker_ipc_cs7_info cs7;
 	bool cs7_reported;
@@ -91,7 +106,9 @@ struct aworker {
 
 struct aworker_pool {
 	void *ctx;
-	struct aworker_pool_cfg cfg;		/*!< copy taken at start time */
+	/*! Copy taken at start time. Its strings (cfg_file[]) are the pool's own talloc copies: the VTY may replace or
+	 * free the ones in g_cfg at any time, and changes there only take effect when osmo-bsc is restarted. */
+	struct aworker_pool_cfg cfg;
 	unsigned int num;
 	struct aworker *worker[AWORKER_POOL_MAX_WORKERS];
 	struct llist_head users;
@@ -118,6 +135,10 @@ static bool g_fatal;
 static char *g_exec_path;
 static char **g_exec_log_argv;		/*!< NULL terminated, talloc'ed under g_exec_path */
 static unsigned int g_exec_log_argc;
+/*! The running executable, opened once by aworker_pool_set_exec() (O_CLOEXEC). Workers are fexecve()d from it, so
+ * every generation is the very binary image of the main process, whatever happens to its path later. -1: not
+ * available, fall back to g_exec_path. */
+static int g_exec_fd = -1;
 
 #define LOGW(w, lvl, fmt, args...) \
 	LOGP(DAWORKER, lvl, "aworker %u (pid %ld): " fmt, (w)->idx, (long)(w)->pid, ## args)
@@ -129,6 +150,7 @@ static const struct value_string state_names[] = {
 	{ AWORKER_ST_STARTING, "STARTING" },
 	{ AWORKER_ST_READY, "READY" },
 	{ AWORKER_ST_RESTARTING, "RESTARTING" },
+	{ AWORKER_ST_TERMINATING, "TERMINATING" },
 	{ 0, NULL }
 };
 
@@ -354,81 +376,31 @@ static void users_lose_worker(struct aworker *w)
 static int worker_spawn(struct aworker *w);
 static void worker_lost(struct aworker *w, const char *why);
 
-/* Collect the worker process. Sends SIGTERM, and SIGKILL if it does not exit. Blocks for at most
- * REAP_POLL_ATTEMPTS * REAP_POLL_INTERVAL_US, and only while a worker is being taken down.
- * \param[out] config_error  set to true if the worker exited with AWORKER_EXIT_CONFIG. */
-static void worker_kill_and_reap(struct aworker *w, bool *config_error)
+static unsigned int ms_since(const struct timespec *t)
 {
-	unsigned int i;
-	int status;
+	struct timespec now;
+	long long ms;
 
-	if (config_error)
-		*config_error = false;
-	if (w->pid <= 0)
-		return;
-
-	for (i = 0; i < REAP_POLL_ATTEMPTS; i++) {
-		pid_t rc = waitpid(w->pid, &status, WNOHANG);
-		if (rc == w->pid) {
-			if (WIFEXITED(status))
-				LOGW(w, WEXITSTATUS(status) == AWORKER_EXIT_OK ? LOGL_INFO : LOGL_NOTICE,
-				     "exited with status %u\n", WEXITSTATUS(status));
-			else if (WIFSIGNALED(status))
-				LOGW(w, LOGL_ERROR, "killed by signal %u\n", WTERMSIG(status));
-			w->pid = 0;
-			/* A configuration failure is permanent: restarting cannot help. */
-			if (config_error && WIFEXITED(status) && WEXITSTATUS(status) == AWORKER_EXIT_CONFIG)
-				*config_error = true;
-			return;
-		}
-		if (rc < 0) {
-			/* ECHILD: not our child (test mode) or already reaped */
-			w->pid = 0;
-			return;
-		}
-		if (i == 0)
-			kill(w->pid, SIGTERM);
-		usleep(REAP_POLL_INTERVAL_US);
-	}
-	LOGW(w, LOGL_ERROR, "did not exit after SIGTERM, sending SIGKILL\n");
-	kill(w->pid, SIGKILL);
-	waitpid(w->pid, &status, 0);
-	w->pid = 0;
+	osmo_clock_gettime(CLOCK_MONOTONIC, &now);
+	ms = (long long)(now.tv_sec - t->tv_sec) * 1000 + (now.tv_nsec - t->tv_nsec) / 1000000;
+	return ms < 0 ? 0 : (ms > UINT_MAX ? UINT_MAX : (unsigned int)ms);
 }
 
-static void restart_timer_cb(void *data)
+static void log_exit_status(struct aworker *w, int status)
 {
-	struct aworker *w = data;
-
-	if (w->pool->stopping)
-		return;
-	LOGW(w, LOGL_NOTICE, "restarting worker (start #%u)\n", w->starts + 1);
-	if (worker_spawn(w) < 0) {
-		LOGW(w, LOGL_ERROR, "restart failed, retrying in %u s\n", w->pool->cfg.restart_delay);
-		osmo_timer_schedule(&w->restart_timer, w->pool->cfg.restart_delay, 0);
-	}
+	if (WIFEXITED(status))
+		LOGW(w, WEXITSTATUS(status) == AWORKER_EXIT_OK ? LOGL_INFO : LOGL_NOTICE,
+		     "exited with status %u\n", WEXITSTATUS(status));
+	else if (WIFSIGNALED(status))
+		LOGW(w, LOGL_ERROR, "killed by signal %u\n", WTERMSIG(status));
 }
 
-/* The worker is gone: drop its link, collect the process, tell the users, then apply the failure policy. */
-static void worker_lost(struct aworker *w, const char *why)
+/* What happens to a lost worker once its process is collected (or if there never was one): the failure policy. */
+static void worker_apply_policy(struct aworker *w, bool config_error)
 {
 	struct aworker_pool *pool = w->pool;
-	bool config_error = false;
-	long pid = (long)w->pid;
-
-	if (w->link) {
-		aworker_ipc_link_free(w->link);
-		w->link = NULL;
-	}
-	w->main_fd = -1;
-	w->cs7_reported = false;
-	memset(&w->cs7, 0, sizeof(w->cs7));
-	w->state = AWORKER_ST_STOPPED;
-
-	/* No SCCP operation is ever replayed: whatever was in flight towards this worker is treated as lost, and
-	 * every SCCP connection of its cs7 instances is torn down by the users' 'unavailable' call-back. */
-	users_lose_worker(w);
-	worker_kill_and_reap(w, &config_error);
+	const char *why = w->lost_reason;
+	long pid = (long)w->last_pid;
 
 	if (pool->stopping)
 		return;
@@ -463,6 +435,159 @@ static void worker_lost(struct aworker *w, const char *why)
 		osmo_timer_schedule(&w->restart_timer, pool->cfg.restart_delay, 0);
 		return;
 	}
+}
+
+/* The process is gone and collected: only now may this worker be started again. */
+static void worker_collected(struct aworker *w, int status, bool have_status)
+{
+	bool config_error = have_status && WIFEXITED(status) && WEXITSTATUS(status) == AWORKER_EXIT_CONFIG;
+
+	osmo_timer_del(&w->reap_timer);
+	if (have_status)
+		log_exit_status(w, status);
+	w->last_pid = w->pid;
+	w->pid = 0;
+	w->sigkill_sent = false;
+	w->reap_stuck = false;
+	w->state = AWORKER_ST_STOPPED;
+	worker_apply_policy(w, config_error);
+}
+
+/* One non-blocking look at the process. \returns true if it was collected (worker_collected() has run). */
+static bool worker_try_collect(struct aworker *w)
+{
+	int status;
+	pid_t rc;
+
+	rc = waitpid(w->pid, &status, WNOHANG);
+	if (rc == w->pid) {
+		worker_collected(w, status, true);
+		return true;
+	}
+	if (rc < 0 && errno == ECHILD) {
+		/* A child stays waitable until it is reaped, so for our own former child ECHILD means it is dead and
+		 * was already reaped (e.g. by the kernel, if SIGCHLD is ignored). Its pid may already belong to another
+		 * process: never look at or signal that pid again. */
+		LOGW(w, LOGL_NOTICE, "process already reaped elsewhere (exit status unknown)\n");
+		worker_collected(w, 0, false);
+		return true;
+	}
+	if (rc < 0 && errno != EINTR) {
+		LOGW(w, LOGL_ERROR, "waitpid() failed: %s; will try again\n", strerror(errno));
+	}
+	return false;
+}
+
+/* Timer: poll the process, escalate to SIGKILL after the grace period, report it if it cannot be collected. Never
+ * blocks; the interval grows from AWORKER_REAP_POLL_MS to AWORKER_REAP_POLL_MAX_MS, so this is no busy loop. */
+static void reap_timer_cb(void *data)
+{
+	struct aworker *w = data;
+	unsigned int next;
+
+	if (worker_try_collect(w))
+		return;
+
+	if (!w->sigkill_sent) {
+		unsigned int elapsed = ms_since(&w->term_since);
+		if (elapsed >= AWORKER_TERM_GRACE_MS) {
+			LOGW(w, LOGL_ERROR, "did not exit %u ms after SIGTERM, sending SIGKILL\n", elapsed);
+			kill(w->pid, SIGKILL);
+			w->sigkill_sent = true;
+			osmo_clock_gettime(CLOCK_MONOTONIC, &w->kill_since);
+			w->reap_poll_ms = AWORKER_REAP_POLL_MS;
+		}
+	} else if (!w->reap_stuck && ms_since(&w->kill_since) >= AWORKER_REAP_STUCK_MS) {
+		/* E.g. in uninterruptible sleep in the kernel. It cannot run any code of ours any more, but it is not
+		 * gone either: keep it TERMINATING (so it is never started twice) and keep trying, less often. */
+		w->reap_stuck = true;
+		LOGW(w, LOGL_FATAL, "still not collected %u ms after SIGKILL (stuck in the kernel?); this worker is not"
+		     " restarted until the process is gone\n", ms_since(&w->kill_since));
+	}
+
+	next = w->reap_poll_ms;
+	if (!w->sigkill_sent) {
+		/* Do not overshoot the grace period. */
+		unsigned int elapsed = ms_since(&w->term_since);
+		unsigned int left = elapsed < AWORKER_TERM_GRACE_MS ? AWORKER_TERM_GRACE_MS - elapsed : 0;
+		if (left < next)
+			next = left ? left : 1;
+	}
+	w->reap_poll_ms = OSMO_MIN(w->reap_poll_ms * 2, AWORKER_REAP_POLL_MAX_MS);
+	osmo_timer_schedule(&w->reap_timer, next / 1000, (next % 1000) * 1000);
+}
+
+/* Take the worker's process down without blocking: collect it right away if it has already exited, otherwise
+ * SIGTERM it and let reap_timer_cb() collect it (SIGKILL after AWORKER_TERM_GRACE_MS). The worker stays in
+ * AWORKER_ST_TERMINATING until then; worker_collected() applies the failure policy. */
+static void worker_begin_termination(struct aworker *w)
+{
+	OSMO_ASSERT(w->pid > 0);
+
+	w->state = AWORKER_ST_TERMINATING;
+	w->sigkill_sent = false;
+	w->reap_stuck = false;
+	if (worker_try_collect(w))
+		return;
+
+	kill(w->pid, SIGTERM);
+	osmo_clock_gettime(CLOCK_MONOTONIC, &w->term_since);
+	w->reap_poll_ms = AWORKER_REAP_POLL_MS;
+	LOGW(w, LOGL_INFO, "SIGTERM sent; collecting the process in the background\n");
+	osmo_timer_schedule(&w->reap_timer, 0, AWORKER_REAP_POLL_MS * 1000);
+}
+
+static void restart_timer_cb(void *data)
+{
+	struct aworker *w = data;
+
+	if (w->pool->stopping)
+		return;
+	/* worker_apply_policy() only schedules this once the previous process was collected. Check anyway: starting
+	 * a second generation next to a live first one would open the same SCTP associations twice. */
+	if (w->pid > 0 || w->state == AWORKER_ST_TERMINATING) {
+		LOGW(w, LOGL_ERROR, "previous process not collected yet, not starting a new one\n");
+		return;
+	}
+	LOGW(w, LOGL_NOTICE, "restarting worker (start #%u)\n", w->starts + 1);
+	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING) {
+		LOGW(w, LOGL_ERROR, "restart failed, retrying in %u s\n", w->pool->cfg.restart_delay);
+		w->state = AWORKER_ST_RESTARTING;
+		osmo_timer_schedule(&w->restart_timer, w->pool->cfg.restart_delay, 0);
+	}
+}
+
+/* The worker is gone: drop its link and tell the users right away (that is what confines the failure to this
+ * worker's cs7 instances), then collect the process without blocking and apply the failure policy once it is
+ * collected. */
+static void worker_lost(struct aworker *w, const char *why)
+{
+	/* Already being taken down: the link is gone and the users were told; collection is under way. */
+	if (w->state == AWORKER_ST_TERMINATING)
+		return;
+
+	if (w->link) {
+		aworker_ipc_link_free(w->link);
+		w->link = NULL;
+	}
+	w->main_fd = -1;
+	w->cs7_reported = false;
+	memset(&w->cs7, 0, sizeof(w->cs7));
+	/* TERMINATING before the users' call-backs run: should one of them lead back here, the check above returns. */
+	w->state = w->pid > 0 ? AWORKER_ST_TERMINATING : AWORKER_ST_STOPPED;
+	osmo_strlcpy(w->lost_reason, why, sizeof(w->lost_reason));
+
+	/* No SCCP operation is ever replayed: whatever was in flight towards this worker is treated as lost, and
+	 * every SCCP connection of its cs7 instances is torn down by the users' 'unavailable' call-back. */
+	users_lose_worker(w);
+
+	if (w->pid > 0) {
+		w->last_pid = w->pid;
+		worker_begin_termination(w);
+		return;
+	}
+	w->last_pid = 0;
+	worker_apply_policy(w, false);
 }
 
 /***********************************************************************
@@ -697,6 +822,19 @@ static bool is_log_opt(const char *arg, bool *takes_value)
 	return false;
 }
 
+/* Move a descriptor that landed on 0, 1 or 2 (because osmo-bsc was started with a standard stream closed) above
+ * them, so that it can never be mistaken for, or replaced as, a standard stream. \returns the new fd or -1. */
+static int fd_above_stdio(int fd, bool cloexec)
+{
+	int nfd;
+
+	if (fd < 0 || fd > 2)
+		return fd;
+	nfd = fcntl(fd, cloexec ? F_DUPFD_CLOEXEC : F_DUPFD, 3);
+	close(fd);
+	return nfd;
+}
+
 void aworker_pool_set_exec(const char *argv0, int argc, char **argv)
 {
 	char path[PATH_MAX];
@@ -717,6 +855,16 @@ void aworker_pool_set_exec(const char *argv0, int argc, char **argv)
 	}
 	OSMO_ASSERT(g_exec_path);
 
+	/* Hold on to the binary image itself, not to its name: replacing or deleting the file later (a reinstall
+	 * while osmo-bsc runs) must neither break a worker restart nor start a different build next to this one. */
+	if (g_exec_fd >= 0)
+		close(g_exec_fd);
+	g_exec_fd = fd_above_stdio(open("/proc/self/exe", O_RDONLY | O_CLOEXEC), true);
+	if (g_exec_fd < 0)
+		LOGP(DAWORKER, LOGL_NOTICE, "cannot open /proc/self/exe (%s): workers will be started from the path '%s',"
+		     " so replacing that file while osmo-bsc runs would make a restarted worker a different binary\n",
+		     strerror(errno), g_exec_path);
+
 	g_exec_log_argv = talloc_zero_array(g_exec_path, char *, argc + 1);
 	OSMO_ASSERT(g_exec_log_argv);
 	for (i = 1; i < argc; i++) {
@@ -729,53 +877,131 @@ void aworker_pool_set_exec(const char *argv0, int argc, char **argv)
 	}
 }
 
-/* In the child, between fork() and execv(): close every descriptor but stdio and the IPC socket, so that no
- * socket, log file or database handle of the main process survives into the worker. */
-static void child_close_fds(int keep_fd)
+/* Descriptor hygiene in the child, between fork() and exec(): close EVERY descriptor except stdio and the ones in
+ * keep[] (sorted ascending, all > 2). No fixed limit: close_range() if the kernel has it, otherwise /proc/self/fd
+ * is swept until nothing is left to close, and only without /proc the RLIMIT_NOFILE range is closed. */
+static bool is_kept(int fd, const int *keep, unsigned int n_keep)
 {
-	int fds[256];
-	unsigned int n = 0, i;
-	struct dirent *de;
-	DIR *d;
+	unsigned int i;
 
-	d = opendir("/proc/self/fd");
-	if (!d) {
-		/* Fall back to a bounded sweep; OPEN_MAX is not necessarily meaningful, so use a sane ceiling. */
-		for (i = 3; i < 1024; i++) {
-			if ((int)i != keep_fd)
-				close((int)i);
-		}
-		return;
+	for (i = 0; i < n_keep; i++) {
+		if (keep[i] == fd)
+			return true;
 	}
-	while ((de = readdir(d)) && n < ARRAY_SIZE(fds)) {
-		int fd = atoi(de->d_name);
-		if (fd <= 2 || fd == keep_fd || fd == dirfd(d))
-			continue;
-		fds[n++] = fd;
-	}
-	closedir(d);
-	for (i = 0; i < n; i++)
-		close(fds[i]);
+	return false;
 }
 
-/* Run in the child after fork(); never returns. */
-static void child_exec_worker(unsigned int idx, const char *cfg_file, int fd)
+static int sys_close_range(unsigned int first, unsigned int last)
+{
+#ifdef SYS_close_range
+	return (int)syscall(SYS_close_range, first, last, 0);
+#else
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
+static void close_fds_by_rlimit(const int *keep, unsigned int n_keep)
+{
+	struct rlimit rl;
+	unsigned long max = 1024, fd;
+
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+		max = OSMO_MAX((unsigned long)rl.rlim_cur, 1024UL);
+	else
+		max = 1UL << 20;
+	for (fd = 3; fd < max; fd++) {
+		if (!is_kept((int)fd, keep, n_keep))
+			close((int)fd);
+	}
+}
+
+static void close_fds_by_proc(const int *keep, unsigned int n_keep)
+{
+	for (;;) {
+		int batch[128];
+		unsigned int n = 0, i;
+		struct dirent *de;
+		DIR *d = opendir("/proc/self/fd");
+
+		if (!d) {
+			/* Not even /proc: we cannot see which descriptors are open, so close the whole range. */
+			static const char msg[] = "osmo-bsc: aworker: no close_range() and no /proc/self/fd; closing"
+						  " descriptors up to RLIMIT_NOFILE\n";
+			if (write(2, msg, sizeof(msg) - 1) < 0) {}
+			close_fds_by_rlimit(keep, n_keep);
+			return;
+		}
+		while ((de = readdir(d)) && n < ARRAY_SIZE(batch)) {
+			char *end;
+			long fd = strtol(de->d_name, &end, 10);
+			if (*end || end == de->d_name || fd <= 2 || fd == dirfd(d) || is_kept((int)fd, keep, n_keep))
+				continue;
+			batch[n++] = (int)fd;
+		}
+		closedir(d);
+		if (!n)
+			return;		/* a full pass found nothing more to close */
+		for (i = 0; i < n; i++)
+			close(batch[i]);
+	}
+}
+
+static void child_close_fds(const int *keep, unsigned int n_keep)
+{
+	unsigned int first = 3, i;
+
+	for (i = 0; i <= n_keep; i++) {
+		unsigned int last = i < n_keep ? (unsigned int)keep[i] - 1 : ~0U;
+		if (first <= last && sys_close_range(first, last) < 0) {
+			close_fds_by_proc(keep, n_keep);	/* ENOSYS (old kernel), EPERM (seccomp), ... */
+			return;
+		}
+		if (i < n_keep)
+			first = (unsigned int)keep[i] + 1;
+	}
+}
+
+/* Run in the child after fork(); never returns. \param parent pid of the main process, taken before fork(). */
+static void child_exec_worker(unsigned int idx, const char *cfg_file, int fd, pid_t parent)
 {
 	char **argv;
 	char fdstr[16], idxstr[16];
 	unsigned int n = 0, i;
+	int keep[2], n_keep = 0;
 	int flags;
 
 	/* Die with the main process, whatever happens to it -- including SIGKILL, which leaves no chance to
 	 * send GOODBYE. This survives the execv() below. */
 	prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+	/* ... but only for a parent death AFTER this call. If the main process is already gone, we were re-parented
+	 * and nobody would ever tell us: do not become an orphan worker with an SCTP association of its own. */
+	if (getppid() != parent)
+		_exit(AWORKER_EXIT_LINK);
 
-	/* The IPC socket must survive execv(). */
+	/* The IPC socket must survive exec(), and it must not sit on a standard stream's number. */
+	if (fd <= 2) {
+		int old = fd, null_fd;
+		fd = fcntl(old, F_DUPFD, 3);
+		if (fd < 0)
+			_exit(AWORKER_EXIT_LINK);
+		null_fd = open("/dev/null", O_RDWR);
+		if (null_fd >= 0 && null_fd != old) {
+			dup2(null_fd, old);
+			close(null_fd);
+		}
+	}
 	flags = fcntl(fd, F_GETFD);
 	if (flags >= 0)
 		fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
 
-	child_close_fds(fd);
+	/* Keep the IPC socket, and the executable we exec from (it is O_CLOEXEC, so the worker does not inherit it). */
+	if (g_exec_fd >= 0 && g_exec_fd < fd)
+		keep[n_keep++] = g_exec_fd;
+	keep[n_keep++] = fd;
+	if (g_exec_fd >= 0 && g_exec_fd > fd)
+		keep[n_keep++] = g_exec_fd;
+	child_close_fds(keep, n_keep);
 
 	snprintf(fdstr, sizeof(fdstr), "%d", fd);
 	snprintf(idxstr, sizeof(idxstr), "%u", idx);
@@ -794,9 +1020,14 @@ static void child_exec_worker(unsigned int idx, const char *cfg_file, int fd)
 	argv[n++] = (char *)cfg_file;
 	argv[n] = NULL;
 
-	execv(g_exec_path, argv);
-	/* execv() only returns on failure, and we have no usable logging left here. */
-	fprintf(stderr, "osmo-bsc: aworker %u: cannot execute '%s': %s\n", idx, g_exec_path, strerror(errno));
+	/* Same command line and environment as execv() would use, but from the binary image we were started from. */
+	if (g_exec_fd >= 0)
+		fexecve(g_exec_fd, argv, environ);
+	else
+		execv(g_exec_path, argv);
+	/* exec only returns on failure, and we have no usable logging left here. */
+	fprintf(stderr, "osmo-bsc: aworker %u: cannot execute '%s'%s: %s\n", idx, g_exec_path,
+		g_exec_fd >= 0 ? " (from the descriptor opened at startup)" : "", strerror(errno));
 	_exit(AWORKER_EXIT_CONFIG);
 }
 
@@ -804,6 +1035,7 @@ static int worker_spawn(struct aworker *w)
 {
 	struct aworker_pool *pool = w->pool;
 	const char *cfg_file = pool->cfg.cfg_file[w->idx];
+	pid_t parent = getpid();
 	int sp[2];
 	pid_t pid;
 	int rc;
@@ -812,7 +1044,13 @@ static int worker_spawn(struct aworker *w)
 	OSMO_ASSERT(cfg_file);
 	OSMO_ASSERT(g_exec_path);
 
-	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) < 0) {
+	/* Never two generations of one worker: the previous process must have been collected. */
+	if (w->pid > 0 || w->state == AWORKER_ST_TERMINATING) {
+		LOGW(w, LOGL_ERROR, "refusing to start a new process: the previous one is not collected yet\n");
+		return -EBUSY;
+	}
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sp) < 0) {
 		rc = -errno;
 		LOGP(DAWORKER, LOGL_ERROR, "aworker %u: socketpair() failed: %s\n", w->idx, strerror(-rc));
 		return rc;
@@ -829,7 +1067,7 @@ static int worker_spawn(struct aworker *w)
 
 	if (pid == 0) {
 		close(sp[0]);
-		child_exec_worker(w->idx, cfg_file, sp[1]);
+		child_exec_worker(w->idx, cfg_file, sp[1], parent);
 		/* not reached */
 	}
 
@@ -838,10 +1076,15 @@ static int worker_spawn(struct aworker *w)
 	rc = link_create(w, sp[0]);
 	if (rc < 0) {
 		close(sp[0]);
-		worker_kill_and_reap(w, NULL);
+		/* The process exists: take it down like any lost worker, without blocking; the failure policy
+		 * runs once it is collected. */
+		osmo_strlcpy(w->lost_reason, "cannot set up the IPC link", sizeof(w->lost_reason));
+		w->last_pid = pid;
+		worker_begin_termination(w);
 		return rc;
 	}
-	LOGW(w, LOGL_NOTICE, "started '%s' with config file '%s'\n", g_exec_path, cfg_file);
+	LOGW(w, LOGL_NOTICE, "started '%s'%s with config file '%s'\n", g_exec_path,
+	     g_exec_fd >= 0 ? " (from the descriptor opened at startup)" : "", cfg_file);
 	return 0;
 }
 
@@ -853,7 +1096,8 @@ static void startup_timer_cb(void *data)
 
 	for (i = 0; i < pool->num; i++) {
 		struct aworker *w = pool->worker[i];
-		if (w->state == AWORKER_ST_READY)
+		/* READY: fine. TERMINATING: already lost and being collected; its failure policy follows. */
+		if (w->state == AWORKER_ST_READY || w->state == AWORKER_ST_TERMINATING)
 			continue;
 		LOGW(w, LOGL_ERROR, "not ready %u s after start (state %s); treating the worker as failed\n",
 		     pool->cfg.startup_timeout, get_value_string(state_names, w->state));
@@ -883,7 +1127,19 @@ static struct aworker_pool *pool_alloc(void *ctx, unsigned int num)
 	if (!pool)
 		return NULL;
 	pool->ctx = pool;
+	/* Deep copy: the strings belong to the pool. The VTY replaces or frees the ones in g_cfg whenever it is told
+	 * to, and the running pool -- worker restarts, 'show a-worker-pool' -- must never see that. */
 	pool->cfg = g_cfg;
+	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
+		pool->cfg.cfg_file[i] = NULL;
+		if (!g_cfg.cfg_file[i])
+			continue;
+		pool->cfg.cfg_file[i] = talloc_strdup(pool, g_cfg.cfg_file[i]);
+		if (!pool->cfg.cfg_file[i]) {
+			talloc_free(pool);
+			return NULL;
+		}
+	}
 	pool->num = num;
 	pool->next_user_ref = 1;
 	INIT_LLIST_HEAD(&pool->users);
@@ -900,6 +1156,7 @@ static struct aworker_pool *pool_alloc(void *ctx, unsigned int num)
 		w->main_fd = -1;
 		w->state = AWORKER_ST_STOPPED;
 		osmo_timer_setup(&w->restart_timer, restart_timer_cb, w);
+		osmo_timer_setup(&w->reap_timer, reap_timer_cb, w);
 		pool->worker[i] = w;
 	}
 	return pool;
@@ -975,6 +1232,73 @@ int aworker_pool_start_with_fds(void *ctx, const int *fds, unsigned int num)
 	return 0;
 }
 
+/* aworker_pool_stop() only: collect whatever has exited, until all are collected or \a ms have passed. Runs after
+ * the event loop has ended (osmo-bsc is exiting), so sleeping here blocks nothing; the wait is bounded.
+ * \returns true if no process is left. */
+static bool stop_wait(struct aworker_pool *pool, unsigned int ms)
+{
+	struct timespec t0;
+	unsigned int i;
+
+	osmo_clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;) {
+		bool left = false;
+		for (i = 0; i < pool->num; i++) {
+			struct aworker *w = pool->worker[i];
+			int status;
+			pid_t rc;
+
+			if (w->pid <= 0)
+				continue;
+			rc = waitpid(w->pid, &status, WNOHANG);
+			if (rc == w->pid) {
+				log_exit_status(w, status);
+				w->pid = 0;
+			} else if (rc < 0 && errno == ECHILD) {
+				w->pid = 0;	/* already reaped elsewhere; never signal that pid again */
+			} else {
+				left = true;
+			}
+		}
+		if (!left)
+			return true;
+		if (ms_since(&t0) >= ms)
+			return false;
+		usleep(STOP_POLL_MS * 1000);
+	}
+}
+
+/* Take all processes down together (not one after the other): SIGTERM to all, wait up to the grace period, SIGKILL
+ * to the rest, wait a bounded time again. A process that is still not collected after that is reported, and not
+ * pretended gone; having received SIGKILL, it cannot run any of our code any more. */
+static void stop_processes(struct aworker_pool *pool)
+{
+	unsigned int i;
+
+	for (i = 0; i < pool->num; i++) {
+		struct aworker *w = pool->worker[i];
+		if (w->pid > 0 && !w->sigkill_sent)
+			kill(w->pid, SIGTERM);
+	}
+	if (stop_wait(pool, AWORKER_TERM_GRACE_MS))
+		return;
+	for (i = 0; i < pool->num; i++) {
+		struct aworker *w = pool->worker[i];
+		if (w->pid <= 0)
+			continue;
+		LOGW(w, LOGL_ERROR, "did not exit after SIGTERM, sending SIGKILL\n");
+		kill(w->pid, SIGKILL);
+	}
+	if (stop_wait(pool, STOP_KILL_WAIT_MS))
+		return;
+	for (i = 0; i < pool->num; i++) {
+		struct aworker *w = pool->worker[i];
+		if (w->pid > 0)
+			LOGW(w, LOGL_FATAL, "still not collected %u ms after SIGKILL (stuck in the kernel?); leaving it"
+			     " to the kernel\n", STOP_KILL_WAIT_MS);
+	}
+}
+
 void aworker_pool_stop(void)
 {
 	struct aworker_pool *pool = g_pool;
@@ -991,6 +1315,7 @@ void aworker_pool_stop(void)
 		struct msgb *rec;
 
 		osmo_timer_del(&w->restart_timer);
+		osmo_timer_del(&w->reap_timer);
 		if (w->link) {
 			if (aworker_ipc_link_get_state(w->link) == AWORKER_IPC_LINK_READY
 			    && aworker_ipc_enc_goodbye(pool->ctx, &rec, AWORKER_IPC_GOODBYE_SHUTDOWN) == 0)
@@ -1000,8 +1325,8 @@ void aworker_pool_stop(void)
 		}
 		w->main_fd = -1;
 		w->state = AWORKER_ST_STOPPED;
-		worker_kill_and_reap(w, NULL);
 	}
+	stop_processes(pool);
 
 	/* The users outlive the pool (they are owned by the A interface code), so detach them explicitly. */
 	while (!llist_empty(&pool->users)) {
@@ -1020,6 +1345,32 @@ void aworker_pool_stop(void)
 bool aworker_pool_shutdown_was_fatal(void)
 {
 	return g_fatal;
+}
+
+unsigned int aworker_pool_num_workers(void)
+{
+	return g_pool ? g_pool->num : 0;
+}
+
+int aworker_pool_worker_info(unsigned int idx, struct aworker_pool_worker_info *out)
+{
+	const struct aworker *w;
+
+	if (!g_pool)
+		return -ENODEV;
+	if (idx >= g_pool->num || !out)
+		return -EINVAL;
+	w = g_pool->worker[idx];
+	*out = (struct aworker_pool_worker_info){
+		.idx = w->idx,
+		.state = w->state,
+		.pid = w->pid,
+		.starts = w->starts,
+		.cfg_file = g_pool->cfg.cfg_file[idx],
+		.sigkill_sent = w->sigkill_sent,
+		.reap_stuck = w->reap_stuck,
+	};
+	return 0;
 }
 
 bool aworker_pool_all_ready(void)
@@ -1348,6 +1699,14 @@ void aworker_pool_dump_vty(struct vty *vty)
 		vty_out(vty, " worker %u: state %s, pid %ld, starts %u, config file %s%s", w->idx,
 			get_value_string(state_names, w->state), (long)w->pid, w->starts,
 			g_pool->cfg.cfg_file[i] ? g_pool->cfg.cfg_file[i] : "(none)", VTY_NEWLINE);
+		if (w->state == AWORKER_ST_TERMINATING)
+			vty_out(vty, "  terminating: %s%s",
+				w->reap_stuck ? "SIGKILL sent, process still not collected (stuck in the kernel?)"
+				: w->sigkill_sent ? "SIGKILL sent, waiting to collect the process"
+				: "SIGTERM sent, waiting to collect the process", VTY_NEWLINE);
+		if (g_cfg.cfg_file[i] && g_pool->cfg.cfg_file[i] && strcmp(g_cfg.cfg_file[i], g_pool->cfg.cfg_file[i]))
+			vty_out(vty, "  configured config file %s takes effect after restarting osmo-bsc%s",
+				g_cfg.cfg_file[i], VTY_NEWLINE);
 		for (j = 0; j < w->cs7.count; j++) {
 			const struct aworker_ipc_cs7_entry *e = &w->cs7.e[j];
 			vty_out(vty, "  cs7 instance %u: point-code %u, %s, %u AS(s)%s", e->cs7_id,

@@ -4,6 +4,7 @@ SUBDIRS = \
 	aworker_cfg_scan \
 	aworker_ipc \
 	aworker_pool \
+	aworker_proc \
 	bsc \
 	codec_pref \
 	gsm0408 \

@@ -1031,7 +1031,7 @@ static void test_p7_no_restart_while_stopping(char **argv)
 	bsc = fork();
 	OSMO_ASSERT(bsc >= 0);
 	if (bsc == 0) {
-		struct osmo_timer_list control;
+		struct osmo_timer_list control = {};	/* osmo_timer_setup() does not clear it */
 		char cfg[2][2 * PATH_MAX];
 		const char *files[2];
 		unsigned int i, forks0;

@@ -705,6 +705,29 @@ static struct vty_app_info vty_info = {
 	},
 };
 
+/* Every msc must be served by some A-worker: see aworker_pool_check_ownership(). An msc without an explicit cs7
+ * instance uses instance 0, as in osmo_bsc_sigtran_init(). */
+static int check_aworker_ownership(void)
+{
+	struct aworker_pool_msc_ref *refs;
+	struct bsc_msc_data *msc;
+	unsigned int n = 0, num = llist_count(&bsc_gsmnet->mscs);
+	int rc;
+
+	refs = talloc_zero_array(tall_bsc_ctx, struct aworker_pool_msc_ref, num ? : 1);
+	OSMO_ASSERT(refs);
+	llist_for_each_entry(msc, &bsc_gsmnet->mscs, entry) {
+		if (n >= num)
+			break;
+		refs[n].nr = msc->nr;
+		refs[n].cs7_id = msc->a.cs7_instance_valid ? msc->a.cs7_instance : 0;
+		n++;
+	}
+	rc = aworker_pool_check_ownership(refs, n);
+	talloc_free(refs);
+	return rc;
+}
+
 extern int bsc_shutdown_net(struct gsm_network *net);
 static void signal_handler(int signum)
 {
@@ -1046,6 +1069,10 @@ int main(int argc, char **argv)
 		}
 		if (aworker_pool_check_main_cs7() < 0) {
 			fprintf(stderr, "The A-worker pool configuration is inconsistent. exiting.\n");
+			exit(1);
+		}
+		if (check_aworker_ownership() < 0) {
+			fprintf(stderr, "The A-worker pool configuration is inconsistent (see the log). exiting.\n");
 			exit(1);
 		}
 		/* The IPC link refuses to run unless SIGPIPE is ignored. */

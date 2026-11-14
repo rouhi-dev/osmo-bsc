@@ -131,6 +131,24 @@ int aworker_pool_prescan_config(const char *config_file);
 /*! Second line of defence, run after the configuration file was parsed: refuse a main-process cs7 instance that
  * has an Application Server. \returns 0 or -EINVAL (errors are logged). */
 int aworker_pool_check_main_cs7(void);
+/*! 'cs7 instance <0-15>': the cs7 instance ids the expected-ownership map covers. */
+#define AWORKER_POOL_MAX_CS7_ID		16
+/*! An 'msc' of the main configuration and the cs7 instance it uses. */
+struct aworker_pool_msc_ref {
+	int nr;
+	uint32_t cs7_id;
+};
+/*! Global consistency of the pool configuration, run after the main configuration was parsed and before any
+ * worker is started. Reads the worker config files like the workers do (a worker owns the cs7 instances its file
+ * configures with an asp, as or listen node) and refuses
+ *  - a cs7 instance configured in two worker files, and
+ *  - an msc whose cs7 instance no worker file configures (unless a worker file could not be read: then it may be
+ *    in that file, and only an error is logged).
+ * \returns 0, or -EINVAL (every problem is logged, naming the files, lines, instances and mscs). */
+int aworker_pool_check_ownership(const struct aworker_pool_msc_ref *mscs, unsigned int num_mscs);
+/*! The worker the running pool expects to own \a cs7_id, from its worker config files at start; -1 if none (or
+ * no pool is running). */
+int aworker_pool_expected_owner(uint32_t cs7_id);
 /*! Record how to start a worker: the osmo-bsc executable and the command line it was started with (the logging
  * options are passed on to the workers). Must be called before aworker_pool_start(), early: it opens the running
  * executable (/proc/self/exe) once, and every worker generation is executed from that descriptor with fexecve(),

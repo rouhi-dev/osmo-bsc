@@ -41,5 +41,11 @@ T9: the running pool owns its configuration strings
   the pool uses its own copy of the config file name
   replacing or removing the configured file at runtime leaves the running pool's copy intact
   the copy goes away with the pool
+T10: expected cs7 ownership and the global configuration checks
+  consistent files: accepted; the pool expects instance 0 -> worker 0, 1 -> worker 1, no owner for a point-code-only section
+  one cs7 instance in two worker files: refused (check and start), naming the instance, both files and lines
+  an msc on a cs7 instance no worker file configures: refused, naming the msc and the instance
+  the instance may be in an unreadable worker file: logged, not refused (a worker-level error)
+  without 'a-worker-pool' nothing is checked
 talloc blocks at the end: unchanged
 PASSED

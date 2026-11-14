@@ -111,6 +111,16 @@ struct aworker {
 	bool cs7_reported;
 };
 
+/* Which worker is expected to own which cs7 instance, read from the worker config files with the worker's own rule
+ * (aworker.c, cs7_collect()): a worker owns exactly the cs7 instances for which its file has an asp, as or listen
+ * node. */
+struct ownership {
+	int owner[AWORKER_POOL_MAX_CS7_ID];		/*!< worker index, or -1: no file configures this instance */
+	unsigned int lineno[AWORKER_POOL_MAX_CS7_ID];	/*!< line of its 'cs7 instance' command in that file */
+	bool unreadable[AWORKER_POOL_MAX_WORKERS];	/*!< this worker's file could not be read: what it owns is unknown */
+	unsigned int num_unreadable;
+};
+
 struct aworker_pool {
 	void *ctx;
 	/*! Copy taken at start time. Its strings (cfg_file[]) are the pool's own talloc copies: the VTY may replace or
@@ -121,6 +131,7 @@ struct aworker_pool {
 	struct llist_head users;
 	uint32_t next_user_ref;
 	struct osmo_timer_list startup_timer;
+	struct ownership own;			/*!< expected ownership, built at start */
 	bool no_fork;				/*!< started with aworker_pool_start_with_fds() */
 	bool stopping;
 };
@@ -217,6 +228,96 @@ int aworker_pool_prescan_config(const char *config_file)
 	     "%s:%u: '%s' is not allowed inside 'cs7 instance %u' (line %u) when 'a-worker-pool' is configured\n",
 	     config_file, c->node_lineno, c->node, c->id, c->lineno);
 	return -EINVAL;
+}
+
+/***********************************************************************
+ * Expected ownership of the cs7 instances
+ ***********************************************************************/
+
+/* Scan the config files of the first cfg->num_workers workers into \a own. A cs7 instance configured in two of them is
+ * a contradiction in the pool configuration itself: logged naming both files, \returns -EINVAL. A file that cannot
+ * be read is only recorded in own->unreadable[]: that is the worker's own problem, reported when it starts. */
+static int ownership_build(const struct aworker_pool_cfg *cfg, struct ownership *own)
+{
+	unsigned int i, j;
+	int rc = 0;
+
+	memset(own, 0, sizeof(*own));
+	for (j = 0; j < AWORKER_POOL_MAX_CS7_ID; j++)
+		own->owner[j] = -1;
+
+	for (i = 0; i < cfg->num_workers && i < AWORKER_POOL_MAX_WORKERS; i++) {
+		struct aworker_cfg_scan scan;
+		int src;
+
+		if (!cfg->cfg_file[i])
+			continue;
+		src = aworker_cfg_scan(cfg->cfg_file[i], &scan);
+		if (src < 0) {
+			LOGP(DAWORKER, LOGL_ERROR, "aworker %u: cannot read its config file '%s': %s; which cs7"
+			     " instances it owns is unknown\n", i, cfg->cfg_file[i], strerror(-src));
+			own->unreadable[i] = true;
+			own->num_unreadable++;
+			continue;
+		}
+		for (j = 0; j < scan.num_cs7; j++) {
+			const struct aworker_cfg_scan_cs7 *sc = &scan.cs7[j];
+			int prev;
+
+			if (!sc->num_asp && !sc->num_as && !sc->num_listen)
+				continue;	/* configuration only: nothing to own (as in the worker) */
+			if (sc->id >= AWORKER_POOL_MAX_CS7_ID) {
+				/* Not a valid 'cs7 instance' number; the worker's VTY parser refuses the file. */
+				continue;
+			}
+			prev = own->owner[sc->id];
+			if (prev >= 0 && prev != (int)i) {
+				LOGP(DAWORKER, LOGL_FATAL, "'a-worker-pool': cs7 instance %u is configured in two worker"
+				     " config files: worker %d '%s' (line %u) and worker %u '%s' (line %u). Each cs7"
+				     " instance must be configured, with its asp / as, in exactly one worker config"
+				     " file.\n", sc->id, prev, cfg->cfg_file[prev], own->lineno[sc->id], i,
+				     cfg->cfg_file[i], sc->lineno);
+				rc = -EINVAL;
+				continue;
+			}
+			if (prev < 0) {
+				own->owner[sc->id] = i;
+				own->lineno[sc->id] = sc->lineno;
+			}
+		}
+	}
+	return rc;
+}
+
+int aworker_pool_check_ownership(const struct aworker_pool_msc_ref *mscs, unsigned int num_mscs)
+{
+	struct ownership own;
+	unsigned int i;
+	int rc;
+
+	if (!aworker_pool_enabled())
+		return 0;
+
+	rc = ownership_build(&g_cfg, &own);
+
+	for (i = 0; i < num_mscs; i++) {
+		uint32_t id = mscs[i].cs7_id;
+
+		if (id < AWORKER_POOL_MAX_CS7_ID && own.owner[id] >= 0)
+			continue;
+		if (own.num_unreadable) {
+			/* It may be in a file we could not read: that worker fails on its own when it starts. */
+			LOGP(DAWORKER, LOGL_ERROR, "'a-worker-pool': msc %d uses cs7 instance %u, which none of the"
+			     " readable worker config files configures (%u could not be read)\n", mscs[i].nr, id,
+			     own.num_unreadable);
+			continue;
+		}
+		LOGP(DAWORKER, LOGL_FATAL, "'a-worker-pool': msc %d uses cs7 instance %u, but no worker config file"
+		     " configures that instance with an asp / as, so no A-worker would ever serve this msc. Add"
+		     " 'cs7 instance %u' with its asp to exactly one worker config file.\n", mscs[i].nr, id, id);
+		rc = -EINVAL;
+	}
+	return rc;
 }
 
 /* After the configuration was parsed: no cs7 instance of the main process may have an Application Server. This
@@ -1169,6 +1270,25 @@ static struct aworker_pool *pool_alloc(void *ctx, unsigned int num)
 	return pool;
 }
 
+static void ownership_log(const struct aworker_pool *pool)
+{
+	unsigned int id;
+
+	for (id = 0; id < AWORKER_POOL_MAX_CS7_ID; id++) {
+		int w = pool->own.owner[id];
+		if (w >= 0)
+			LOGP(DAWORKER, LOGL_INFO, "cs7 instance %u is expected to be owned by worker %d ('%s', line"
+			     " %u)\n", id, w, pool->cfg.cfg_file[w], pool->own.lineno[id]);
+	}
+}
+
+int aworker_pool_expected_owner(uint32_t cs7_id)
+{
+	if (!g_pool || cs7_id >= AWORKER_POOL_MAX_CS7_ID)
+		return -1;
+	return g_pool->own.owner[cs7_id];
+}
+
 int aworker_pool_start(void *ctx)
 {
 	struct aworker_pool *pool;
@@ -1191,6 +1311,11 @@ int aworker_pool_start(void *ctx)
 	pool = pool_alloc(ctx, g_cfg.num_workers);
 	if (!pool)
 		return -ENOMEM;
+	if (ownership_build(&pool->cfg, &pool->own) < 0) {
+		talloc_free(pool);
+		return -EINVAL;
+	}
+	ownership_log(pool);
 	g_pool = pool;
 	/* Covers the exit() calls of a startup that fails after this point: without this, the workers would
 	 * keep their SCTP associations open with no osmo-bsc behind them. */
@@ -1225,6 +1350,10 @@ int aworker_pool_start_with_fds(void *ctx, const int *fds, unsigned int num)
 	pool = pool_alloc(ctx, num);
 	if (!pool)
 		return -ENOMEM;
+	if (ownership_build(&pool->cfg, &pool->own) < 0) {
+		talloc_free(pool);
+		return -EINVAL;
+	}
 	pool->no_fork = true;
 	g_pool = pool;
 

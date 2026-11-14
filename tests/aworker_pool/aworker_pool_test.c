@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -852,6 +853,165 @@ static void test_t9_cfg_ownership(void)
 	printf("  the copy goes away with the pool\n");
 }
 
+/***********************************************************************
+ * T10: expected ownership and the global configuration checks
+ ***********************************************************************/
+
+static char t10_dir[256];
+
+static const char *t10_file(const char *name, const char *text)
+{
+	static char path[8][320];
+	static unsigned int n;
+	char *p = path[n++ % ARRAY_SIZE(path)];
+	FILE *f;
+
+	snprintf(p, sizeof(path[0]), "%s/%s", t10_dir, name);
+	if (text) {
+		f = fopen(p, "w");
+		OSMO_ASSERT(f);
+		fputs(text, f);
+		fclose(f);
+	}
+	return p;
+}
+
+/* What the pool logs while fn runs, read back from a file log target. */
+static struct log_target *t10_log;
+static char t10_logbuf[8192];
+
+static void t10_capture_begin(void)
+{
+	unlink(t10_file("log", NULL));
+	t10_log = log_target_create_file(t10_file("log", NULL));
+	OSMO_ASSERT(t10_log);
+	log_set_all_filter(t10_log, 1);
+	log_set_print_filename2(t10_log, LOG_FILENAME_NONE);
+	log_add_target(t10_log);
+}
+
+static const char *t10_capture_end(void)
+{
+	FILE *f;
+	size_t n;
+
+	log_target_destroy(t10_log);
+	t10_log = NULL;
+	f = fopen(t10_file("log", NULL), "r");
+	OSMO_ASSERT(f);
+	n = fread(t10_logbuf, 1, sizeof(t10_logbuf) - 1, f);
+	t10_logbuf[n] = '\0';
+	fclose(f);
+	return t10_logbuf;
+}
+
+static void t10_set_files(const char *f0, const char *f1)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+
+	osmo_talloc_replace_string(ctx, &cfg->cfg_file[0], f0);
+	osmo_talloc_replace_string(ctx, &cfg->cfg_file[1], f1);
+	cfg->num_workers = 2;
+}
+
+static void test_t10_expected_ownership(void)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	/* Worker 0 owns cs7 instance 0; its section for instance 2 only configures a point code (owns nothing). */
+	const char *w0 = t10_file("w0.cfg",
+		"cs7 instance 0\n"
+		" point-code 0.23.3\n"
+		" asp asp-0 2905 0 m3ua\n"
+		"cs7 instance 2\n"
+		" point-code 0.23.3\n");
+	/* Worker 1 owns cs7 instance 1, which its file names twice: not a conflict. */
+	const char *w1 = t10_file("w1.cfg",
+		"cs7 instance 1\n"
+		" asp asp-1 2905 0 m3ua\n"
+		"cs7 instance 1\n"
+		" as as-1 m3ua\n");
+	/* Worker 1, but also configuring cs7 instance 0 (line 4), which worker 0 owns. */
+	const char *w1dup = t10_file("w1dup.cfg",
+		"!\n"
+		"cs7 instance 1\n"
+		" asp asp-1 2905 0 m3ua\n"
+		"cs7 instance 0\n"
+		" as as-0 m3ua\n");
+	const char *missing = t10_file("missing.cfg", NULL);
+	const struct aworker_pool_msc_ref ok_mscs[] = { { .nr = 0, .cs7_id = 0 }, { .nr = 1, .cs7_id = 1 } };
+	const struct aworker_pool_msc_ref bad_mscs[] = { { .nr = 0, .cs7_id = 0 }, { .nr = 7, .cs7_id = 3 } };
+	const struct aworker_pool_msc_ref msc5[] = { { .nr = 5, .cs7_id = 1 } };
+	int sp[2][2];
+	const char *log;
+	char want[512];
+	unsigned int i;
+
+	printf("T10: expected cs7 ownership and the global configuration checks\n");
+
+	/* Consistent: each instance in one file, every msc's instance owned. */
+	t10_set_files(w0, w1);
+	CHECK(aworker_pool_check_ownership(ok_mscs, ARRAY_SIZE(ok_mscs)) == 0);
+	for (i = 0; i < 2; i++)
+		OSMO_ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp[i]) == 0);
+	CHECK(aworker_pool_start_with_fds(ctx, (int[]){ sp[0][0], sp[1][0] }, 2) == 0);
+	CHECK(aworker_pool_expected_owner(0) == 0);
+	CHECK(aworker_pool_expected_owner(1) == 1);
+	CHECK(aworker_pool_expected_owner(2) == -1);	/* point code only */
+	CHECK(aworker_pool_expected_owner(3) == -1);
+	CHECK(aworker_pool_expected_owner(AWORKER_POOL_MAX_CS7_ID) == -1);
+	aworker_pool_stop();
+	CHECK(aworker_pool_expected_owner(0) == -1);
+	for (i = 0; i < 2; i++)
+		close(sp[i][1]);
+	printf("  consistent files: accepted; the pool expects instance 0 -> worker 0, 1 -> worker 1, no owner for a"
+	       " point-code-only section\n");
+
+	/* The same instance in two files: refused by the check and by the start, naming both files and lines. */
+	t10_set_files(w0, w1dup);
+	t10_capture_begin();
+	CHECK(aworker_pool_check_ownership(ok_mscs, ARRAY_SIZE(ok_mscs)) == -EINVAL);
+	log = t10_capture_end();
+	snprintf(want, sizeof(want), "cs7 instance 0 is configured in two worker config files: worker 0 '%s' (line 1)"
+		 " and worker 1 '%s' (line 4)", w0, w1dup);
+	CHECK(strstr(log, want) != NULL);
+	for (i = 0; i < 2; i++)
+		OSMO_ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp[i]) == 0);
+	CHECK(aworker_pool_start_with_fds(ctx, (int[]){ sp[0][0], sp[1][0] }, 2) == -EINVAL);
+	CHECK(aworker_pool_num_workers() == 0);
+	for (i = 0; i < 2; i++) {
+		close(sp[i][0]);
+		close(sp[i][1]);
+	}
+	printf("  one cs7 instance in two worker files: refused (check and start), naming the instance, both files"
+	       " and lines\n");
+
+	/* An msc whose instance no worker file configures. */
+	t10_set_files(w0, w1);
+	t10_capture_begin();
+	CHECK(aworker_pool_check_ownership(bad_mscs, ARRAY_SIZE(bad_mscs)) == -EINVAL);
+	log = t10_capture_end();
+	CHECK(strstr(log, "msc 7 uses cs7 instance 3, but no worker config file configures that instance") != NULL);
+	CHECK(strstr(log, "msc 0 ") == NULL);
+	printf("  an msc on a cs7 instance no worker file configures: refused, naming the msc and the instance\n");
+
+	/* Not certain when a worker file cannot be read: that is the worker's own error, not a global one. */
+	t10_set_files(w0, missing);
+	t10_capture_begin();
+	CHECK(aworker_pool_check_ownership(msc5, ARRAY_SIZE(msc5)) == 0);
+	log = t10_capture_end();
+	CHECK(strstr(log, "msc 5 uses cs7 instance 1, which none of the readable worker config files configures")
+	      != NULL);
+	printf("  the instance may be in an unreadable worker file: logged, not refused (a worker-level error)\n");
+
+	/* Without a pool nothing is checked. */
+	cfg->num_workers = 0;
+	CHECK(aworker_pool_check_ownership(bad_mscs, ARRAY_SIZE(bad_mscs)) == 0);
+	printf("  without 'a-worker-pool' nothing is checked\n");
+
+	TALLOC_FREE(cfg->cfg_file[0]);
+	TALLOC_FREE(cfg->cfg_file[1]);
+}
+
 int main(void)
 {
 	size_t blocks;
@@ -879,6 +1039,17 @@ int main(void)
 	test_t7_duplicate_cs7();
 	test_t8_bind_refused();
 	test_t9_cfg_ownership();
+
+	snprintf(t10_dir, sizeof(t10_dir), "%s/aworker_pool.XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+	OSMO_ASSERT(mkdtemp(t10_dir));
+	test_t10_expected_ownership();
+	if (!failures) {
+		char cmd[300];
+		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", t10_dir);
+		if (system(cmd)) {}
+	} else {
+		printf("files kept in %s\n", t10_dir);
+	}
 
 	printf("talloc blocks at the end: %s\n", talloc_total_blocks(ctx) == blocks ? "unchanged" : "grown");
 	CHECK(talloc_total_blocks(ctx) == blocks);

@@ -47,5 +47,10 @@ T10: expected cs7 ownership and the global configuration checks
   an msc on a cs7 instance no worker file configures: refused, naming the msc and the instance
   the instance may be in an unreadable worker file: logged, not refused (a worker-level error)
   without 'a-worker-pool' nothing is checked
+T11: CS7_INFO is checked against the ownership expected from the config files
+  a worker claiming an instance its file did not configure is FAILED (ownership); worker 0 and its user are unaffected
+  a claim that matches the file is accepted: both workers READY
+  a worker reporting less than its file configured is FAILED (ownership)
+  no worker can take an instance another worker's file configures, even before that worker reports
 talloc blocks at the end: unchanged
 PASSED

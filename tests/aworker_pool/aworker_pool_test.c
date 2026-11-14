@@ -1012,6 +1012,119 @@ static void test_t10_expected_ownership(void)
 	TALLOC_FREE(cfg->cfg_file[1]);
 }
 
+/***********************************************************************
+ * T11: a worker's CS7_INFO is checked against the expected ownership
+ ***********************************************************************/
+
+static struct aworker_pool_worker_info t11_info(unsigned int i)
+{
+	struct aworker_pool_worker_info info = {};
+	OSMO_ASSERT(aworker_pool_worker_info(i, &info) == 0);
+	return info;
+}
+
+/* Worker 0 serves 'msc-0' on cs7 instance 0 correctly: bound, available, READY. */
+static void t11_good_worker0(void)
+{
+	static const uint32_t ids0[] = { 0 };
+	struct aworker_ipc_msg m;
+	struct msgb *msg;
+
+	us0 = (struct user_state){ .name = "msc-0" };
+	us0.bsc_sccp = bsc_sccp_inst_alloc(ctx);
+	us0.user = aworker_sccp_user_bind(ctx, ss7[0], us0.bsc_sccp, us0.name, test_prim_cb, OSMO_SCCP_SSN_BSSAP,
+					  &test_ops);
+	OSMO_ASSERT(us0.user);
+	pump();
+	fw_handshake(&fw[0], ids0, 1);
+	pump();
+	CHECK(fw_expect(&fw[0], AWORKER_IPC_MT_USER_BIND, &m));
+	CHECK(aworker_ipc_enc_user_bind_result(ctx, &msg, m.user_ref, AWORKER_IPC_BIND_OK) == 0);
+	fw_send(&fw[0], msg);
+	pump();
+	CHECK(aworker_sccp_user_ready(us0.user));
+}
+
+static bool t11_failed_with(unsigned int i, const char *detail)
+{
+	struct aworker_pool_worker_info info = t11_info(i);
+	return info.state == AWORKER_ST_FAILED && info.fail_reason == AWORKER_FAIL_OWNERSHIP && info.failed_at
+	       && strstr(info.fail_detail, detail);
+}
+
+static bool t11_worker0_unaffected(void)
+{
+	return t11_info(0).state == AWORKER_ST_READY && aworker_sccp_user_ready(us0.user) && us0.unavailable == 0;
+}
+
+static void test_t11_ownership_claims(void)
+{
+	static const uint32_t ids1[] = { 1 }, ids12[] = { 1, 2 }, ids0[] = { 0 };
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	const char *w0 = t10_file("t11w0.cfg", "cs7 instance 0\n asp asp-0 2905 0 m3ua\n");
+	const char *w1 = t10_file("t11w1.cfg", "cs7 instance 1\n asp asp-1 2905 0 m3ua\n");
+	struct user_state saved0 = us0;
+
+	printf("T11: CS7_INFO is checked against the ownership expected from the config files\n");
+
+	/* Worker 1 claims an instance its file did not configure. */
+	t10_set_files(w0, w1);
+	fixture_up();
+	t11_good_worker0();
+	fw_handshake(&fw[1], ids12, 2);
+	pump();
+	CHECK(t11_failed_with(1, "claims cs7 instance 2, which its config file did not configure at start"));
+	CHECK(t11_worker0_unaffected());
+	us_free(&us0);
+	fixture_down();
+	printf("  a worker claiming an instance its file did not configure is FAILED (ownership); worker 0 and its"
+	       " user are unaffected\n");
+
+	/* Worker 1 claims exactly what its file configured: READY. */
+	t10_set_files(w0, w1);
+	fixture_up();
+	t11_good_worker0();
+	fw_handshake(&fw[1], ids1, 1);
+	pump();
+	CHECK(t11_info(1).state == AWORKER_ST_READY && t11_info(1).fail_reason == AWORKER_FAIL_NONE);
+	CHECK(t11_worker0_unaffected());
+	us_free(&us0);
+	fixture_down();
+	printf("  a claim that matches the file is accepted: both workers READY\n");
+
+	/* Worker 1 reports less than its file configured. */
+	t10_set_files(w0, t10_file("t11w12.cfg", "cs7 instance 1\n asp asp-1 2905 0 m3ua\n"
+						 "cs7 instance 2\n asp asp-2 2905 0 m3ua\n"));
+	fixture_up();
+	t11_good_worker0();
+	fw_handshake(&fw[1], ids1, 1);
+	pump();
+	CHECK(t11_failed_with(1, "does not report cs7 instance 2, which its config file configured at start"));
+	CHECK(t11_worker0_unaffected());
+	us_free(&us0);
+	fixture_down();
+	printf("  a worker reporting less than its file configured is FAILED (ownership)\n");
+
+	/* Worker 1, whose file cannot be read (nothing known about it), claims worker 0's instance first. */
+	t10_set_files(w0, t10_file("t11missing.cfg", NULL));
+	fixture_up();
+	pump();
+	fw_handshake(&fw[1], ids0, 1);
+	pump();
+	CHECK(t11_failed_with(1, "claims cs7 instance 0, which the config file of worker 0 configured at start"));
+	t11_good_worker0();
+	CHECK(t11_worker0_unaffected());
+	us_free(&us0);
+	fixture_down();
+	printf("  no worker can take an instance another worker's file configures, even before that worker"
+	       " reports\n");
+
+	us0 = saved0;
+	cfg->num_workers = 0;
+	TALLOC_FREE(cfg->cfg_file[0]);
+	TALLOC_FREE(cfg->cfg_file[1]);
+}
+
 int main(void)
 {
 	size_t blocks;
@@ -1043,6 +1156,7 @@ int main(void)
 	snprintf(t10_dir, sizeof(t10_dir), "%s/aworker_pool.XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
 	OSMO_ASSERT(mkdtemp(t10_dir));
 	test_t10_expected_ownership();
+	test_t11_ownership_claims();
 	if (!failures) {
 		char cmd[300];
 		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", t10_dir);

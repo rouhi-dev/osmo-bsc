@@ -30,4 +30,9 @@ P8: a worker that cannot use its config file is FAILED; the others and osmo-bsc 
   resetting a worker that is not FAILED is refused and changes nothing
   after the file is fixed, a reset starts exactly that worker once; it becomes READY
   worker 0 kept its process throughout, and osmo-bsc was never asked to shut down
+P9: a worker claiming a cs7 instance its file did not configure at start is FAILED
+  worker 1 reported instance 2, its file configured 1: FAILED (reason ownership); worker 0 READY
+  it stays FAILED past restart-delay and startup-timeout: no process started
+  once it reports what its file configured, a reset starts it once and it becomes READY
+  worker 0 kept its process throughout, and osmo-bsc was never asked to shut down
 PASSED

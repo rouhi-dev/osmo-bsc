@@ -126,6 +126,9 @@ struct ownership {
 	unsigned int lineno[AWORKER_POOL_MAX_CS7_ID];	/*!< line of its 'cs7 instance' command in that file */
 	bool unreadable[AWORKER_POOL_MAX_WORKERS];	/*!< this worker's file could not be read: what it owns is unknown */
 	unsigned int num_unreadable;
+	/*! The exact set this worker owns is known: its file was read and configures at least one instance. (A
+	 * worker whose file configures none refuses to run anyway.) Its CS7_INFO must match that set. */
+	bool known[AWORKER_POOL_MAX_WORKERS];
 };
 
 struct aworker_pool {
@@ -304,6 +307,7 @@ static int ownership_build(const struct aworker_pool_cfg *cfg, struct ownership 
 				own->owner[sc->id] = i;
 				own->lineno[sc->id] = sc->lineno;
 			}
+			own->known[i] = true;
 		}
 	}
 	return rc;
@@ -754,6 +758,50 @@ static void link_ready_cb(struct aworker_ipc_link *link, const struct aworker_ip
 	     peer->pid, peer->ident);
 }
 
+/* Check a CS7_INFO against the expected ownership; on a mismatch, log it, record the detail and \returns false. */
+static bool ownership_claim_ok(struct aworker *w, const struct aworker_ipc_cs7_info *info)
+{
+	const struct ownership *own = &w->pool->own;
+	bool claimed[AWORKER_POOL_MAX_CS7_ID] = {};
+	unsigned int i;
+	uint32_t id;
+
+	for (i = 0; i < info->count; i++) {
+		int exp;
+
+		id = info->e[i].cs7_id;
+		exp = id < AWORKER_POOL_MAX_CS7_ID ? own->owner[id] : -1;
+		if (id < AWORKER_POOL_MAX_CS7_ID)
+			claimed[id] = true;
+		if (exp == (int)w->idx)
+			continue;
+		if (exp >= 0)
+			snprintf(w->fail_detail, sizeof(w->fail_detail), "claims cs7 instance %u, which the config"
+				 " file of worker %d configured at start", id, exp);
+		else if (own->known[w->idx])
+			snprintf(w->fail_detail, sizeof(w->fail_detail), "claims cs7 instance %u, which its config"
+				 " file did not configure at start", id);
+		else
+			continue;	/* nothing expected of this worker; the first-come check below applies */
+		goto mismatch;
+	}
+	if (!own->known[w->idx])
+		return true;
+	for (id = 0; id < AWORKER_POOL_MAX_CS7_ID; id++) {
+		if (own->owner[id] == (int)w->idx && !claimed[id]) {
+			snprintf(w->fail_detail, sizeof(w->fail_detail), "does not report cs7 instance %u, which its"
+				 " config file configured at start", id);
+			goto mismatch;
+		}
+	}
+	return true;
+
+mismatch:
+	LOGW(w, LOGL_ERROR, "CS7_INFO does not match the ownership expected from the config files at start: %s"
+	     " (was a config file changed?); closing link\n", w->fail_detail);
+	return false;
+}
+
 static void handle_cs7_info(struct aworker *w, const struct aworker_ipc_msg *m)
 {
 	struct aworker_pool *pool = w->pool;
@@ -761,6 +809,16 @@ static void handle_cs7_info(struct aworker *w, const struct aworker_ipc_msg *m)
 
 	if (w->cs7_reported) {
 		LOGW(w, LOGL_ERROR, "second CS7_INFO on the same link; closing link\n");
+		aworker_ipc_link_close(w->link);
+		return;
+	}
+
+	/* The claim must match what the worker config files said at start (see struct ownership): a worker never
+	 * takes an instance another worker's file configures, and a worker whose own set is known reports exactly
+	 * that set. Anything else means the file was changed after osmo-bsc started; restarting the worker would
+	 * read the same file again, so it is FAILED until an operator resets it. */
+	if (!ownership_claim_ok(w, &m->u.cs7_info)) {
+		w->pending_fail = AWORKER_FAIL_OWNERSHIP;
 		aworker_ipc_link_close(w->link);
 		return;
 	}

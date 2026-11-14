@@ -1202,6 +1202,96 @@ static void test_p8_failed_worker(char **argv)
 }
 
 /***********************************************************************
+ * P9: a worker claiming a cs7 instance its file did not configure at start is FAILED (ownership)
+ ***********************************************************************/
+
+struct p9_result {
+	bool reached;		/*!< worker 0 READY and worker 1 FAILED */
+	bool recorded;		/*!< reason ownership, detail names the instance */
+	bool stayed_failed;	/*!< past restart-delay and startup-timeout: still FAILED, never restarted */
+	unsigned int forks_while_failed;
+	bool reset_ok;		/*!< after the worker is fixed, a reset makes it READY with the failure forgotten */
+	unsigned int forks_on_reset;
+	bool w0_untouched;
+	bool no_shutdown;
+};
+
+static void test_p9_ownership_failed(char **argv)
+{
+	/* The pool reads the 'cs7 instance' sections (the expected ownership); the fake worker reports 'cs7='. */
+	const char *own0 = "cs7 instance 0\n asp asp-0 2905 0 m3ua\n";
+	const char *own1 = "cs7 instance 1\n asp asp-1 2905 0 m3ua\n";
+	struct p9_result res = {};
+	int pp[2], status;
+	pid_t bsc;
+
+	printf("P9: a worker claiming a cs7 instance its file did not configure at start is FAILED\n");
+	OSMO_ASSERT(pipe(pp) == 0);
+	bsc = fork();
+	OSMO_ASSERT(bsc >= 0);
+	if (bsc == 0) {
+		const char *files[2];
+		struct aworker_pool_worker_info i0, i1;
+		unsigned int forks0;
+		pid_t p0;
+		int st;
+
+		close(pp[0]);
+		files[0] = worker_cfg(0, 0, own0);
+		files[1] = worker_cfg(1, 2, own1);	/* configures instance 1, reports instance 2 */
+		pool_configure(2, files);		/* restart-delay 1 s */
+		aworker_pool_cfg()->startup_timeout = 2;
+		aworker_pool_set_exec(argv[0], 1, argv);
+		if (aworker_pool_start(ctx) < 0)
+			_exit(1);
+		res.reached = run_until(p8_w0_ready_w1_failed, NULL, 10000);
+		p0 = winfo(0).pid;
+		i1 = winfo(1);
+		res.recorded = i1.fail_reason == AWORKER_FAIL_OWNERSHIP && i1.failed_at != 0 && i1.fail_detail
+			       && strstr(i1.fail_detail, "claims cs7 instance 2, which its config file did not"
+					 " configure at start");
+
+		forks0 = g_forks;
+		run_until(never_p8, NULL, 3000);
+		i1 = winfo(1);
+		res.forks_while_failed = g_forks - forks0;
+		res.stayed_failed = i1.state == AWORKER_ST_FAILED && i1.starts == 1 && !res.forks_while_failed;
+
+		/* The worker is put right (it reports instance 1 again), then reset. */
+		worker_cfg(1, 1, own1);
+		forks0 = g_forks;
+		res.reset_ok = aworker_pool_reset_worker(1) == 0 && run_until(w1_ready, NULL, 10000);
+		res.forks_on_reset = g_forks - forks0;
+		i1 = winfo(1);
+		res.reset_ok = res.reset_ok && i1.fail_reason == AWORKER_FAIL_NONE && !i1.fail_detail[0];
+
+		i0 = winfo(0);
+		res.w0_untouched = i0.state == AWORKER_ST_READY && i0.pid == p0 && i0.starts == 1;
+		res.no_shutdown = !osmo_select_shutdown_requested() && !aworker_pool_shutdown_was_fatal();
+		aworker_pool_stop();
+		st = write(pp[1], &res, sizeof(res)) == sizeof(res) ? 0 : 1;
+		_exit(st);
+	}
+	close(pp[1]);
+	CHECK(read(pp[0], &res, sizeof(res)) == sizeof(res));
+	close(pp[0]);
+	CHECK(collect(bsc, &status, 30000) == bsc);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	CHECK(res.reached && res.recorded);
+	printf("  worker 1 reported instance 2, its file configured 1: FAILED (reason ownership); worker 0 READY\n");
+	CHECK(res.stayed_failed);
+	CHECK(res.forks_while_failed == 0);
+	printf("  it stays FAILED past restart-delay and startup-timeout: no process started\n");
+	CHECK(res.reset_ok);
+	CHECK(res.forks_on_reset == 1);
+	printf("  once it reports what its file configured, a reset starts it once and it becomes READY\n");
+	CHECK(res.w0_untouched);
+	CHECK(res.no_shutdown);
+	printf("  worker 0 kept its process throughout, and osmo-bsc was never asked to shut down\n");
+}
+
+/***********************************************************************
  * main
  ***********************************************************************/
 
@@ -1233,6 +1323,7 @@ int main(int argc, char **argv)
 	test_p6_stop_waits_for_goodbye(argv);
 	test_p7_no_restart_while_stopping(argv);
 	test_p8_failed_worker(argv);
+	test_p9_ownership_failed(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

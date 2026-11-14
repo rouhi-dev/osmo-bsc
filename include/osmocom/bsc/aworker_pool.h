@@ -52,6 +52,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 
 #include <osmocom/core/utils.h>
 
@@ -92,7 +93,18 @@ enum aworker_state {
 	AWORKER_ST_TERMINATING,	/*!< lost: the process was signalled and has not been collected yet. A worker never
 				 *   leaves this state before waitpid() returned its status, so that two generations of
 				 *   one worker can never run at the same time. */
+	AWORKER_ST_FAILED,	/*!< a failure that restarting cannot fix (see enum aworker_fail_reason): not restarted
+				 *   until an operator resets it (aworker_pool_reset_worker(), VTY 'a-worker-pool reset
+				 *   worker N'). Only this worker is affected: osmo-bsc and the other workers go on. */
 };
+
+/*! Why a worker is AWORKER_ST_FAILED. */
+enum aworker_fail_reason {
+	AWORKER_FAIL_NONE = 0,
+	AWORKER_FAIL_CONFIG,		/*!< the worker exited with AWORKER_EXIT_CONFIG: it cannot use its config file */
+	AWORKER_FAIL_OWNERSHIP,		/*!< it claimed a cs7 instance its config file did not have at start */
+};
+const char *aworker_fail_reason_name(enum aworker_fail_reason reason);
 
 /*! A read-only snapshot of one worker, for status reporting and tests. */
 struct aworker_pool_worker_info {
@@ -104,6 +116,10 @@ struct aworker_pool_worker_info {
 					 *   valid until the pool stops) */
 	bool sigkill_sent;		/*!< TERMINATING: SIGTERM was not enough */
 	bool reap_stuck;		/*!< TERMINATING: still not collected AWORKER_REAP_STUCK_MS after SIGKILL */
+	enum aworker_fail_reason fail_reason;	/*!< FAILED: why */
+	const char *fail_detail;	/*!< FAILED: what happened, for the operator ("" otherwise; valid until the pool
+					 *   stops) */
+	time_t failed_at;		/*!< FAILED: when (wall clock); 0 otherwise */
 };
 
 struct aworker_pool_cfg {
@@ -181,6 +197,11 @@ void aworker_pool_dump_vty(struct vty *vty);
 unsigned int aworker_pool_num_workers(void);
 /*! Snapshot of worker \a idx of the running pool. \returns 0, or -ENODEV / -EINVAL. */
 int aworker_pool_worker_info(unsigned int idx, struct aworker_pool_worker_info *out);
+/*! Leave AWORKER_ST_FAILED: forget the failure and start the worker again (with its config file as read at
+ * osmo-bsc start). Only that worker is touched.
+ * \returns 0; -EBUSY if the worker is not FAILED (nothing is changed); -EINVAL for an unknown index; -ENODEV if
+ *	    no pool runs; -ESHUTDOWN while the pool stops. */
+int aworker_pool_reset_worker(unsigned int idx);
 
 /*! Testing seam: start the pool on already connected AF_UNIX SOCK_SEQPACKET sockets instead of forking. fds[i]
  * is the main-process end of the link to worker i and is owned by the pool afterwards. */

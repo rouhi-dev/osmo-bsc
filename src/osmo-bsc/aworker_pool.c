@@ -101,6 +101,13 @@ struct aworker {
 	pid_t last_pid;				/*!< the process that was lost, for the log after it is collected */
 	char lost_reason[160];			/*!< why it was lost, applied with the failure policy once collected */
 
+	/* AWORKER_ST_FAILED. A cause found while the process still runs is recorded in pending_fail (with its
+	 * fail_detail) and applied by worker_apply_policy(), once the process is collected. */
+	enum aworker_fail_reason pending_fail;
+	enum aworker_fail_reason fail_reason;
+	char fail_detail[200];
+	time_t failed_at;
+
 	/* Clean shutdown, see aworker_pool_stop(). */
 	bool goodbye_queued;
 	uint32_t goodbye_seq;			/*!< sequence number of the queued GOODBYE */
@@ -169,8 +176,21 @@ static const struct value_string state_names[] = {
 	{ AWORKER_ST_READY, "READY" },
 	{ AWORKER_ST_RESTARTING, "RESTARTING" },
 	{ AWORKER_ST_TERMINATING, "TERMINATING" },
+	{ AWORKER_ST_FAILED, "FAILED" },
 	{ 0, NULL }
 };
+
+static const struct value_string fail_reason_names[] = {
+	{ AWORKER_FAIL_NONE, "none" },
+	{ AWORKER_FAIL_CONFIG, "config" },
+	{ AWORKER_FAIL_OWNERSHIP, "ownership" },
+	{ 0, NULL }
+};
+
+const char *aworker_fail_reason_name(enum aworker_fail_reason reason)
+{
+	return get_value_string(fail_reason_names, reason);
+}
 
 const struct value_string aworker_failure_policy_names[] = {
 	{ AWORKER_FAILURE_RESTART, "restart" },
@@ -503,40 +523,64 @@ static void log_exit_status(struct aworker *w, int status)
 		LOGW(w, LOGL_ERROR, "killed by signal %u\n", WTERMSIG(status));
 }
 
+/* A failure that restarting cannot fix: keep the worker FAILED until an operator resets it. Only this worker. */
+static void worker_fail(struct aworker *w, enum aworker_fail_reason reason, const char *detail)
+{
+	w->state = AWORKER_ST_FAILED;
+	w->fail_reason = reason;
+	osmo_strlcpy(w->fail_detail, detail, sizeof(w->fail_detail));
+	w->failed_at = time(NULL);
+	osmo_timer_del(&w->restart_timer);
+	LOGP(DAWORKER, LOGL_ERROR, "aworker %u (pid %ld): FAILED (%s): %s. It is not restarted; osmo-bsc and the"
+	     " other workers continue. Fix the cause, then 'a-worker-pool reset worker %u'.\n", w->idx,
+	     (long)w->last_pid, aworker_fail_reason_name(reason), w->fail_detail, w->idx);
+}
+
 /* What happens to a lost worker once its process is collected (or if there never was one): the failure policy. */
 static void worker_apply_policy(struct aworker *w, bool config_error)
 {
 	struct aworker_pool *pool = w->pool;
 	const char *why = w->lost_reason;
 	long pid = (long)w->last_pid;
+	enum aworker_fail_reason fail = config_error ? AWORKER_FAIL_CONFIG : w->pending_fail;
+	char detail[sizeof(w->fail_detail)];
 
+	w->pending_fail = AWORKER_FAIL_NONE;
 	if (pool->stopping)
 		return;
+
+	if (fail == AWORKER_FAIL_CONFIG)
+		snprintf(detail, sizeof(detail), "exited with status %u: it cannot use its config file '%s' (its own"
+			 " log says why)", AWORKER_EXIT_CONFIG, pool->cfg.cfg_file[w->idx]);
+	else if (fail != AWORKER_FAIL_NONE)
+		osmo_strlcpy(detail, w->fail_detail, sizeof(detail));
 
 	/* Started on existing sockets (aworker_pool_start_with_fds()): there is no process to restart and no
 	 * configuration of our own to blame, so just leave the worker stopped. */
 	if (pool->no_fork) {
+		if (fail != AWORKER_FAIL_NONE) {
+			worker_fail(w, fail, detail);
+			return;
+		}
 		LOGP(DAWORKER, LOGL_ERROR, "aworker %u: worker lost (%s)\n", w->idx, why);
-		return;
-	}
-
-	if (config_error) {
-		LOGP(DAWORKER, LOGL_FATAL, "aworker %u (pid %ld): worker cannot start with its configuration"
-		     " (%s); shutting down osmo-bsc\n", w->idx, pid, why);
-		g_fatal = true;
-		osmo_select_shutdown_request();
 		return;
 	}
 
 	switch (pool->cfg.on_failure) {
 	case AWORKER_FAILURE_SHUTDOWN:
+		/* The explicit opt-in: any worker failure ends osmo-bsc, including one restarting cannot fix. */
 		LOGP(DAWORKER, LOGL_FATAL, "aworker %u (pid %ld): worker lost (%s) and 'on-worker-failure"
-		     " shutdown' is configured; shutting down osmo-bsc\n", w->idx, pid, why);
+		     " shutdown' is configured; shutting down osmo-bsc\n", w->idx, pid,
+		     fail != AWORKER_FAIL_NONE ? detail : why);
 		g_fatal = true;
 		osmo_select_shutdown_request();
 		return;
 	case AWORKER_FAILURE_RESTART:
 	default:
+		if (fail != AWORKER_FAIL_NONE) {
+			worker_fail(w, fail, detail);
+			return;
+		}
 		LOGP(DAWORKER, LOGL_ERROR, "aworker %u (pid %ld): worker lost (%s); restarting in %u s\n",
 		     w->idx, pid, why, pool->cfg.restart_delay);
 		w->state = AWORKER_ST_RESTARTING;
@@ -1204,8 +1248,10 @@ static void startup_timer_cb(void *data)
 
 	for (i = 0; i < pool->num; i++) {
 		struct aworker *w = pool->worker[i];
-		/* READY: fine. TERMINATING: already lost and being collected; its failure policy follows. */
-		if (w->state == AWORKER_ST_READY || w->state == AWORKER_ST_TERMINATING)
+		/* READY: fine. TERMINATING: already lost and being collected; its failure policy follows. FAILED:
+		 * stays so until it is reset. */
+		if (w->state == AWORKER_ST_READY || w->state == AWORKER_ST_TERMINATING
+		    || w->state == AWORKER_ST_FAILED)
 			continue;
 		LOGW(w, LOGL_ERROR, "not ready %u s after start (state %s); treating the worker as failed\n",
 		     pool->cfg.startup_timeout, get_value_string(state_names, w->state));
@@ -1572,7 +1618,40 @@ int aworker_pool_worker_info(unsigned int idx, struct aworker_pool_worker_info *
 		.cfg_file = g_pool->cfg.cfg_file[idx],
 		.sigkill_sent = w->sigkill_sent,
 		.reap_stuck = w->reap_stuck,
+		.fail_reason = w->fail_reason,
+		.fail_detail = w->fail_detail,
+		.failed_at = w->failed_at,
 	};
+	return 0;
+}
+
+int aworker_pool_reset_worker(unsigned int idx)
+{
+	struct aworker *w;
+
+	if (!g_pool)
+		return -ENODEV;
+	if (idx >= g_pool->num)
+		return -EINVAL;
+	if (g_pool->stopping)
+		return -ESHUTDOWN;
+	w = g_pool->worker[idx];
+	if (w->state != AWORKER_ST_FAILED)
+		return -EBUSY;
+
+	LOGW(w, LOGL_NOTICE, "reset by the operator (was FAILED: %s: %s); starting it again\n",
+	     aworker_fail_reason_name(w->fail_reason), w->fail_detail);
+	w->fail_reason = AWORKER_FAIL_NONE;
+	w->fail_detail[0] = '\0';
+	w->failed_at = 0;
+	w->state = AWORKER_ST_STOPPED;
+	if (g_pool->no_fork)
+		return 0;	/* no process of our own to start */
+	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING) {
+		LOGW(w, LOGL_ERROR, "start failed, retrying in %u s\n", g_pool->cfg.restart_delay);
+		w->state = AWORKER_ST_RESTARTING;
+		osmo_timer_schedule(&w->restart_timer, g_pool->cfg.restart_delay, 0);
+	}
 	return 0;
 }
 
@@ -1902,6 +1981,15 @@ void aworker_pool_dump_vty(struct vty *vty)
 		vty_out(vty, " worker %u: state %s, pid %ld, starts %u, config file %s%s", w->idx,
 			get_value_string(state_names, w->state), (long)w->pid, w->starts,
 			g_pool->cfg.cfg_file[i] ? g_pool->cfg.cfg_file[i] : "(none)", VTY_NEWLINE);
+		if (w->state == AWORKER_ST_FAILED) {
+			char when[32];
+			struct tm tm;
+			strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", localtime_r(&w->failed_at, &tm));
+			vty_out(vty, "  failed: %s, at %s: %s%s", aworker_fail_reason_name(w->fail_reason), when,
+				w->fail_detail, VTY_NEWLINE);
+			vty_out(vty, "  not restarted; 'a-worker-pool reset worker %u' starts it again%s", w->idx,
+				VTY_NEWLINE);
+		}
 		if (w->state == AWORKER_ST_TERMINATING)
 			vty_out(vty, "  terminating: %s%s",
 				w->reap_stuck ? "SIGKILL sent, process still not collected (stuck in the kernel?)"

@@ -24,4 +24,10 @@ P7: a worker restart is due when the pool is stopped; no replacement is started
   worker 0 was RESTARTING with its restart overdue; worker 1 READY, so stop polled the event loop
   a timer due at the same time as the restart fired while aworker_pool_stop() ran
   yet aworker_pool_stop() started no process
+P8: a worker that cannot use its config file is FAILED; the others and osmo-bsc go on
+  worker 1 exited 66 and is FAILED (reason config, with the file and the time); worker 0 READY
+  it stays FAILED past restart-delay and startup-timeout: no process started
+  resetting a worker that is not FAILED is refused and changes nothing
+  after the file is fixed, a reset starts exactly that worker once; it becomes READY
+  worker 0 kept its process throughout, and osmo-bsc was never asked to shut down
 PASSED

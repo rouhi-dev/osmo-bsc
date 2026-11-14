@@ -16,6 +16,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <errno.h>
 #include <stdlib.h>
 
 #include <osmocom/core/talloc.h>
@@ -185,9 +186,36 @@ DEFUN(show_aworker_pool, show_aworker_pool_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUN(aworker_reset_worker, aworker_reset_worker_cmd,
+      "a-worker-pool reset worker <0-15>",
+      "A-interface worker pool\n"
+      "Leave the FAILED state: forget the failure and start the worker again\n"
+      "One worker\n"
+      "Worker index\n")
+{
+	unsigned int idx = atoi(argv[0]);
+	int rc = aworker_pool_reset_worker(idx);
+
+	switch (rc) {
+	case 0:
+		vty_out(vty, "worker %u reset; starting it again%s", idx, VTY_NEWLINE);
+		return CMD_SUCCESS;
+	case -EBUSY:
+		vty_out(vty, "%% worker %u is not FAILED; nothing to reset%s", idx, VTY_NEWLINE);
+		return CMD_WARNING;
+	case -EINVAL:
+		vty_out(vty, "%% there is no worker %u%s", idx, VTY_NEWLINE);
+		return CMD_WARNING;
+	default:
+		vty_out(vty, "%% the A-worker pool is not running%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+}
+
 void aworker_pool_vty_init(void)
 {
 	install_element_ve(&show_aworker_pool_cmd);
+	install_element(ENABLE_NODE, &aworker_reset_worker_cmd);
 
 	install_element(CONFIG_NODE, &cfg_aworker_pool_cmd);
 	install_node(&aworker_pool_node, config_write_aworker_pool);

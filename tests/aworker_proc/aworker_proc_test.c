@@ -185,6 +185,7 @@ static struct {
 	char exitlog[PATH_MAX];		/*!< if set: how this worker ended ("goodbye" or "eof") */
 	char termlog[PATH_MAX + 8];		/*!< with exitlog: created if SIGTERM arrives */
 	unsigned int linger_ms;		/*!< on GOODBYE, exit only after this long (a worker shutting down) */
+	bool exit_config;		/*!< behave like a worker that cannot use its config file */
 	struct osmo_timer_list exit_timer;
 	bool got_goodbye;
 	struct aworker_ipc_link *link;
@@ -317,8 +318,12 @@ static int fake_worker_main(int argc, char **argv)
 			osmo_strlcpy(fw.exitlog, line + 8, sizeof(fw.exitlog));
 		else if (!strncmp(line, "linger=", 7))
 			fw.linger_ms = atoi(line + 7);
+		else if (!strcmp(line, "exit_config=1"))
+			fw.exit_config = true;
 	}
 	fclose(f);
+	if (fw.exit_config)
+		return AWORKER_EXIT_CONFIG;
 
 	if (fw.report[0]) {
 		len = snprintf(text, sizeof(text), "pid=%d ppid=%d ipc=%d exe=%s fds=", (int)getpid(), (int)getppid(),
@@ -999,6 +1004,11 @@ static void test_p6_stop_waits_for_goodbye(char **argv)
  * P7: a worker restart is due when the pool is stopped
  ***********************************************************************/
 
+static bool never_p8(void *data)
+{
+	return false;
+}
+
 static bool w0_restarting(void *data)
 {
 	return winfo(0).state == AWORKER_ST_RESTARTING;
@@ -1083,6 +1093,115 @@ static void test_p7_no_restart_while_stopping(char **argv)
 }
 
 /***********************************************************************
+ * P8: a worker that cannot use its config file is FAILED; only an operator reset starts it again
+ ***********************************************************************/
+
+static bool p8_w0_ready_w1_failed(void *data)
+{
+	return winfo(0).state == AWORKER_ST_READY && winfo(1).state == AWORKER_ST_FAILED;
+}
+
+static bool w1_ready(void *data)
+{
+	return winfo(1).state == AWORKER_ST_READY;
+}
+
+struct p8_result {
+	bool reached;		/*!< worker 0 READY and worker 1 FAILED */
+	bool recorded;		/*!< reason config, detail names exit 66 and the file, time set */
+	bool stayed_failed;	/*!< still FAILED after restart-delay and startup-timeout passed, never restarted */
+	unsigned int forks_while_failed;
+	bool w0_untouched;	/*!< worker 0: READY with the same process from start to end */
+	bool no_shutdown;	/*!< osmo-bsc (this process) was never asked to shut down */
+	bool reset_ready_refused; /*!< resetting the READY worker 0: -EBUSY, nothing changed */
+	bool reset_ok;		/*!< resetting worker 1: 0, one fork, READY, failure forgotten */
+	unsigned int forks_on_reset;
+	bool reset_again_refused;
+};
+
+static void test_p8_failed_worker(char **argv)
+{
+	struct p8_result res = {};
+	int pp[2], status;
+	pid_t bsc;
+
+	printf("P8: a worker that cannot use its config file is FAILED; the others and osmo-bsc go on\n");
+	OSMO_ASSERT(pipe(pp) == 0);
+	bsc = fork();
+	OSMO_ASSERT(bsc >= 0);
+	if (bsc == 0) {
+		const char *files[2];
+		struct aworker_pool_worker_info i0, i1;
+		pid_t p0;
+		unsigned int forks0;
+		int st;
+
+		close(pp[0]);
+		files[0] = worker_cfg(0, 0, NULL);
+		files[1] = worker_cfg(1, 1, "exit_config=1\n");
+		pool_configure(2, files);	/* restart-delay 1 s */
+		aworker_pool_cfg()->startup_timeout = 2;
+		aworker_pool_set_exec(argv[0], 1, argv);
+		if (aworker_pool_start(ctx) < 0)
+			_exit(1);
+		res.reached = run_until(p8_w0_ready_w1_failed, NULL, 10000);
+		p0 = winfo(0).pid;
+		i1 = winfo(1);
+		res.recorded = i1.fail_reason == AWORKER_FAIL_CONFIG && i1.failed_at != 0 && i1.fail_detail
+			       && strstr(i1.fail_detail, "exited with status 66") && strstr(i1.fail_detail, files[1]);
+
+		/* Past restart-delay (1 s) and startup-timeout (2 s): neither may start it again. */
+		forks0 = g_forks;
+		run_until(never_p8, NULL, 3000);
+		i1 = winfo(1);
+		res.forks_while_failed = g_forks - forks0;
+		res.stayed_failed = i1.state == AWORKER_ST_FAILED && i1.starts == 1 && !res.forks_while_failed;
+
+		/* Resetting a worker that is not FAILED changes nothing. */
+		res.reset_ready_refused = aworker_pool_reset_worker(0) == -EBUSY && winfo(0).state == AWORKER_ST_READY
+					  && winfo(0).pid == p0;
+
+		/* The operator fixes the file and resets worker 1: only worker 1 is started. */
+		worker_cfg(1, 1, NULL);
+		forks0 = g_forks;
+		st = aworker_pool_reset_worker(1);
+		res.reset_ok = st == 0 && run_until(w1_ready, NULL, 10000);
+		res.forks_on_reset = g_forks - forks0;
+		i1 = winfo(1);
+		res.reset_ok = res.reset_ok && i1.fail_reason == AWORKER_FAIL_NONE && i1.failed_at == 0
+			       && !i1.fail_detail[0] && i1.starts == 2;
+		res.reset_again_refused = aworker_pool_reset_worker(1) == -EBUSY;
+
+		i0 = winfo(0);
+		res.w0_untouched = i0.state == AWORKER_ST_READY && i0.pid == p0 && i0.starts == 1;
+		res.no_shutdown = !osmo_select_shutdown_requested() && !aworker_pool_shutdown_was_fatal();
+		aworker_pool_stop();
+		st = write(pp[1], &res, sizeof(res)) == sizeof(res) ? 0 : 1;
+		_exit(st);
+	}
+	close(pp[1]);
+	CHECK(read(pp[0], &res, sizeof(res)) == sizeof(res));
+	close(pp[0]);
+	CHECK(collect(bsc, &status, 30000) == bsc);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	CHECK(res.reached && res.recorded);
+	printf("  worker 1 exited 66 and is FAILED (reason config, with the file and the time); worker 0 READY\n");
+	CHECK(res.stayed_failed);
+	CHECK(res.forks_while_failed == 0);
+	printf("  it stays FAILED past restart-delay and startup-timeout: no process started\n");
+	CHECK(res.reset_ready_refused);
+	printf("  resetting a worker that is not FAILED is refused and changes nothing\n");
+	CHECK(res.reset_ok);
+	CHECK(res.forks_on_reset == 1);
+	CHECK(res.reset_again_refused);
+	printf("  after the file is fixed, a reset starts exactly that worker once; it becomes READY\n");
+	CHECK(res.w0_untouched);
+	CHECK(res.no_shutdown);
+	printf("  worker 0 kept its process throughout, and osmo-bsc was never asked to shut down\n");
+}
+
+/***********************************************************************
  * main
  ***********************************************************************/
 
@@ -1113,6 +1232,7 @@ int main(int argc, char **argv)
 	test_p5_clean_shutdown(argv);
 	test_p6_stop_waits_for_goodbye(argv);
 	test_p7_no_restart_while_stopping(argv);
+	test_p8_failed_worker(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

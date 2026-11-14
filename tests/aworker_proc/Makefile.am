@@ -36,6 +36,7 @@ aworker_proc_test_LDFLAGS = \
 	$(AM_LDFLAGS) \
 	-Wl,--wrap=waitpid \
 	-Wl,--wrap=prctl \
+	-Wl,--wrap=fork \
 	$(NULL)
 
 aworker_proc_test_LDADD = \

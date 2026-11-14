@@ -106,6 +106,15 @@ int __wrap_prctl(int option, unsigned long a2, unsigned long a3, unsigned long a
 	return __real_prctl(option, a2, a3, a4, a5);
 }
 
+static unsigned int g_forks;		/*!< fork() calls of this process (the pool starts a worker with fork()) */
+
+pid_t __real_fork(void);
+pid_t __wrap_fork(void)
+{
+	g_forks++;
+	return __real_fork();
+}
+
 /***********************************************************************
  * Helpers
  ***********************************************************************/
@@ -987,6 +996,93 @@ static void test_p6_stop_waits_for_goodbye(char **argv)
 }
 
 /***********************************************************************
+ * P7: a worker restart is due when the pool is stopped
+ ***********************************************************************/
+
+static bool w0_restarting(void *data)
+{
+	return winfo(0).state == AWORKER_ST_RESTARTING;
+}
+
+static bool g_p7_control_fired;
+
+static void p7_control_cb(void *data)
+{
+	g_p7_control_fired = true;
+}
+
+struct p7_result {
+	bool restarting;	/*!< worker 0 was RESTARTING, with its restart overdue, when the pool was stopped */
+	bool flush_ran;		/*!< worker 1's GOODBYE was pending, so aworker_pool_stop() polled the event loop */
+	bool control_fired;	/*!< a timer due at the same time as the restart fired during aworker_pool_stop() */
+	unsigned int forks;	/*!< fork() calls during aworker_pool_stop() */
+};
+
+static void test_p7_no_restart_while_stopping(char **argv)
+{
+	const char *extra[2] = { "", "" };
+	struct p7_result res = {};
+	int pp[2], status;
+	pid_t bsc;
+
+	printf("P7: a worker restart is due when the pool is stopped; no replacement is started\n");
+	clear_exitlogs();
+	OSMO_ASSERT(pipe(pp) == 0);
+	bsc = fork();
+	OSMO_ASSERT(bsc >= 0);
+	if (bsc == 0) {
+		struct osmo_timer_list control;
+		char cfg[2][2 * PATH_MAX];
+		const char *files[2];
+		unsigned int i, forks0;
+		int st;
+
+		close(pp[0]);
+		for (i = 0; i < 2; i++) {
+			snprintf(cfg[i], sizeof(cfg[i]), "exitlog=%s/exit%u\n%s", g_dir, i, extra[i]);
+			files[i] = worker_cfg(i, i, cfg[i]);
+		}
+		pool_configure(2, files);	/* restart-delay 1 s */
+		aworker_pool_set_exec(argv[0], 1, argv);
+		if (aworker_pool_start(ctx) < 0 || !run_until(all_ready, NULL, 10000))
+			_exit(1);
+
+		/* Lose worker 0: once collected, its restart is scheduled restart-delay (1 s) later. */
+		kill(winfo(0).pid, SIGKILL);
+		if (!run_until(w0_restarting, NULL, 5000))
+			_exit(1);
+		/* A control timer due at the same time (scheduled just after, so it expires just after). */
+		osmo_timer_setup(&control, p7_control_cb, NULL);
+		osmo_timer_schedule(&control, 1, 0);
+		/* Let both become overdue without running the event loop: the next poll that runs timers fires
+		 * them. No shutdown request, so libosmocore does run timers (it stops doing so after a request). */
+		usleep(1100 * 1000);
+		res.restarting = winfo(0).state == AWORKER_ST_RESTARTING && winfo(0).pid == 0;
+		res.flush_ran = winfo(1).state == AWORKER_ST_READY;	/* its GOODBYE will be pending */
+
+		forks0 = g_forks;
+		aworker_pool_stop();
+		res.forks = g_forks - forks0;
+		res.control_fired = g_p7_control_fired;
+		osmo_timer_del(&control);
+		st = write(pp[1], &res, sizeof(res)) == sizeof(res) ? 0 : 1;
+		_exit(st);
+	}
+	close(pp[1]);
+	CHECK(read(pp[0], &res, sizeof(res)) == sizeof(res));
+	close(pp[0]);
+	CHECK(collect(bsc, &status, 10000) == bsc);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	CHECK(res.restarting && res.flush_ran);
+	printf("  worker 0 was RESTARTING with its restart overdue; worker 1 READY, so stop polled the event loop\n");
+	CHECK(res.control_fired);
+	printf("  a timer due at the same time as the restart fired while aworker_pool_stop() ran\n");
+	CHECK(res.forks == 0);
+	printf("  yet aworker_pool_stop() started no process\n");
+}
+
+/***********************************************************************
  * main
  ***********************************************************************/
 
@@ -1016,6 +1112,7 @@ int main(int argc, char **argv)
 	test_p4_exe_replaced();
 	test_p5_clean_shutdown(argv);
 	test_p6_stop_waits_for_goodbye(argv);
+	test_p7_no_restart_while_stopping(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

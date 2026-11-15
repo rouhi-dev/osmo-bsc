@@ -511,3 +511,17 @@ Open points:
 * No real-binary test of the startup timeout: a real worker reports its cs7 instances within milliseconds, so it
   cannot be held in STARTING without a test seam.
 * `show a-worker-pool` does not show the remaining startup time (2a-8, status).
+
+### Startup-timeout default 60 s (decision after 2a-5)
+
+The approved 2a-5 instruction (an independent 60 s timeout for every worker start) supersedes the 20 s in §8. The
+default is now 60 s; an explicit `startup-timeout` still replaces it. The manual and the example configuration say so.
+* Test P20 (fake clock):
+  * The built-in default is 60. A process started at 5 s is still starting at 64.999 s and is timed out at 65 s.
+  * With `startup-timeout 30` it is timed out at 35 s.
+* Mutations:
+  * Default back to 20: fails P20.
+  * The configured value ignored: fails P20.
+* Real osmo-bsc:
+  * Without the command, `show a-worker-pool` says 60 s and `show running-config` writes no line.
+  * With `startup-timeout 30`, both show 30.

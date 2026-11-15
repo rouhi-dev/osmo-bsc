@@ -1326,6 +1326,7 @@ static void test_p9_ownership_failed(char **argv)
  ***********************************************************************/
 
 static unsigned long g_fake_ms;	/*!< fake time since fake_clock_on() */
+static unsigned int g_startup_timeout_default;	/*!< aworker_pool_cfg()->startup_timeout before any test set it */
 
 static void fake_clock_on(void)
 {
@@ -2171,6 +2172,44 @@ static void test_p19_old_timeout_not_replacement(char **argv)
 	printf("  stopping osmo-bsc while a process is starting leaves no startup timer behind\n");
 }
 
+/* P20: the built-in default startup-timeout is 60 s, per start; an explicit setting replaces it. Worker 1's process
+ * started at 5 s never becomes READY: timed out at 65 s with the default, at 35 s with 'startup-timeout 30'. */
+static unsigned int g_p20_timeout;
+
+static void p20_fn(char **argv, struct start_result *res)
+{
+	pid_t p1;
+	unsigned long deadline = 5000 + g_p20_timeout * 1000UL;
+
+	res->started = backoff_pool_start(argv, NULL, g_p20_timeout);
+	if (!res->started)
+		return;
+	p1 = restart_with(1, "no_cs7=1\n");		/* started at 5 s */
+	if (!p1)
+		return;
+	fake_advance_to(deadline - 1);
+	res->ok[0] = w_is(1, AWORKER_ST_STARTING, p1);
+	fake_advance_to(deadline);
+	res->ok[1] = !w_is(1, AWORKER_ST_STARTING, 0) && collected(1) && winfo(1).restarts_in_window == 2;
+	res->w0_untouched = winfo(0).state == AWORKER_ST_READY && winfo(0).starts == 1;
+}
+
+static void test_p20_startup_timeout_default(char **argv)
+{
+	struct start_result res;
+
+	printf("P20: startup-timeout is 60 s by default; a configured value replaces it\n");
+	CHECK(g_startup_timeout_default == 60);
+	g_p20_timeout = g_startup_timeout_default;
+	start_run(argv, p20_fn, &res);
+	CHECK(res.ok[0] && res.ok[1] && res.w0_untouched);
+	printf("  default: a process started at 5 s is still starting at 64.999 s, timed out at 65 s\n");
+	g_p20_timeout = 30;
+	start_run(argv, p20_fn, &res);
+	CHECK(res.ok[0] && res.ok[1] && res.w0_untouched);
+	printf("  'startup-timeout 30': still starting at 34.999 s, timed out at 35 s\n");
+}
+
 /***********************************************************************
  * main
  ***********************************************************************/
@@ -2183,6 +2222,7 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "--aworker-fd"))
 			return fake_worker_main(argc, argv);
 	}
+	g_startup_timeout_default = aworker_pool_cfg()->startup_timeout;
 	if (argc == 3 && !strcmp(argv[1], "--exe-test")) {
 		osmo_strlcpy(g_dir, argv[2], sizeof(g_dir));
 		return exe_test_main(argv);
@@ -2214,6 +2254,7 @@ int main(int argc, char **argv)
 	test_p17_startup_timeout_per_start(argv);
 	test_p18_ready_before_deadline(argv);
 	test_p19_old_timeout_not_replacement(argv);
+	test_p20_startup_timeout_default(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

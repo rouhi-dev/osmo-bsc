@@ -79,4 +79,7 @@ P19: a startup timeout never outlives its process
   the next process starts at 119 s as scheduled
   which is timed out at 179 s, its own deadline: fourth restart in the window, backoff 40 s
   stopping osmo-bsc while a process is starting leaves no startup timer behind
+P20: startup-timeout is 60 s by default; a configured value replaces it
+  default: a process started at 5 s is still starting at 64.999 s, timed out at 65 s
+  'startup-timeout 30': still starting at 34.999 s, timed out at 35 s
 PASSED

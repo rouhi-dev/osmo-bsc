@@ -117,7 +117,7 @@ running SIGTRAN stack cannot be moved.
   counted from that start: at OsmoBSC start, after a restart and after a reset alike. A worker that is
   not ready by then is treated as lost, and the restart policy applies (see <<aworker_restart>>). Once
   after OsmoBSC start, an error also names every SCCP user whose `cs7` instance no worker claimed. The
-  default is 20.
+  default is 60.
 
 `on-worker-failure (restart|shutdown)`::
   What to do when a worker dies or its IPC link breaks: restart it after its restart delay (the
@@ -152,7 +152,7 @@ pending restart delay or the delay the next loss would cause, and the restarts w
 
 ----
 OsmoBSC# show a-worker-pool
-A-worker pool: 2 worker(s), on-worker-failure restart, startup-timeout 20 s, restart-delay 5 s (max 60 s), stable-time 60 s
+A-worker pool: 2 worker(s), on-worker-failure restart, startup-timeout 60 s, restart-delay 5 s (max 60 s), stable-time 60 s
  max-restarts 5 window 300 s: a loss that would be restart 5 within 300 s makes a worker FAILED (at most 4 restarts)
  worker 0: state READY, pid 2048, starts 1, config file /etc/osmocom/osmo-bsc-aworker0.cfg
   cs7 instance 0: point-code 187, m3ua, 1 AS(s)

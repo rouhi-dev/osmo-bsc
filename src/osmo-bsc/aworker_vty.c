@@ -155,6 +155,22 @@ DEFUN_ATTR(cfg_aworker_stable_time, cfg_aworker_stable_time_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUN_ATTR(cfg_aworker_max_restarts, cfg_aworker_max_restarts_cmd,
+	   "max-restarts <1-32> window <1-86400>",
+	   "Stop restarting a worker that keeps being lost: an unplanned loss that would be the N-th restart within"
+	   " the window (counted from the oldest restart recorded in it) makes the worker FAILED instead, so at"
+	   " most N-1 restarts happen within any window; 'a-worker-pool reset worker' starts it again\n"
+	   "N; 1: no automatic restart at all\n"
+	   "The window\n"
+	   "Window in seconds\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	aworker_pool_cfg()->max_restarts = atoi(argv[0]);
+	aworker_pool_cfg()->restart_window = atoi(argv[1]);
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
 DEFUN_ATTR(cfg_aworker_on_failure, cfg_aworker_on_failure_cmd,
 	   "on-worker-failure (restart|shutdown)",
 	   "What to do when a worker process dies or its IPC link breaks. In both cases every SCCP connection of"
@@ -179,6 +195,8 @@ static int config_write_aworker_pool(struct vty *vty)
 		   || cfg->restart_delay != AWORKER_RESTART_DELAY_DEFAULT
 		   || cfg->restart_delay_max != AWORKER_RESTART_DELAY_MAX_DEFAULT
 		   || cfg->stable_time != AWORKER_STABLE_TIME_DEFAULT
+		   || cfg->max_restarts != AWORKER_MAX_RESTARTS_DEFAULT
+		   || cfg->restart_window != AWORKER_RESTART_WINDOW_DEFAULT
 		   || cfg->on_failure != AWORKER_FAILURE_RESTART;
 
 	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
@@ -202,6 +220,8 @@ static int config_write_aworker_pool(struct vty *vty)
 		vty_out(vty, " restart-delay-max %u%s", cfg->restart_delay_max, VTY_NEWLINE);
 	if (cfg->stable_time != AWORKER_STABLE_TIME_DEFAULT)
 		vty_out(vty, " stable-time %u%s", cfg->stable_time, VTY_NEWLINE);
+	if (cfg->max_restarts != AWORKER_MAX_RESTARTS_DEFAULT || cfg->restart_window != AWORKER_RESTART_WINDOW_DEFAULT)
+		vty_out(vty, " max-restarts %u window %u%s", cfg->max_restarts, cfg->restart_window, VTY_NEWLINE);
 	if (cfg->on_failure != AWORKER_FAILURE_RESTART)
 		vty_out(vty, " on-worker-failure %s%s",
 			get_value_string(aworker_failure_policy_names, cfg->on_failure), VTY_NEWLINE);
@@ -256,5 +276,6 @@ void aworker_pool_vty_init(void)
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_restart_delay_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_restart_delay_max_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_stable_time_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_max_restarts_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_on_failure_cmd);
 }

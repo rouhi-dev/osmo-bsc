@@ -52,6 +52,13 @@
  * the previous delay after every further one, never more than 'restart-delay-max' (but never less than
  * 'restart-delay'). A worker that was READY for at least 'stable-time' before it was lost starts over at
  * 'restart-delay'. Time a worker spends starting (not yet READY) never counts as stable.
+ *
+ * 'max-restarts N window S' limits the restarts of each worker: the times of its unplanned restarts are recorded
+ * (CLOCK_MONOTONIC, when the lost process is collected and the restart is decided). An unplanned loss that would be
+ * the N-th restart within S seconds of the oldest restart still recorded (one is dropped once it is S seconds old)
+ * puts the worker into FAILED (reason restart-limit) instead, so at most N-1 restarts happen within any S seconds.
+ * Stability does not clear the record (it only resets the backoff); an operator reset does. Defaults: N 5, S 300.
+ * Only unplanned losses count: config and ownership failures are FAILED at once, and planned stops never count.
  */
 
 #include <stdbool.h>
@@ -72,6 +79,9 @@ struct aworker;
 #define AWORKER_RESTART_DELAY_DEFAULT	5
 #define AWORKER_RESTART_DELAY_MAX_DEFAULT	60
 #define AWORKER_STABLE_TIME_DEFAULT	60
+#define AWORKER_MAX_RESTARTS_DEFAULT	5
+#define AWORKER_RESTART_WINDOW_DEFAULT	300
+#define AWORKER_MAX_RESTARTS_LIMIT	32	/*!< largest 'max-restarts' */
 
 /* Taking a worker down never blocks the main process: SIGTERM, then waitpid(WNOHANG) from a timer, SIGKILL after
  * the grace period, and polling again until the process is collected. A worker whose process has not been collected
@@ -109,6 +119,7 @@ enum aworker_fail_reason {
 	AWORKER_FAIL_NONE = 0,
 	AWORKER_FAIL_CONFIG,		/*!< the worker exited with AWORKER_EXIT_CONFIG: it cannot use its config file */
 	AWORKER_FAIL_OWNERSHIP,		/*!< it claimed a cs7 instance its config file did not have at start */
+	AWORKER_FAIL_RESTART_LIMIT,	/*!< lost again although 'max-restarts' was reached ('max-restarts N window S') */
 };
 const char *aworker_fail_reason_name(enum aworker_fail_reason reason);
 
@@ -129,6 +140,7 @@ struct aworker_pool_worker_info {
 	unsigned int backoff_step;	/*!< consecutive unplanned restarts since the worker was last stable (or reset):
 					 *   the next restart waits restart-delay * 2^backoff_step, capped */
 	unsigned int restart_delay;	/*!< seconds: delay of the restart scheduled last (0 if none so far) */
+	unsigned int restarts_in_window; /*!< recorded unplanned restarts less than 'window' seconds old */
 };
 
 struct aworker_pool_cfg {
@@ -141,6 +153,8 @@ struct aworker_pool_cfg {
 	unsigned int restart_delay;	/*!< seconds: restart delay after the first unplanned loss (the backoff base) */
 	unsigned int restart_delay_max;	/*!< seconds: the backoff never waits longer (but never less than restart_delay) */
 	unsigned int stable_time;	/*!< seconds READY before a loss after which the backoff starts over */
+	unsigned int max_restarts;	/*!< the max_restarts-th restart within restart_window makes the worker FAILED */
+	unsigned int restart_window;	/*!< seconds */
 	enum aworker_failure_policy on_failure;
 };
 

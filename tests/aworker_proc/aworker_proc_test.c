@@ -1397,6 +1397,9 @@ static bool restarts_after(unsigned int i, unsigned int delay_s)
 	return g_forks == forks0 + 1 && run_until(w_ready, &i, 10000) && g_forks == forks0 + 1;
 }
 
+/* P13-P15 set their own restart limit before backoff_pool_start(); 0: the default. */
+static unsigned int g_bo_max_restarts, g_bo_window;
+
 /* Start a two-worker pool on the fake clock; worker 1 is the one that crashes. \returns false unless both are READY. */
 static bool backoff_pool_start(char **argv, const char *extra1, unsigned int startup_timeout)
 {
@@ -1409,6 +1412,8 @@ static bool backoff_pool_start(char **argv, const char *extra1, unsigned int sta
 	aworker_pool_cfg()->restart_delay = AWORKER_RESTART_DELAY_DEFAULT;
 	aworker_pool_cfg()->restart_delay_max = AWORKER_RESTART_DELAY_MAX_DEFAULT;
 	aworker_pool_cfg()->stable_time = AWORKER_STABLE_TIME_DEFAULT;
+	aworker_pool_cfg()->max_restarts = g_bo_max_restarts ? : AWORKER_MAX_RESTARTS_DEFAULT;
+	aworker_pool_cfg()->restart_window = g_bo_window ? : AWORKER_RESTART_WINDOW_DEFAULT;
 	aworker_pool_cfg()->startup_timeout = startup_timeout;
 	aworker_pool_set_exec(argv[0], 1, argv);
 	fake_clock_on();
@@ -1427,6 +1432,15 @@ struct backoff_result {
 	unsigned int step_before_stable;		/*!< P11: ... and 1 ms before */
 	bool w0_untouched;				/*!< worker 0 READY with its first process throughout */
 	bool no_shutdown;
+	/* restart limit (P13-P15) */
+	bool failed;			/*!< the worker FAILED with reason restart-limit and the expected detail */
+	unsigned int in_window;		/*!< its restarts_in_window then */
+	bool stayed_failed;		/*!< still FAILED, no process started, long after */
+	unsigned int forks_while_failed;
+	bool reset_ok;			/*!< reset: one start, READY, the record and the backoff forgotten */
+	bool other_ok;			/*!< P14: the other worker's own record decides */
+	unsigned int in_window_later;	/*!< P14: worker 0's restarts_in_window once its restart is S s old */
+	bool stop_ok;			/*!< P15: a loss while stopping counts nothing */
 };
 
 /* Lose worker 1 after it was READY for up_ms (fake time), record the restart decision, and let it restart. */
@@ -1462,9 +1476,10 @@ static void backoff_run(char **argv, void (*fn)(char **argv, struct backoff_resu
 		close(pp[0]);
 		memset(res, 0, sizeof(*res));
 		fn(argv, res);
-		/* starts == 1: the process it got at pool start is still the one */
-		res->w0_untouched = res->started && winfo(0).state == AWORKER_ST_READY && winfo(0).starts == 1
-				    && winfo(0).pid > 0;
+		/* starts == 1: the process it got at pool start is still the one (P15 checks before its stop) */
+		if (aworker_pool_num_workers())
+			res->w0_untouched = res->started && winfo(0).state == AWORKER_ST_READY
+					    && winfo(0).starts == 1 && winfo(0).pid > 0;
 		res->no_shutdown = !osmo_select_shutdown_requested() && !aworker_pool_shutdown_was_fatal();
 		fake_clock_off();
 		aworker_pool_stop();
@@ -1620,6 +1635,206 @@ static void test_p12_startup_not_stable(char **argv)
 	CHECK(res.no_shutdown);
 }
 
+
+/***********************************************************************
+ * Restart limit (P13-P15), 'max-restarts N window S' as approved (plan §11.2): an unplanned loss that would be the
+ * N-th restart within S seconds of the oldest recorded one makes the worker FAILED -- at most N-1 restarts.
+ ***********************************************************************/
+
+static bool limit_failed(unsigned int i, const char *detail_part)
+{
+	struct aworker_pool_worker_info inf = winfo(i);
+	return inf.state == AWORKER_ST_FAILED && inf.fail_reason == AWORKER_FAIL_RESTART_LIMIT && inf.failed_at
+	       && inf.fail_detail && strstr(inf.fail_detail, detail_part);
+}
+
+/* P13: the defaults (5 in 300 s); worker 1 lost as soon as it is READY. */
+static void p13_fn(char **argv, struct backoff_result *res)
+{
+	struct aworker_pool_worker_info i1;
+	unsigned int i, forks0;
+
+	res->started = backoff_pool_start(argv, NULL, 250);	/* the startup timer fires while it is FAILED */
+	if (!res->started)
+		return;
+	for (i = 0; i < 4; i++)
+		backoff_round(res, 0);		/* restarts 1-4: 5, 10, 20, 40 s; the 4th at 75 s */
+	if (!crash(1))				/* would be restart 5 within 300 s of restart 1 */
+		return;
+	i1 = winfo(1);
+	res->in_window = i1.restarts_in_window;
+	res->failed = limit_failed(1, "lost again after 4 restarts within 300 s (the first 75 s ago): restart 5"
+				      " would reach 'max-restarts 5 window 300'");
+
+	/* Never restarted automatically: neither by a restart timer nor by the startup timer (250 s). */
+	forks0 = g_forks;
+	fake_advance_ms(200 * 1000);
+	pump();
+	res->forks_while_failed = g_forks - forks0;
+	res->stayed_failed = limit_failed(1, "max-restarts 5 window 300") && !res->forks_while_failed;
+
+	/* 275 s: all 4 recorded restarts are still within 300 s. The operator resets it: one start, READY, a fresh
+	 * record and backoff. */
+	forks0 = g_forks;
+	i = 1;
+	res->reset_ok = aworker_pool_reset_worker(1) == 0 && run_until(w_ready, &i, 10000) && g_forks == forks0 + 1;
+	i1 = winfo(1);
+	res->reset_ok = res->reset_ok && i1.fail_reason == AWORKER_FAIL_NONE && !i1.restarts_in_window
+			&& !i1.backoff_step;
+	backoff_round(res, 0);			/* lost again: restart-delay 5 s, restart 1 of a new window */
+	res->reset_ok = res->reset_ok && winfo(1).restarts_in_window == 1;
+}
+
+static void test_p13_restart_limit(char **argv)
+{
+	static const unsigned int delays[] = { 5, 10, 20, 40, 5 };
+	struct backoff_result res;
+
+	printf("P13: a worker lost again and again is FAILED once its restarts reach 'max-restarts 5 window 300'\n");
+	backoff_run(argv, p13_fn, &res);
+	CHECK(check_rounds(&res, delays, ARRAY_SIZE(delays)));
+	CHECK(res.failed);
+	CHECK(res.in_window == 4);
+	printf("  4 restarts (5, 10, 20, 40 s); the loss that would be the 5th restart within 300 s makes it FAILED\n");
+	printf("  (reason restart-limit; the detail names the restarts, the window and the limit)\n");
+	CHECK(res.stayed_failed);
+	CHECK(res.forks_while_failed == 0);
+	printf("  it stays FAILED: no process started in the 200 s that follow (the startup timer fires meanwhile)\n");
+	CHECK(res.reset_ok);
+	printf("  a reset starts it once with the record and the backoff forgotten: lost again, restarted after 5 s\n");
+	CHECK(res.w0_untouched);
+	CHECK(res.no_shutdown);
+	printf("  worker 0 kept its process and stayed READY, and osmo-bsc was never asked to shut down\n");
+}
+
+/* P14: 'max-restarts 2 window 300': the second restart within 300 s is refused. Both workers are lost at 0 s and
+ * restarted; worker 0 is lost again at 299.999 s (FAILED), worker 1 at 300 s, when its first restart has left the
+ * window (restarted). Each worker's own record decides. */
+static void p14_fn(char **argv, struct backoff_result *res)
+{
+	struct aworker_pool_worker_info i1;
+	unsigned int forks0;
+
+	g_bo_max_restarts = 2;
+	g_bo_window = 300;
+	res->started = backoff_pool_start(argv, NULL, 600);
+	if (!res->started)
+		return;
+	/* 0 s: both lost; each is restart 1 of its own window */
+	if (!crash(0) || !crash(1) || winfo(0).state != AWORKER_ST_RESTARTING
+	    || winfo(1).state != AWORKER_ST_RESTARTING)
+		return;
+	forks0 = g_forks;
+	fake_advance_ms(4999);
+	if (g_forks != forks0)
+		return;
+	fake_advance_ms(1);
+	if (g_forks != forks0 + 2 || !run_until(all_ready, NULL, 10000))
+		return;
+	/* 299.999 s: worker 0's restart at 0 s is still within the window */
+	fake_advance_ms(294999);
+	if (!crash(0))
+		return;
+	res->failed = limit_failed(0, "lost again after 1 restarts within 300 s (the first 299 s ago): restart 2"
+				      " would reach 'max-restarts 2 window 300'");
+	res->in_window = winfo(0).restarts_in_window;
+	/* 300 s: the restarts at 0 s have just left the window */
+	fake_advance_ms(1);
+	res->in_window_later = winfo(0).restarts_in_window;
+	if (!crash(1))
+		return;
+	i1 = winfo(1);
+	res->other_ok = i1.state == AWORKER_ST_RESTARTING && i1.restarts_in_window == 1 && i1.restart_delay == 5
+			&& restarts_after(1, 5) && limit_failed(0, "max-restarts 2 window 300");
+}
+
+static void test_p14_restart_window(char **argv)
+{
+	struct backoff_result res;
+
+	printf("P14: the restart window is per worker and slides: a restart counts while it is less than S s old\n");
+	backoff_run(argv, p14_fn, &res);
+	CHECK(res.started);
+	CHECK(res.failed && res.in_window == 1);
+	printf("  'max-restarts 2 window 300': worker 0, restarted at 0 s, lost again at 299.999 s: FAILED\n");
+	CHECK(res.in_window_later == 0);
+	printf("  at 300 s its status no longer counts that restart\n");
+	CHECK(res.other_ok);
+	printf("  worker 1, restarted at 0 s too, lost again at 300 s: that restart left the window, it is restarted\n");
+}
+
+/* P15: a planned stop is no unplanned loss. With 'max-restarts 1', a loss the pool handles while it runs makes the
+ * worker FAILED at once; the same loss handled while the pool stops counts nothing. */
+static void p15_running_fn(char **argv, struct backoff_result *res)
+{
+	g_bo_max_restarts = 1;
+	res->started = backoff_pool_start(argv, NULL, 600);
+	if (!res->started)
+		return;
+	res->failed = crash(1) && limit_failed(1, "lost: 'max-restarts 1 window 300' allows no automatic restart");
+}
+
+static void p15_stopping_fn(char **argv, struct backoff_result *res)
+{
+	char path[PATH_MAX], text[16384];
+	struct log_target *t;
+	unsigned long end;
+	unsigned int forks0;
+	pid_t pid;
+	FILE *f;
+	size_t n;
+
+	g_bo_max_restarts = 1;
+	res->started = backoff_pool_start(argv, NULL, 600);
+	if (!res->started)
+		return;
+	res->w0_untouched = winfo(0).starts == 1;
+	snprintf(path, sizeof(path), "%s/p15.log", g_dir);
+	t = log_target_create_file(path);
+	OSMO_ASSERT(t);
+	log_set_all_filter(t, 1);
+	log_set_category_filter(t, DAWORKER, 1, LOGL_DEBUG);
+	log_set_print_filename2(t, LOG_FILENAME_NONE);
+	log_add_target(t);
+
+	/* Worker 1 dies; the pool has not handled it when osmo-bsc stops: it does so during aworker_pool_stop(). */
+	pid = winfo(1).pid;
+	kill(pid, SIGKILL);
+	end = now_ms() + 5000;
+	while (!is_zombie(pid) && now_ms() < end)
+		usleep(1000);
+	forks0 = g_forks;
+	fake_clock_off();
+	aworker_pool_stop();
+	log_target_destroy(t);
+
+	f = fopen(path, "r");
+	n = f ? fread(text, 1, sizeof(text) - 1, f) : 0;
+	text[n] = '\0';
+	if (f)
+		fclose(f);
+	res->stop_ok = is_zombie(pid) == false && g_forks == forks0
+		       && strstr(text, "SIGKILL") == NULL		/* it was simply collected */
+		       && strstr(text, "restart-limit") == NULL && strstr(text, "FAILED") == NULL
+		       && strstr(text, "restarting in") == NULL;
+	if (!res->stop_ok)
+		printf("%s", text);
+}
+
+static void test_p15_stop_not_counted(char **argv)
+{
+	struct backoff_result res;
+
+	printf("P15: a planned stop never counts as an unplanned loss\n");
+	backoff_run(argv, p15_running_fn, &res);
+	CHECK(res.failed);
+	printf("  'max-restarts 1': a worker lost while the pool runs is FAILED (restart-limit) at once\n");
+	backoff_run(argv, p15_stopping_fn, &res);
+	CHECK(res.stop_ok);
+	CHECK(res.w0_untouched);
+	printf("  the same loss handled while the pool stops: not counted, not FAILED, no restart, nothing started\n");
+}
+
 /***********************************************************************
  * main
  ***********************************************************************/
@@ -1656,6 +1871,9 @@ int main(int argc, char **argv)
 	test_p10_backoff(argv);
 	test_p11_stable_time(argv);
 	test_p12_startup_not_stable(argv);
+	test_p13_restart_limit(argv);
+	test_p14_restart_window(argv);
+	test_p15_stop_not_counted(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

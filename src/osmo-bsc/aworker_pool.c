@@ -97,6 +97,9 @@ struct aworker {
 	bool ready_seen;			/*!< the current process reached READY ... */
 	struct timespec ready_since;		/*!< ... at this time */
 	bool stable_at_loss;			/*!< it was READY for at least stable-time when it was lost */
+	/*! Restart limit: times of the recorded unplanned restarts, oldest first, see worker_schedule_restart(). */
+	struct timespec restart_at[AWORKER_MAX_RESTARTS_LIMIT];
+	unsigned int num_restart_at;
 
 	/* Taking the process down without blocking (AWORKER_ST_TERMINATING), see worker_begin_termination(). */
 	struct osmo_timer_list reap_timer;
@@ -159,6 +162,8 @@ static struct aworker_pool_cfg g_cfg = {
 	.restart_delay = AWORKER_RESTART_DELAY_DEFAULT,
 	.restart_delay_max = AWORKER_RESTART_DELAY_MAX_DEFAULT,
 	.stable_time = AWORKER_STABLE_TIME_DEFAULT,
+	.max_restarts = AWORKER_MAX_RESTARTS_DEFAULT,
+	.restart_window = AWORKER_RESTART_WINDOW_DEFAULT,
 	.on_failure = AWORKER_FAILURE_RESTART,
 };
 
@@ -196,6 +201,7 @@ static const struct value_string fail_reason_names[] = {
 	{ AWORKER_FAIL_NONE, "none" },
 	{ AWORKER_FAIL_CONFIG, "config" },
 	{ AWORKER_FAIL_OWNERSHIP, "ownership" },
+	{ AWORKER_FAIL_RESTART_LIMIT, "restart-limit" },
 	{ 0, NULL }
 };
 
@@ -575,10 +581,61 @@ static unsigned int worker_next_step(const struct aworker *w)
 	return worker_is_stable(w) ? 0 : w->backoff_step;
 }
 
-/* An unplanned loss with 'on-worker-failure restart': schedule the restart, backing off. */
+/* Recorded restarts within the window: one counts while it is less than restart-window seconds old. */
+static bool restart_in_window(const struct aworker *w, unsigned int i)
+{
+	return ms_since(&w->restart_at[i]) < (unsigned long long)w->pool->cfg.restart_window * 1000;
+}
+
+static unsigned int restarts_in_window(const struct aworker *w)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; i < w->num_restart_at; i++)
+		n += restart_in_window(w, i);
+	return n;
+}
+
+/* Drop the recorded restarts that left the window (the oldest are first). */
+static void restarts_expire(struct aworker *w)
+{
+	unsigned int i = 0;
+
+	while (i < w->num_restart_at && !restart_in_window(w, i))
+		i++;
+	memmove(&w->restart_at[0], &w->restart_at[i], (w->num_restart_at - i) * sizeof(w->restart_at[0]));
+	w->num_restart_at -= i;
+}
+
+/* An unplanned loss with 'on-worker-failure restart', decided when the process is collected: unless this would be
+ * the max-restarts-th restart within restart-window (counting from the oldest recorded one still in it), record it
+ * and schedule the restart, backing off. Otherwise the worker is FAILED (restart-limit): with the defaults, at most
+ * 4 restarts within 300 s. */
 static void worker_schedule_restart(struct aworker *w)
 {
 	struct aworker_pool *pool = w->pool;
+
+	restarts_expire(w);
+	if (w->num_restart_at + 1 >= pool->cfg.max_restarts) {
+		char detail[sizeof(w->fail_detail)];
+
+		/* The loss reason last and bounded: the limit is what the operator needs to see. */
+		if (w->num_restart_at)
+			snprintf(detail, sizeof(detail), "lost again after %u restarts within %u s (the first %u s"
+				 " ago): restart %u would reach 'max-restarts %u window %u'; last loss: %.60s",
+				 w->num_restart_at, pool->cfg.restart_window, ms_since(&w->restart_at[0]) / 1000,
+				 w->num_restart_at + 1, pool->cfg.max_restarts, pool->cfg.restart_window,
+				 w->lost_reason);
+		else
+			snprintf(detail, sizeof(detail), "lost: 'max-restarts %u window %u' allows no automatic"
+				 " restart; last loss: %.60s", pool->cfg.max_restarts, pool->cfg.restart_window,
+				 w->lost_reason);
+		w->stable_at_loss = false;
+		worker_fail(w, AWORKER_FAIL_RESTART_LIMIT, detail);
+		return;
+	}
+	OSMO_ASSERT(w->num_restart_at < ARRAY_SIZE(w->restart_at));
+	osmo_clock_gettime(CLOCK_MONOTONIC, &w->restart_at[w->num_restart_at++]);
 
 	if (w->stable_at_loss && w->backoff_step) {
 		LOGP(DAWORKER, LOGL_NOTICE, "aworker %u: it was READY for at least stable-time (%u s) before it was"
@@ -1501,10 +1558,11 @@ int aworker_pool_start(void *ctx)
 	}
 
 	LOGP(DAWORKER, LOGL_NOTICE, "A-worker pool started: %u worker(s), on-worker-failure %s,"
-	     " startup-timeout %u s, restart-delay %u s (max %u s), stable-time %u s\n", pool->num,
-	     get_value_string(aworker_failure_policy_names, pool->cfg.on_failure), pool->cfg.startup_timeout,
-	     pool->cfg.restart_delay, OSMO_MAX(pool->cfg.restart_delay, pool->cfg.restart_delay_max),
-	     pool->cfg.stable_time);
+	     " startup-timeout %u s, restart-delay %u s (max %u s), stable-time %u s, max-restarts %u window %u s\n",
+	     pool->num, get_value_string(aworker_failure_policy_names, pool->cfg.on_failure),
+	     pool->cfg.startup_timeout, pool->cfg.restart_delay,
+	     OSMO_MAX(pool->cfg.restart_delay, pool->cfg.restart_delay_max), pool->cfg.stable_time,
+	     pool->cfg.max_restarts, pool->cfg.restart_window);
 	osmo_timer_schedule(&pool->startup_timer, pool->cfg.startup_timeout, 0);
 	return 0;
 }
@@ -1749,6 +1807,7 @@ int aworker_pool_worker_info(unsigned int idx, struct aworker_pool_worker_info *
 		.failed_at = w->failed_at,
 		.backoff_step = worker_next_step(w),
 		.restart_delay = w->restart_delay_s,
+		.restarts_in_window = restarts_in_window(w),
 	};
 	return 0;
 }
@@ -1775,6 +1834,7 @@ int aworker_pool_reset_worker(unsigned int idx)
 	/* A fresh start: no backoff carried over from before the failure. */
 	w->backoff_step = 0;
 	w->restart_delay_s = g_pool->cfg.restart_delay;
+	w->num_restart_at = 0;
 	w->state = AWORKER_ST_STOPPED;
 	if (g_pool->no_fork)
 		return 0;	/* no process of our own to start */
@@ -2102,6 +2162,9 @@ void aworker_pool_dump_vty(struct vty *vty)
 		get_value_string(aworker_failure_policy_names, g_pool->cfg.on_failure), g_pool->cfg.startup_timeout,
 		g_pool->cfg.restart_delay, OSMO_MAX(g_pool->cfg.restart_delay, g_pool->cfg.restart_delay_max),
 		g_pool->cfg.stable_time, VTY_NEWLINE);
+	vty_out(vty, " max-restarts %u window %u s: a loss that would be restart %u within %u s makes a worker"
+		" FAILED (at most %u restarts)%s", g_pool->cfg.max_restarts, g_pool->cfg.restart_window,
+		g_pool->cfg.max_restarts, g_pool->cfg.restart_window, g_pool->cfg.max_restarts - 1, VTY_NEWLINE);
 
 	for (i = 0; i < g_pool->num; i++) {
 		struct aworker *w = g_pool->worker[i];
@@ -2122,11 +2185,14 @@ void aworker_pool_dump_vty(struct vty *vty)
 		if (w->state == AWORKER_ST_RESTARTING)
 			vty_out(vty, "  restarting after %u s (unplanned restart %u in a row)%s", w->restart_delay_s,
 				w->backoff_step, VTY_NEWLINE);
-		else if (worker_next_step(w))
+		else if (w->state != AWORKER_ST_FAILED && worker_next_step(w))
 			vty_out(vty, "  unplanned restarts in a row: %u; if lost now, restarted after %u s"
 				" (back to %u s once READY for %u s)%s", w->backoff_step,
 				restart_delay_for(&g_pool->cfg, w->backoff_step), g_pool->cfg.restart_delay,
 				g_pool->cfg.stable_time, VTY_NEWLINE);
+		if (w->state != AWORKER_ST_FAILED && restarts_in_window(w))
+			vty_out(vty, "  unplanned restarts within the last %u s: %u (restart %u would make it FAILED)%s",
+				g_pool->cfg.restart_window, restarts_in_window(w), g_pool->cfg.max_restarts, VTY_NEWLINE);
 		if (w->state == AWORKER_ST_TERMINATING)
 			vty_out(vty, "  terminating: %s%s",
 				w->reap_stuck ? "SIGKILL sent, process still not collected (stuck in the kernel?)"

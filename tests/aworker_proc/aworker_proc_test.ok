@@ -46,4 +46,17 @@ P11: a worker that was READY for stable-time before it was lost starts the backo
 P12: time spent starting is not stable time: a startup timeout continues the backoff
   a process that never became READY ran 65 s (more than stable-time) until the startup timeout:
   that loss is the third in a row (5, 10, 20 s), not a fresh start
+P13: a worker lost again and again is FAILED once its restarts reach 'max-restarts 5 window 300'
+  4 restarts (5, 10, 20, 40 s); the loss that would be the 5th restart within 300 s makes it FAILED
+  (reason restart-limit; the detail names the restarts, the window and the limit)
+  it stays FAILED: no process started in the 200 s that follow (the startup timer fires meanwhile)
+  a reset starts it once with the record and the backoff forgotten: lost again, restarted after 5 s
+  worker 0 kept its process and stayed READY, and osmo-bsc was never asked to shut down
+P14: the restart window is per worker and slides: a restart counts while it is less than S s old
+  'max-restarts 2 window 300': worker 0, restarted at 0 s, lost again at 299.999 s: FAILED
+  at 300 s its status no longer counts that restart
+  worker 1, restarted at 0 s too, lost again at 300 s: that restart left the window, it is restarted
+P15: a planned stop never counts as an unplanned loss
+  'max-restarts 1': a worker lost while the pool runs is FAILED (restart-limit) at once
+  the same loss handled while the pool stops: not counted, not FAILED, no restart, nothing started
 PASSED

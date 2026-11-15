@@ -59,4 +59,8 @@ P14: the restart window is per worker and slides: a restart counts while it is l
 P15: a planned stop never counts as an unplanned loss
   'max-restarts 1': a worker lost while the pool runs is FAILED (restart-limit) at once
   the same loss handled while the pool stops: not counted, not FAILED, no restart, nothing started
+P16: stable-time resets the backoff, not the restart record
+  lost at 0, 5, 15 s (5, 10, 20 s), then READY 60 s and lost: restarted after restart-delay (5 s)
+  the restarts of 0, 5 and 15 s still count, and that restart is added: 4 within 300 s
+  READY 60 s again, lost at 160 s: restart 5 within 300 s, so FAILED (restart-limit)
 PASSED

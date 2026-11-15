@@ -1440,6 +1440,8 @@ struct backoff_result {
 	bool reset_ok;			/*!< reset: one start, READY, the record and the backoff forgotten */
 	bool other_ok;			/*!< P14: the other worker's own record decides */
 	unsigned int in_window_later;	/*!< P14: worker 0's restarts_in_window once its restart is S s old */
+	unsigned int in_window_stable;	/*!< P16: restarts_in_window right after the loss that followed a stable period */
+	unsigned int step_stable;	/*!< P16: backoff_step right after that loss */
 	bool stop_ok;			/*!< P15: a loss while stopping counts nothing */
 };
 
@@ -1835,6 +1837,51 @@ static void test_p15_stop_not_counted(char **argv)
 	printf("  the same loss handled while the pool stops: not counted, not FAILED, no restart, nothing started\n");
 }
 
+/* P16: stable-time resets only the backoff, never the restart record (plan §3, §8, §11.2). Worker 1, defaults:
+ * lost at 0, 5 and 15 s right after READY (restarts after 5, 10, 20 s), then READY 60 s from 35 s and lost at 95 s:
+ * the restart waits restart-delay again, but the restarts of 0, 5 and 15 s still count and the new one is added
+ * (4 in the window). READY 60 s again, lost at 160 s: that would be restart 5 within 300 s of the one at 0 s, so
+ * the worker is FAILED although both of its last losses followed a stable period. */
+static void p16_fn(char **argv, struct backoff_result *res)
+{
+	struct aworker_pool_worker_info i1;
+
+	res->started = backoff_pool_start(argv, NULL, 600);
+	if (!res->started)
+		return;
+	backoff_round(res, 0);			/*   0 s: 5 s */
+	backoff_round(res, 0);			/*   5 s: 10 s */
+	backoff_round(res, 0);			/*  15 s: 20 s; READY at 35 s */
+	backoff_round(res, 60000);		/*  95 s, READY 60 s: 5 s; READY at 100 s */
+	i1 = winfo(1);
+	res->in_window_stable = i1.restarts_in_window;
+	res->step_stable = i1.backoff_step;
+	fake_advance_ms(60000);			/* 160 s, READY 60 s */
+	if (!crash(1))
+		return;
+	res->in_window = winfo(1).restarts_in_window;
+	res->failed = limit_failed(1, "lost again after 4 restarts within 300 s (the first 160 s ago): restart 5"
+				      " would reach 'max-restarts 5 window 300'");
+}
+
+static void test_p16_stable_keeps_record(char **argv)
+{
+	static const unsigned int delays[] = { 5, 10, 20, 5 };
+	struct backoff_result res;
+
+	printf("P16: stable-time resets the backoff, not the restart record\n");
+	backoff_run(argv, p16_fn, &res);
+	CHECK(check_rounds(&res, delays, ARRAY_SIZE(delays)));
+	CHECK(res.step_stable == 1);
+	printf("  lost at 0, 5, 15 s (5, 10, 20 s), then READY 60 s and lost: restarted after restart-delay (5 s)\n");
+	CHECK(res.in_window_stable == 4);
+	printf("  the restarts of 0, 5 and 15 s still count, and that restart is added: 4 within 300 s\n");
+	CHECK(res.failed && res.in_window == 4);
+	printf("  READY 60 s again, lost at 160 s: restart 5 within 300 s, so FAILED (restart-limit)\n");
+	CHECK(res.w0_untouched);
+	CHECK(res.no_shutdown);
+}
+
 /***********************************************************************
  * main
  ***********************************************************************/
@@ -1874,6 +1921,7 @@ int main(int argc, char **argv)
 	test_p13_restart_limit(argv);
 	test_p14_restart_window(argv);
 	test_p15_stop_not_counted(argv);
+	test_p16_stable_keeps_record(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

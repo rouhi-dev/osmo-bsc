@@ -448,3 +448,66 @@ afterwards, so the check is unchanged. After the fix: two runs, 46/46 each.
 * `restart-delay 0` stays 0 (compatible). Such a worker can therefore restart N-1 times without delay before the
   limit makes it FAILED.
 * The worker-level `point-code` failure reason (§2) is still not implemented.
+
+### Policy B confirmed; P16: committed 2a8e2e0a4
+
+Reviewed after 2a-4 and approved: stable time resets only the backoff exponent. Restart records leave the window only
+by age, or through an operator reset (§3, §8, §11.2; architecture §6). Test-only commit P16:
+* Lost at 0, 5 and 15 s, then READY 60 s and lost at 95 s: restarted after 5 s. The earlier restarts are still in
+  the window and the new one is added, 4 in the window.
+* READY 60 s again and lost at 160 s: FAILED (restart-limit).
+* Clearing the record after a stable period (Policy A) fails P16 and P14. Not resetting the backoff fails P16,
+  P11 and P14.
+
+### 2a-5 — startup timeout per start: committed 6b36f3301
+
+Each worker has a startup timer for its current process.
+* **Armed** in `link_create()`, which every start (pool start, restart, reset, test start on existing sockets)
+  goes through. Every start therefore gets the full `startup-timeout`, and re-arming replaces an earlier deadline.
+* **Deleted** on every way out of STARTING: READY, `worker_lost()`, and `aworker_pool_stop()` (before the
+  GOODBYE flush).
+* **Callback:** acts only on its own worker, only while it is STARTING, and ends it with
+  `worker_lost(w, "startup timeout")`. Collection and the failure policy (backoff, restart limit, FAILED,
+  `on-worker-failure shutdown`) then apply as for any other unplanned loss.
+* **Pool-level timer:** kept only for its diagnostic about SCCP users still unbound after pool start.
+* **Default:** stays 20 s as approved in §8. The 2a-5 brief said 60 s; changing the default was not done without
+  approval.
+* **Behaviour change:** restarted and reset workers are now timed out as well.
+
+Tests (fake clock, `startup-timeout 60`):
+* **P17:** two workers started at 5 and 25 s, neither READY. At 64.999 s both are still starting. At 65 s only
+  worker 0 is timed out, as an unplanned loss with backoff 10 s, then restarted and READY. Worker 1 is timed out at
+  85 s. Each worker's pid and state are untouched by the other.
+* **P18:** READY at 64.999 s is not timed out (checked up to 300 s).
+* **P19:**
+  * A process lost before its deadline: neither its old deadline nor a deadline passing during RESTARTING
+    affects the worker or its replacement.
+  * The replacement is timed out exactly at its own deadline.
+  * A stop with a process STARTING leaves no live timer; the fake clock keeps running through the stop and past the
+    deadline.
+* **P12:** now uses `startup-timeout 65` per start, with the same timeline and output.
+
+Mutations:
+* **Caught:**
+  * armed only at the first start;
+  * no cancel at READY and no state check;
+  * no cancel on loss and no state check;
+  * no cancel on loss and the deadline not replaced at the next start;
+  * a timeout ending every STARTING worker;
+  * stop leaving the timers pending (ASan build only; the normal build reads freed memory without crashing).
+* **Survive by design (as P7):** removing one of the two guards alone, i.e. the cancellation at READY, the
+  cancellation on loss, or the state check.
+
+Two test corrections while writing them, neither of which weakened a check:
+* P18 first expected 1 restart in the window at 300 s. At 300 s the restart from 0 s has correctly left the
+  window, so "no further loss" is now checked at 250 s and "same process" again at 300 s.
+* The stop check first passed even with the stop-path deletion removed. Its worker exited on GOODBYE, so
+  `worker_lost()` already cancelled the timer. Also, libosmocore is not ASan-instrumented and the deadline lay far
+  in the future. The process now lingers past the flush, and the clock passes its deadline.
+
+Normal and ASan/UBSan: 14/14, no new warnings, no sanitizer report. E2E: 46/46.
+
+Open points:
+* No real-binary test of the startup timeout: a real worker reports its cs7 instances within milliseconds, so it
+  cannot be held in STARTING without a test seam.
+* `show a-worker-pool` does not show the remaining startup time (2a-8, status).

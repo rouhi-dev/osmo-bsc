@@ -113,9 +113,11 @@ running SIGTRAN stack cannot be moved.
   Configuration file of one worker. Every worker below `workers` needs one.
 
 `startup-timeout <1-600>`::
-  Seconds to wait for the workers to complete their handshake and report their `cs7` instances. On
-  expiry the workers that are not ready are treated as failed, and an error names every SCCP user
-  whose `cs7` instance no worker claimed. The default is 20.
+  Seconds each started worker process has to complete its handshake and report its `cs7` instances,
+  counted from that start: at OsmoBSC start, after a restart and after a reset alike. A worker that is
+  not ready by then is treated as lost, and the restart policy applies (see <<aworker_restart>>). Once
+  after OsmoBSC start, an error also names every SCCP user whose `cs7` instance no worker claimed. The
+  default is 20.
 
 `on-worker-failure (restart|shutdown)`::
   What to do when a worker dies or its IPC link breaks: restart it after its restart delay (the
@@ -207,7 +209,8 @@ affected:
   in a row doubles the delay, up to `restart-delay-max`. With the defaults: 5, 10, 20, 40, 60, 60, ...
   seconds. A worker that was ready for at least `stable-time` before it was lost starts over at
   `restart-delay`. Time spent starting (before the worker reported its `cs7` instances) never counts
-  as stable, so a worker that times out at startup keeps backing off.
+  as stable, so a worker that times out at startup (`startup-timeout`) keeps backing off; each such
+  timeout counts as an unplanned loss.
 * *Limit.* Each worker records the time of each of its unplanned restarts, taken when the lost process
   is collected. A restart counts while it is less than `window` seconds old. An unplanned loss that
   would be restart N (`max-restarts N`) within the window makes the worker FAILED with the reason

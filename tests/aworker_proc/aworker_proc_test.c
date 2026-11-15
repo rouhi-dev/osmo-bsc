@@ -186,6 +186,7 @@ static struct {
 	char termlog[PATH_MAX + 8];		/*!< with exitlog: created if SIGTERM arrives */
 	unsigned int linger_ms;		/*!< on GOODBYE, exit only after this long (a worker shutting down) */
 	bool exit_config;		/*!< behave like a worker that cannot use its config file */
+	bool no_cs7;			/*!< never send CS7_INFO: the worker never becomes READY */
 	struct osmo_timer_list exit_timer;
 	bool got_goodbye;
 	struct aworker_ipc_link *link;
@@ -203,6 +204,8 @@ static void fw_ready_cb(struct aworker_ipc_link *link, const struct aworker_ipc_
 	};
 	struct msgb *rec;
 
+	if (fw.no_cs7)
+		return;
 	OSMO_ASSERT(aworker_ipc_enc_cs7_info(ctx, &rec, &info) == 0);
 	aworker_ipc_link_send(link, rec, NULL);
 }
@@ -320,6 +323,8 @@ static int fake_worker_main(int argc, char **argv)
 			fw.linger_ms = atoi(line + 7);
 		else if (!strcmp(line, "exit_config=1"))
 			fw.exit_config = true;
+		else if (!strcmp(line, "no_cs7=1"))
+			fw.no_cs7 = true;
 	}
 	fclose(f);
 	if (fw.exit_config)
@@ -1291,6 +1296,330 @@ static void test_p9_ownership_failed(char **argv)
 	printf("  worker 0 kept its process throughout, and osmo-bsc was never asked to shut down\n");
 }
 
+
+/***********************************************************************
+ * Restart backoff (P10-P12), with a fake clock
+ *
+ * In the osmo-bsc process of these tests, libosmocore's clocks are overridden: timers (osmo_gettimeofday()) and
+ * the pool's CLOCK_MONOTONIC (osmo_clock_gettime()) only move when the test moves them. Everything else -- the
+ * workers' fork/exec, IPC handshake, CS7_INFO and process exit -- happens in real time while the fake clock stands
+ * still, so a delay is checked to the millisecond: no start 1 ms before it, exactly one start at it.
+ ***********************************************************************/
+
+static void fake_clock_on(void)
+{
+	osmo_gettimeofday_override = true;
+	gettimeofday(&osmo_gettimeofday_override_time, NULL);
+	osmo_clock_override_enable(CLOCK_MONOTONIC, true);
+	clock_gettime(CLOCK_MONOTONIC, osmo_clock_override_gettimespec(CLOCK_MONOTONIC));
+}
+
+/* Before aworker_pool_stop(): its bounded waits measure real time. */
+static void fake_clock_off(void)
+{
+	osmo_gettimeofday_override = false;
+	osmo_clock_override_enable(CLOCK_MONOTONIC, false);
+}
+
+/* A few non-blocking event loop iterations: expired timers fire, pending I/O is handled. */
+static void pump(void)
+{
+	int i;
+	for (i = 0; i < 20; i++) {
+		if (!osmo_select_main_ctx(1))
+			usleep(500);
+	}
+}
+
+static void fake_advance_ms(unsigned long ms)
+{
+	osmo_gettimeofday_override_add(ms / 1000, (ms % 1000) * 1000);
+	osmo_clock_override_add(CLOCK_MONOTONIC, ms / 1000, (ms % 1000) * 1000000);
+	pump();
+}
+
+static bool is_zombie(pid_t pid)
+{
+	char path[64], buf[256], *p;
+	FILE *f;
+	bool z = false;
+
+	snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+	f = fopen(path, "r");
+	if (!f)
+		return false;
+	if (fgets(buf, sizeof(buf), f) && (p = strrchr(buf, ')')))
+		z = p[1] == ' ' && p[2] == 'Z';
+	fclose(f);
+	return z;
+}
+
+static bool w_restarting_or_failed(void *data)
+{
+	enum aworker_state st = winfo(*(unsigned int *)data).state;
+	return st == AWORKER_ST_RESTARTING || st == AWORKER_ST_FAILED;
+}
+
+static bool w_ready(void *data)
+{
+	return winfo(*(unsigned int *)data).state == AWORKER_ST_READY;
+}
+
+/* Crash worker i (SIGKILL) and let the pool handle it. The test first waits until the process is a zombie, so that
+ * the pool collects it at once, at the current fake time (no SIGTERM, no reap timer). \returns false if the pool
+ * did not decide on a restart (or FAILED) in time. */
+static bool crash(unsigned int i)
+{
+	pid_t pid = winfo(i).pid;
+	unsigned long end = now_ms() + 5000;
+
+	if (pid <= 0 || kill(pid, SIGKILL))
+		return false;
+	while (!is_zombie(pid) && now_ms() < end)
+		usleep(1000);
+	return run_until(w_restarting_or_failed, &i, 5000);
+}
+
+/* Worker i is RESTARTING with a delay of delay_s: no start up to 1 ms before it, exactly one start at it, and the
+ * new process becomes READY (in real time; the fake clock stands still meanwhile). */
+static bool restarts_after(unsigned int i, unsigned int delay_s)
+{
+	unsigned int forks0 = g_forks;
+
+	if (delay_s) {
+		fake_advance_ms(delay_s * 1000UL - 1);
+		if (g_forks != forks0 || winfo(i).state != AWORKER_ST_RESTARTING)
+			return false;
+		fake_advance_ms(1);
+	} else {
+		pump();
+	}
+	return g_forks == forks0 + 1 && run_until(w_ready, &i, 10000) && g_forks == forks0 + 1;
+}
+
+/* Start a two-worker pool on the fake clock; worker 1 is the one that crashes. \returns false unless both are READY. */
+static bool backoff_pool_start(char **argv, const char *extra1, unsigned int startup_timeout)
+{
+	const char *files[2];
+
+	files[0] = worker_cfg(0, 0, NULL);
+	files[1] = worker_cfg(1, 1, extra1);
+	pool_configure(2, files);
+	/* The approved defaults; pool_configure() sets the Phase 1 test values. */
+	aworker_pool_cfg()->restart_delay = AWORKER_RESTART_DELAY_DEFAULT;
+	aworker_pool_cfg()->restart_delay_max = AWORKER_RESTART_DELAY_MAX_DEFAULT;
+	aworker_pool_cfg()->stable_time = AWORKER_STABLE_TIME_DEFAULT;
+	aworker_pool_cfg()->startup_timeout = startup_timeout;
+	aworker_pool_set_exec(argv[0], 1, argv);
+	fake_clock_on();
+	return aworker_pool_start(ctx) == 0 && run_until(all_ready, NULL, 10000);
+}
+
+#define BACKOFF_MAX_STEPS 8
+
+struct backoff_result {
+	bool started;
+	unsigned int n;					/*!< losses */
+	unsigned int delay[BACKOFF_MAX_STEPS];		/*!< restart delay the pool chose after each loss */
+	unsigned int step[BACKOFF_MAX_STEPS];		/*!< backoff_step right after each loss */
+	bool on_time[BACKOFF_MAX_STEPS];		/*!< restarted exactly after that delay, then READY */
+	unsigned int step_when_stable;			/*!< P11: backoff_step reported while READY >= stable-time */
+	unsigned int step_before_stable;		/*!< P11: ... and 1 ms before */
+	bool w0_untouched;				/*!< worker 0 READY with its first process throughout */
+	bool no_shutdown;
+};
+
+/* Lose worker 1 after it was READY for up_ms (fake time), record the restart decision, and let it restart. */
+static void backoff_round(struct backoff_result *res, unsigned long up_ms)
+{
+	struct aworker_pool_worker_info i1;
+	unsigned int n = res->n;
+
+	if (n >= BACKOFF_MAX_STEPS)
+		return;
+	if (up_ms)
+		fake_advance_ms(up_ms);
+	if (!crash(1))
+		return;
+	i1 = winfo(1);
+	res->delay[n] = i1.restart_delay;
+	res->step[n] = i1.backoff_step;
+	res->n++;
+	if (i1.state == AWORKER_ST_RESTARTING)
+		res->on_time[n] = restarts_after(1, i1.restart_delay);
+}
+
+/* Run fn in a forked osmo-bsc process (on the fake clock) and return what it found. */
+static void backoff_run(char **argv, void (*fn)(char **argv, struct backoff_result *res), struct backoff_result *res)
+{
+	int pp[2], status;
+	pid_t bsc;
+
+	OSMO_ASSERT(pipe(pp) == 0);
+	bsc = fork();
+	OSMO_ASSERT(bsc >= 0);
+	if (bsc == 0) {
+		close(pp[0]);
+		memset(res, 0, sizeof(*res));
+		fn(argv, res);
+		/* starts == 1: the process it got at pool start is still the one */
+		res->w0_untouched = res->started && winfo(0).state == AWORKER_ST_READY && winfo(0).starts == 1
+				    && winfo(0).pid > 0;
+		res->no_shutdown = !osmo_select_shutdown_requested() && !aworker_pool_shutdown_was_fatal();
+		fake_clock_off();
+		aworker_pool_stop();
+		_exit(write(pp[1], res, sizeof(*res)) == sizeof(*res) ? 0 : 1);
+	}
+	close(pp[1]);
+	CHECK(read(pp[0], res, sizeof(*res)) == sizeof(*res));
+	close(pp[0]);
+	CHECK(collect(bsc, &status, 60000) == bsc);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(res->started);
+}
+
+static bool check_rounds(const struct backoff_result *res, const unsigned int *delays, unsigned int n)
+{
+	unsigned int i;
+	bool ok = res->n == n;
+
+	for (i = 0; i < n && i < res->n; i++) {
+		if (res->delay[i] != delays[i] || !res->on_time[i]) {
+			printf("  loss %u: restart delay %u s (expected %u s), restarted on time: %s\n", i + 1,
+			       res->delay[i], delays[i], res->on_time[i] ? "yes" : "no");
+			ok = false;
+		}
+	}
+	return ok;
+}
+
+/* P10: worker 1 is lost every time 59 s after it became READY -- 1 s short of stable-time, so the backoff never
+ * starts over. Losses are 59 s + delay apart, so at most 3 earlier restarts are ever within 300 s and the restart
+ * limit (2a-4b) is never reached: the delays double from restart-delay and stay at restart-delay-max. */
+static void p10_fn(char **argv, struct backoff_result *res)
+{
+	unsigned int i;
+
+	res->started = backoff_pool_start(argv, NULL, 600);	/* startup timer out of the way */
+	if (!res->started)
+		return;
+	backoff_round(res, 0);
+	for (i = 1; i < 6; i++)
+		backoff_round(res, 59000);
+}
+
+static void test_p10_backoff(char **argv)
+{
+	static const unsigned int delays[] = { 5, 10, 20, 40, 60, 60 };
+	static const unsigned int steps[] = { 1, 2, 3, 4, 5, 6 };
+	struct backoff_result res;
+	unsigned int i;
+	bool steps_ok = true;
+
+	printf("P10: a worker lost again and again is restarted with an exponential backoff, capped\n");
+	backoff_run(argv, p10_fn, &res);
+	CHECK(check_rounds(&res, delays, ARRAY_SIZE(delays)));
+	for (i = 0; i < ARRAY_SIZE(steps); i++)
+		steps_ok = steps_ok && res.step[i] == steps[i];
+	CHECK(steps_ok);
+	printf("  the first restart waits restart-delay (5 s), each further loss doubles it: 5, 10, 20, 40 s\n");
+	printf("  restart-delay-max (60 s) caps it: 60, 60 s; no start 1 ms before a delay, exactly one at it\n");
+	CHECK(res.w0_untouched);
+	CHECK(res.no_shutdown);
+	printf("  worker 0 kept its process and stayed READY, and osmo-bsc was never asked to shut down\n");
+}
+
+/* P11: READY for stable-time before the loss starts the backoff over; 1 ms less does not. */
+static void p11_fn(char **argv, struct backoff_result *res)
+{
+	res->started = backoff_pool_start(argv, NULL, 600);	/* startup timer out of the way */
+	if (!res->started)
+		return;
+	backoff_round(res, 0);			/* 5 s */
+	backoff_round(res, 59999);		/* READY 1 ms short of stable-time: 10 s */
+	fake_advance_ms(59999);
+	res->step_before_stable = winfo(1).backoff_step;
+	fake_advance_ms(1);
+	res->step_when_stable = winfo(1).backoff_step;
+	backoff_round(res, 0);			/* READY exactly stable-time: back to 5 s */
+	backoff_round(res, 0);			/* lost right away again: 10 s */
+}
+
+static void test_p11_stable_time(char **argv)
+{
+	static const unsigned int delays[] = { 5, 10, 5, 10 };
+	struct backoff_result res;
+
+	printf("P11: a worker that was READY for stable-time before it was lost starts the backoff over\n");
+	backoff_run(argv, p11_fn, &res);
+	CHECK(check_rounds(&res, delays, ARRAY_SIZE(delays)));
+	CHECK(res.step_before_stable == 2 && res.step_when_stable == 0);
+	printf("  READY 59.999 s, then lost: the delay still doubles (5 -> 10 s)\n");
+	printf("  READY 60 s (stable-time), then lost: back to restart-delay (5 s); lost again at once: 10 s\n");
+	printf("  the reported backoff step drops to 0 exactly when the worker has been READY for stable-time\n");
+	CHECK(res.w0_untouched);
+	CHECK(res.no_shutdown);
+}
+
+/* P12: a process that never becomes READY is not stable, however long it runs: the startup timeout that ends it is
+ * an unplanned loss like any other, and the backoff goes on. */
+static bool w1_starting(void *data)
+{
+	return winfo(1).state == AWORKER_ST_STARTING;
+}
+
+static void p12_fn(char **argv, struct backoff_result *res)
+{
+	struct aworker_pool_worker_info i1;
+	unsigned int forks0;
+	unsigned long end;
+
+	/* Fake time 0: the pool starts; its startup timer (one for the pool, see 2a-5) fires at 80 s. */
+	res->started = backoff_pool_start(argv, NULL, 80);
+	if (!res->started)
+		return;
+	backoff_round(res, 0);			/* lost at 0 s: 5 s; restarted at 5 s, READY */
+	worker_cfg(1, 1, "no_cs7=1\n");		/* its next process never reports its cs7 instances */
+	if (!crash(1))				/* lost at 5 s: 10 s */
+		return;
+	i1 = winfo(1);
+	res->delay[res->n] = i1.restart_delay;
+	res->step[res->n] = i1.backoff_step;
+	forks0 = g_forks;
+	fake_advance_ms(i1.restart_delay * 1000UL);	/* restarted at 15 s; STARTING from now on */
+	res->on_time[res->n] = g_forks == forks0 + 1 && run_until(w1_starting, NULL, 5000);
+	res->n++;
+
+	/* 80 s: STARTING for 65 s -- longer than stable-time -- when the startup timeout ends it. */
+	fake_advance_ms(65000);
+	end = now_ms() + 5000;
+	while (winfo(1).state != AWORKER_ST_RESTARTING && now_ms() < end)
+		fake_advance_ms(10);	/* the process is SIGTERMed and collected by the reap timer */
+	i1 = winfo(1);
+	if (i1.state != AWORKER_ST_RESTARTING)
+		return;
+	res->delay[res->n] = i1.restart_delay;
+	res->step[res->n] = i1.backoff_step;
+	worker_cfg(1, 1, NULL);
+	res->on_time[res->n] = restarts_after(1, i1.restart_delay);
+	res->n++;
+}
+
+static void test_p12_startup_not_stable(char **argv)
+{
+	static const unsigned int delays[] = { 5, 10, 20 };
+	struct backoff_result res;
+
+	printf("P12: time spent starting is not stable time: a startup timeout continues the backoff\n");
+	backoff_run(argv, p12_fn, &res);
+	CHECK(check_rounds(&res, delays, ARRAY_SIZE(delays)));
+	CHECK(res.n == 3 && res.step[2] == 3);
+	printf("  a process that never became READY ran 65 s (more than stable-time) until the startup timeout:\n");
+	printf("  that loss is the third in a row (5, 10, 20 s), not a fresh start\n");
+	CHECK(res.w0_untouched);
+	CHECK(res.no_shutdown);
+}
+
 /***********************************************************************
  * main
  ***********************************************************************/
@@ -1324,6 +1653,9 @@ int main(int argc, char **argv)
 	test_p7_no_restart_while_stopping(argv);
 	test_p8_failed_worker(argv);
 	test_p9_ownership_failed(argv);
+	test_p10_backoff(argv);
+	test_p11_stable_time(argv);
+	test_p12_startup_not_stable(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

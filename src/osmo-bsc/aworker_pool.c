@@ -91,6 +91,13 @@ struct aworker {
 	struct osmo_timer_list restart_timer;
 	unsigned int starts;			/*!< number of times this worker was started */
 
+	/* Restart backoff, see restart_delay_for(). All times are CLOCK_MONOTONIC (osmo_clock_gettime()). */
+	unsigned int backoff_step;		/*!< consecutive unplanned restarts since last stable or reset */
+	unsigned int restart_delay_s;		/*!< delay of the restart scheduled last */
+	bool ready_seen;			/*!< the current process reached READY ... */
+	struct timespec ready_since;		/*!< ... at this time */
+	bool stable_at_loss;			/*!< it was READY for at least stable-time when it was lost */
+
 	/* Taking the process down without blocking (AWORKER_ST_TERMINATING), see worker_begin_termination(). */
 	struct osmo_timer_list reap_timer;
 	struct timespec term_since;		/*!< when SIGTERM was sent */
@@ -150,6 +157,8 @@ static struct aworker_pool_cfg g_cfg = {
 	.num_workers = 0,
 	.startup_timeout = AWORKER_STARTUP_TIMEOUT_DEFAULT,
 	.restart_delay = AWORKER_RESTART_DELAY_DEFAULT,
+	.restart_delay_max = AWORKER_RESTART_DELAY_MAX_DEFAULT,
+	.stable_time = AWORKER_STABLE_TIME_DEFAULT,
 	.on_failure = AWORKER_FAILURE_RESTART,
 };
 
@@ -540,6 +549,63 @@ static void worker_fail(struct aworker *w, enum aworker_fail_reason reason, cons
 	     (long)w->last_pid, aworker_fail_reason_name(reason), w->fail_detail, w->idx);
 }
 
+/* Restart backoff: the delay before the restart after the step-th consecutive unplanned loss (step 0: the first).
+ * restart-delay * 2^step, but at most restart-delay-max -- and never less than restart-delay, so that a configured
+ * restart-delay above restart-delay-max keeps its meaning. A restart-delay of 0 stays 0. */
+static unsigned int restart_delay_for(const struct aworker_pool_cfg *cfg, unsigned int step)
+{
+	unsigned int cap = OSMO_MAX(cfg->restart_delay, cfg->restart_delay_max);
+	unsigned int d = cfg->restart_delay;
+
+	while (step-- && d && d < cap)
+		d *= 2;
+	return OSMO_MIN(d, cap);
+}
+
+/* Is the worker's current process stable: READY for at least stable-time? Time before READY never counts. */
+static bool worker_is_stable(const struct aworker *w)
+{
+	return w->state == AWORKER_ST_READY && w->ready_seen
+	       && ms_since(&w->ready_since) >= (unsigned long long)w->pool->cfg.stable_time * 1000;
+}
+
+/* The backoff step the next restart would use, were the worker lost now. */
+static unsigned int worker_next_step(const struct aworker *w)
+{
+	return worker_is_stable(w) ? 0 : w->backoff_step;
+}
+
+/* An unplanned loss with 'on-worker-failure restart': schedule the restart, backing off. */
+static void worker_schedule_restart(struct aworker *w)
+{
+	struct aworker_pool *pool = w->pool;
+
+	if (w->stable_at_loss && w->backoff_step) {
+		LOGP(DAWORKER, LOGL_NOTICE, "aworker %u: it was READY for at least stable-time (%u s) before it was"
+		     " lost: the restart delay starts over at restart-delay\n", w->idx, pool->cfg.stable_time);
+		w->backoff_step = 0;
+	}
+	w->stable_at_loss = false;
+	w->restart_delay_s = restart_delay_for(&pool->cfg, w->backoff_step);
+	if (w->backoff_step < 32)
+		w->backoff_step++;
+	LOGP(DAWORKER, LOGL_ERROR, "aworker %u (pid %ld): worker lost (%s); restarting in %u s (unplanned restart"
+	     " %u in a row)\n", w->idx, (long)w->last_pid, w->lost_reason, w->restart_delay_s, w->backoff_step);
+	w->state = AWORKER_ST_RESTARTING;
+	osmo_timer_schedule(&w->restart_timer, w->restart_delay_s, 0);
+}
+
+/* A start that failed before there was a process (socketpair(), fork()): try again after the current delay. This
+ * is no loss of a running worker, so the backoff does not advance; at least 1 s, so that it is never a busy loop. */
+static void worker_retry_start(struct aworker *w)
+{
+	unsigned int delay = OSMO_MAX(w->restart_delay_s, 1);
+
+	LOGW(w, LOGL_ERROR, "start failed, retrying in %u s\n", delay);
+	w->state = AWORKER_ST_RESTARTING;
+	osmo_timer_schedule(&w->restart_timer, delay, 0);
+}
+
 /* What happens to a lost worker once its process is collected (or if there never was one): the failure policy. */
 static void worker_apply_policy(struct aworker *w, bool config_error)
 {
@@ -585,10 +651,7 @@ static void worker_apply_policy(struct aworker *w, bool config_error)
 			worker_fail(w, fail, detail);
 			return;
 		}
-		LOGP(DAWORKER, LOGL_ERROR, "aworker %u (pid %ld): worker lost (%s); restarting in %u s\n",
-		     w->idx, pid, why, pool->cfg.restart_delay);
-		w->state = AWORKER_ST_RESTARTING;
-		osmo_timer_schedule(&w->restart_timer, pool->cfg.restart_delay, 0);
+		worker_schedule_restart(w);
 		return;
 	}
 }
@@ -706,11 +769,8 @@ static void restart_timer_cb(void *data)
 		return;
 	}
 	LOGW(w, LOGL_NOTICE, "restarting worker (start #%u)\n", w->starts + 1);
-	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING) {
-		LOGW(w, LOGL_ERROR, "restart failed, retrying in %u s\n", w->pool->cfg.restart_delay);
-		w->state = AWORKER_ST_RESTARTING;
-		osmo_timer_schedule(&w->restart_timer, w->pool->cfg.restart_delay, 0);
-	}
+	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING)
+		worker_retry_start(w);
 }
 
 /* The worker is gone: drop its link and tell the users right away (that is what confines the failure to this
@@ -722,6 +782,8 @@ static void worker_lost(struct aworker *w, const char *why)
 	if (w->state == AWORKER_ST_TERMINATING)
 		return;
 
+	/* Stability ends with the loss, not with the collection of the process. */
+	w->stable_at_loss = worker_is_stable(w);
 	if (w->link) {
 		aworker_ipc_link_free(w->link);
 		w->link = NULL;
@@ -845,6 +907,8 @@ static void handle_cs7_info(struct aworker *w, const struct aworker_ipc_msg *m)
 	w->cs7 = m->u.cs7_info;
 	w->cs7_reported = true;
 	w->state = AWORKER_ST_READY;
+	w->ready_seen = true;
+	osmo_clock_gettime(CLOCK_MONOTONIC, &w->ready_since);
 
 	for (i = 0; i < w->cs7.count; i++) {
 		const struct aworker_ipc_cs7_entry *e = &w->cs7.e[i];
@@ -1259,6 +1323,9 @@ static int worker_spawn(struct aworker *w)
 		LOGW(w, LOGL_ERROR, "refusing to start a new process: the previous one is not collected yet\n");
 		return -EBUSY;
 	}
+	/* A new process has to earn its stability from READY on. */
+	w->ready_seen = false;
+	w->stable_at_loss = false;
 
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sp) < 0) {
 		rc = -errno;
@@ -1434,9 +1501,10 @@ int aworker_pool_start(void *ctx)
 	}
 
 	LOGP(DAWORKER, LOGL_NOTICE, "A-worker pool started: %u worker(s), on-worker-failure %s,"
-	     " startup-timeout %u s, restart-delay %u s\n", pool->num,
+	     " startup-timeout %u s, restart-delay %u s (max %u s), stable-time %u s\n", pool->num,
 	     get_value_string(aworker_failure_policy_names, pool->cfg.on_failure), pool->cfg.startup_timeout,
-	     pool->cfg.restart_delay);
+	     pool->cfg.restart_delay, OSMO_MAX(pool->cfg.restart_delay, pool->cfg.restart_delay_max),
+	     pool->cfg.stable_time);
 	osmo_timer_schedule(&pool->startup_timer, pool->cfg.startup_timeout, 0);
 	return 0;
 }
@@ -1679,6 +1747,8 @@ int aworker_pool_worker_info(unsigned int idx, struct aworker_pool_worker_info *
 		.fail_reason = w->fail_reason,
 		.fail_detail = w->fail_detail,
 		.failed_at = w->failed_at,
+		.backoff_step = worker_next_step(w),
+		.restart_delay = w->restart_delay_s,
 	};
 	return 0;
 }
@@ -1702,14 +1772,14 @@ int aworker_pool_reset_worker(unsigned int idx)
 	w->fail_reason = AWORKER_FAIL_NONE;
 	w->fail_detail[0] = '\0';
 	w->failed_at = 0;
+	/* A fresh start: no backoff carried over from before the failure. */
+	w->backoff_step = 0;
+	w->restart_delay_s = g_pool->cfg.restart_delay;
 	w->state = AWORKER_ST_STOPPED;
 	if (g_pool->no_fork)
 		return 0;	/* no process of our own to start */
-	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING) {
-		LOGW(w, LOGL_ERROR, "start failed, retrying in %u s\n", g_pool->cfg.restart_delay);
-		w->state = AWORKER_ST_RESTARTING;
-		osmo_timer_schedule(&w->restart_timer, g_pool->cfg.restart_delay, 0);
-	}
+	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING)
+		worker_retry_start(w);
 	return 0;
 }
 
@@ -2028,9 +2098,10 @@ void aworker_pool_dump_vty(struct vty *vty)
 	}
 
 	vty_out(vty, "A-worker pool: %u worker(s), on-worker-failure %s, startup-timeout %u s,"
-		" restart-delay %u s%s", g_pool->num,
+		" restart-delay %u s (max %u s), stable-time %u s%s", g_pool->num,
 		get_value_string(aworker_failure_policy_names, g_pool->cfg.on_failure), g_pool->cfg.startup_timeout,
-		g_pool->cfg.restart_delay, VTY_NEWLINE);
+		g_pool->cfg.restart_delay, OSMO_MAX(g_pool->cfg.restart_delay, g_pool->cfg.restart_delay_max),
+		g_pool->cfg.stable_time, VTY_NEWLINE);
 
 	for (i = 0; i < g_pool->num; i++) {
 		struct aworker *w = g_pool->worker[i];
@@ -2048,6 +2119,14 @@ void aworker_pool_dump_vty(struct vty *vty)
 			vty_out(vty, "  not restarted; 'a-worker-pool reset worker %u' starts it again%s", w->idx,
 				VTY_NEWLINE);
 		}
+		if (w->state == AWORKER_ST_RESTARTING)
+			vty_out(vty, "  restarting after %u s (unplanned restart %u in a row)%s", w->restart_delay_s,
+				w->backoff_step, VTY_NEWLINE);
+		else if (worker_next_step(w))
+			vty_out(vty, "  unplanned restarts in a row: %u; if lost now, restarted after %u s"
+				" (back to %u s once READY for %u s)%s", w->backoff_step,
+				restart_delay_for(&g_pool->cfg, w->backoff_step), g_pool->cfg.restart_delay,
+				g_pool->cfg.stable_time, VTY_NEWLINE);
 		if (w->state == AWORKER_ST_TERMINATING)
 			vty_out(vty, "  terminating: %s%s",
 				w->reap_stuck ? "SIGKILL sent, process still not collected (stuck in the kernel?)"

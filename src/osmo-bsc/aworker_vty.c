@@ -122,11 +122,35 @@ DEFUN_ATTR(cfg_aworker_startup_timeout, cfg_aworker_startup_timeout_cmd,
 
 DEFUN_ATTR(cfg_aworker_restart_delay, cfg_aworker_restart_delay_cmd,
 	   "restart-delay <0-600>",
-	   "How long to wait before restarting a worker that died ('on-worker-failure restart')\n"
+	   "How long to wait before restarting a worker after its first unplanned loss ('on-worker-failure"
+	   " restart'); every further loss in a row doubles the delay, up to 'restart-delay-max'\n"
 	   "Delay in seconds\n",
 	   CMD_ATTR_IMMEDIATE)
 {
 	aworker_pool_cfg()->restart_delay = atoi(argv[0]);
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
+DEFUN_ATTR(cfg_aworker_restart_delay_max, cfg_aworker_restart_delay_max_cmd,
+	   "restart-delay-max <1-3600>",
+	   "Longest restart delay the exponential backoff reaches (never less than 'restart-delay')\n"
+	   "Delay in seconds\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	aworker_pool_cfg()->restart_delay_max = atoi(argv[0]);
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
+DEFUN_ATTR(cfg_aworker_stable_time, cfg_aworker_stable_time_cmd,
+	   "stable-time <1-3600>",
+	   "How long a worker must have been READY before it was lost for its restart delay to start over at"
+	   " 'restart-delay'\n"
+	   "Time in seconds\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	aworker_pool_cfg()->stable_time = atoi(argv[0]);
 	AWORKER_RESTART_NOTE(vty);
 	return CMD_SUCCESS;
 }
@@ -136,7 +160,7 @@ DEFUN_ATTR(cfg_aworker_on_failure, cfg_aworker_on_failure_cmd,
 	   "What to do when a worker process dies or its IPC link breaks. In both cases every SCCP connection of"
 	   " the worker's cs7 instances is terminated and the BSSMAP RESET procedure is restarted; no SCCP"
 	   " operation is ever replayed.\n"
-	   "Restart the worker after 'restart-delay' seconds (the default)\n"
+	   "Restart the worker after its restart delay (the default; see 'restart-delay')\n"
 	   "Terminate osmo-bsc\n",
 	   CMD_ATTR_IMMEDIATE)
 {
@@ -153,6 +177,8 @@ static int config_write_aworker_pool(struct vty *vty)
 	bool any = cfg->num_workers != 0
 		   || cfg->startup_timeout != AWORKER_STARTUP_TIMEOUT_DEFAULT
 		   || cfg->restart_delay != AWORKER_RESTART_DELAY_DEFAULT
+		   || cfg->restart_delay_max != AWORKER_RESTART_DELAY_MAX_DEFAULT
+		   || cfg->stable_time != AWORKER_STABLE_TIME_DEFAULT
 		   || cfg->on_failure != AWORKER_FAILURE_RESTART;
 
 	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
@@ -172,6 +198,10 @@ static int config_write_aworker_pool(struct vty *vty)
 		vty_out(vty, " startup-timeout %u%s", cfg->startup_timeout, VTY_NEWLINE);
 	if (cfg->restart_delay != AWORKER_RESTART_DELAY_DEFAULT)
 		vty_out(vty, " restart-delay %u%s", cfg->restart_delay, VTY_NEWLINE);
+	if (cfg->restart_delay_max != AWORKER_RESTART_DELAY_MAX_DEFAULT)
+		vty_out(vty, " restart-delay-max %u%s", cfg->restart_delay_max, VTY_NEWLINE);
+	if (cfg->stable_time != AWORKER_STABLE_TIME_DEFAULT)
+		vty_out(vty, " stable-time %u%s", cfg->stable_time, VTY_NEWLINE);
 	if (cfg->on_failure != AWORKER_FAILURE_RESTART)
 		vty_out(vty, " on-worker-failure %s%s",
 			get_value_string(aworker_failure_policy_names, cfg->on_failure), VTY_NEWLINE);
@@ -224,5 +254,7 @@ void aworker_pool_vty_init(void)
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_no_cfg_file_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_startup_timeout_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_restart_delay_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_restart_delay_max_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_stable_time_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_on_failure_cmd);
 }

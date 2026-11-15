@@ -46,8 +46,12 @@
  * the link or the worker dies after the record was queued) tears the affected SCCP connection down locally
  * instead. When a worker is lost, every SCCP connection of its cs7 instances is terminated and the BSSMAP RESET
  * FSM of every MSC on them is put back into DISC state, so that the MSC relationship is rebuilt from scratch.
- * 'on-worker-failure restart' then restarts the worker after 'restart-delay' seconds; 'shutdown' terminates
- * osmo-bsc.
+ * 'on-worker-failure restart' then restarts the worker after a delay; 'shutdown' terminates osmo-bsc.
+ *
+ * The restart delay backs off exponentially per worker: 'restart-delay' after the first unplanned loss, then twice
+ * the previous delay after every further one, never more than 'restart-delay-max' (but never less than
+ * 'restart-delay'). A worker that was READY for at least 'stable-time' before it was lost starts over at
+ * 'restart-delay'. Time a worker spends starting (not yet READY) never counts as stable.
  */
 
 #include <stdbool.h>
@@ -66,6 +70,8 @@ struct aworker;
 #define AWORKER_POOL_MAX_WORKERS	16
 #define AWORKER_STARTUP_TIMEOUT_DEFAULT	20
 #define AWORKER_RESTART_DELAY_DEFAULT	5
+#define AWORKER_RESTART_DELAY_MAX_DEFAULT	60
+#define AWORKER_STABLE_TIME_DEFAULT	60
 
 /* Taking a worker down never blocks the main process: SIGTERM, then waitpid(WNOHANG) from a timer, SIGKILL after
  * the grace period, and polling again until the process is collected. A worker whose process has not been collected
@@ -89,7 +95,7 @@ enum aworker_state {
 	AWORKER_ST_STOPPED,	/*!< not running (before the first start, or after a fatal failure) */
 	AWORKER_ST_STARTING,	/*!< process started, IPC handshake and/or CS7_INFO still pending */
 	AWORKER_ST_READY,	/*!< handshake done and cs7 instances reported */
-	AWORKER_ST_RESTARTING,	/*!< waiting for 'restart-delay' before the next start */
+	AWORKER_ST_RESTARTING,	/*!< waiting for its restart delay (see FAILURE POLICY) before the next start */
 	AWORKER_ST_TERMINATING,	/*!< lost: the process was signalled and has not been collected yet. A worker never
 				 *   leaves this state before waitpid() returned its status, so that two generations of
 				 *   one worker can never run at the same time. */
@@ -120,6 +126,9 @@ struct aworker_pool_worker_info {
 	const char *fail_detail;	/*!< FAILED: what happened, for the operator ("" otherwise; valid until the pool
 					 *   stops) */
 	time_t failed_at;		/*!< FAILED: when (wall clock); 0 otherwise */
+	unsigned int backoff_step;	/*!< consecutive unplanned restarts since the worker was last stable (or reset):
+					 *   the next restart waits restart-delay * 2^backoff_step, capped */
+	unsigned int restart_delay;	/*!< seconds: delay of the restart scheduled last (0 if none so far) */
 };
 
 struct aworker_pool_cfg {
@@ -129,7 +138,9 @@ struct aworker_pool_cfg {
 	/*! Config file of each worker; cfg_file[i] must be set for every i < num_workers. */
 	char *cfg_file[AWORKER_POOL_MAX_WORKERS];
 	unsigned int startup_timeout;	/*!< seconds to wait for all workers to become ready */
-	unsigned int restart_delay;	/*!< seconds between a worker's death and its restart */
+	unsigned int restart_delay;	/*!< seconds: restart delay after the first unplanned loss (the backoff base) */
+	unsigned int restart_delay_max;	/*!< seconds: the backoff never waits longer (but never less than restart_delay) */
+	unsigned int stable_time;	/*!< seconds READY before a loss after which the backoff starts over */
 	enum aworker_failure_policy on_failure;
 };
 

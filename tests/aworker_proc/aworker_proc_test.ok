@@ -35,4 +35,15 @@ P9: a worker claiming a cs7 instance its file did not configure at start is FAIL
   it stays FAILED past restart-delay and startup-timeout: no process started
   once it reports what its file configured, a reset starts it once and it becomes READY
   worker 0 kept its process throughout, and osmo-bsc was never asked to shut down
+P10: a worker lost again and again is restarted with an exponential backoff, capped
+  the first restart waits restart-delay (5 s), each further loss doubles it: 5, 10, 20, 40 s
+  restart-delay-max (60 s) caps it: 60, 60 s; no start 1 ms before a delay, exactly one at it
+  worker 0 kept its process and stayed READY, and osmo-bsc was never asked to shut down
+P11: a worker that was READY for stable-time before it was lost starts the backoff over
+  READY 59.999 s, then lost: the delay still doubles (5 -> 10 s)
+  READY 60 s (stable-time), then lost: back to restart-delay (5 s); lost again at once: 10 s
+  the reported backoff step drops to 0 exactly when the worker has been READY for stable-time
+P12: time spent starting is not stable time: a startup timeout continues the backoff
+  a process that never became READY ran 65 s (more than stable-time) until the startup timeout:
+  that loss is the third in a row (5, 10, 20 s), not a fresh start
 PASSED

@@ -365,3 +365,86 @@ Mutation results:
 Real osmo-bsc, 12/12 scripted checks: worker 1's file was changed at runtime and the worker SIGKILLed. Its
 replacement went FAILED (ownership), worker 0's pid stayed the same, and restoring the file plus a reset gave READY.
 T1–T10 and P1–P8 unchanged. Normal and ASan/UBSan 14/14, no new warnings, E2E 46/46.
+
+### Restart policy semantics, approved before 2a-4 (2026-11-15)
+
+* **Restart limit:** §11.2 is applied literally (decision recorded before coding, because the 2a-4 brief's
+  "maximum 5 restarts" could be read the conventional way). The time of each unplanned restart is recorded per
+  worker (CLOCK_MONOTONIC, when the lost process is collected and the restart is decided). A recorded restart
+  counts while it is less than `window` seconds old. An unplanned loss that would be restart N within the window
+  of the oldest restart still recorded makes the worker FAILED (`restart-limit`). So at most N-1 restarts happen,
+  4 in 300 s with the defaults. Config and ownership failures are FAILED directly. Planned stops (and later
+  drains) never count.
+* **Stable time** resets only the backoff exponent, as §3 says. The restart record expires by age only. An
+  operator reset clears both.
+* **`protocol-timeout` (60 s)** belongs to 2b (PROTOCOL_CONNECTING) and is not part of 2a-4. The startup timeout
+  stays separate from both the stable time and the restart window.
+
+### 2a-4a — exponential restart backoff: committed eef2bac51
+
+`delay = restart-delay · 2^n`, capped at `restart-delay-max` but never less than `restart-delay`.
+* n counts the worker's consecutive unplanned restarts.
+* n resets when the worker was READY for at least `stable-time` before it was lost, measured from READY to the
+  loss on CLOCK_MONOTONIC. Time spent STARTING never counts, so a startup timeout continues the backoff.
+* A start that fails before any process exists (socketpair()/fork()) retries after the current delay, at least
+  1 s, without advancing n.
+* New commands: `restart-delay-max` (60) and `stable-time` (60). `restart-delay` (5) keeps its meaning as the
+  first delay.
+* Status: the start log, `show a-worker-pool` and `aworker_pool_worker_info()` (`backoff_step`, `restart_delay`).
+
+Tests: `aworker_proc` P10–P12. In the osmo-bsc process of these tests the libosmocore clocks are overridden
+(`osmo_gettimeofday_override`, `osmo_clock_override_*`), so timers and CLOCK_MONOTONIC only move when the test moves
+them. Every delay is checked to the millisecond: no start 1 ms before it, exactly one at it.
+* P10, defaults: 5, 10, 20, 40, 60, 60 s.
+* P11, stable time: READY 59.999 s → 10 s; READY 60 s → back to 5 s.
+* P12: a never-READY process that runs 65 s until the startup timeout continues the backoff (5, 10, 20 s).
+
+Nine mutations each fail P10, P11 and/or P12. Real osmo-bsc: 12/12 scripted checks (2, 4, 8 s, shown in
+`show a-worker-pool`; worker 0's pid unchanged). Normal and ASan/UBSan 14/14, E2E 46/46.
+
+### 2a-4b — restart limit: committed ef8b53898
+
+`max-restarts <1-32> window <1-86400>` (5, 300) with the semantics above, leading to FAILED (`restart-limit`).
+* The detail names the restarts, the age of the oldest, the limit and the last loss reason.
+* Status: the limit and its meaning in the header ("a loss that would be restart 5 within 300 s makes a worker
+  FAILED (at most 4 restarts)"), restarts in the window per worker, and `restarts_in_window` in the info.
+* The backoff line is no longer printed for a FAILED worker.
+
+Tests:
+* P13, defaults: restarts after 5, 10, 20, 40 s, then FAILED at the loss that would be restart 5. Nothing starts
+  in the 200 s after, while the startup timer fires. A reset with all 4 restarts still in the window starts it
+  once, and the next loss waits 5 s.
+* P14, `max-restarts 2 window 300`, two workers restarted at 0 s: a loss at 299.999 s makes one FAILED, a loss at
+  300 s restarts the other, and the status stops counting the old restart at 300 s.
+* P15, `max-restarts 1`: a loss while running is FAILED, while the same loss handled inside `aworker_pool_stop()`
+  counts nothing.
+
+Mutations: ten, each failing P13, P14 and/or P15, one of them also P10. L10 (status counts expired restarts)
+survived the first run, so P14 gained the 300 s status check, which now catches it. Real osmo-bsc,
+`max-restarts 3 window 120`: 13/13 scripted checks (FAILED on the 3rd loss, VTY reset to READY, worker 0's pid
+unchanged). Normal and ASan/UBSan 14/14.
+
+E2E: the first run on ef8b53898 failed one check, "[kill-2] BSC descriptor count unchanged (16, now 15)". The
+extra descriptor was in the *baseline*, not afterwards. The baseline is taken right after `pool()` closes a VTY
+connection, and osmo-bsc releases its end only when its event loop handles the EOF. A standalone measurement saw
+that end still open right after close() in 184 of 200 tries. This is a race in the harness, not in the code, and
+it was present since run 1. The harness now waits for the baseline to settle, as it already did for the count
+afterwards, so the check is unchanged. After the fix: two runs, 46/46 each.
+
+### Documentation and tooling
+
+* The user manual chapter (`doc/manuals/chapters/aworker-pool.adoc`) was behind the code. It still said that a
+  worker that cannot use its configuration shuts OsmoBSC down, which has been wrong since 2a-3a. It now
+  describes the start-time ownership checks (2a-2), FAILED with its reasons and the reset (2a-3), and the restart
+  backoff and limit (2a-4), and its `show a-worker-pool` example matches the current output. The manual build
+  was not run (no asciidoc toolchain in this environment).
+* The mutation driver now lives next to the E2E harness: `~/dev/osmo-bsc-a-worker-pool-e2e/mutate.py`.
+
+### Open points after 2a-4
+
+* Drain (2d) does not exist yet. That drains never count is a design rule, not yet tested.
+* The startup timeout is still one pool-level timer, armed at pool start (per start: 2a-5).
+* The retry after a start failure without a process (fork() failing) has no test.
+* `restart-delay 0` stays 0 (compatible). Such a worker can therefore restart N-1 times without delay before the
+  limit makes it FAILED.
+* The worker-level `point-code` failure reason (§2) is still not implemented.

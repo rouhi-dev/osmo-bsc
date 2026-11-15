@@ -49,6 +49,18 @@ style rule: reading such a node is what creates the ASP and opens its SCTP assoc
 process would hold a transport that belongs to a worker. The check runs before the file is parsed, so
 no association is ever opened.
 
+Before it starts any worker, OsmoBSC also reads every worker configuration file the way the worker will:
+a worker owns exactly the `cs7` instances its file configures with an `asp`, `as` or `listen` node.
+OsmoBSC refuses to start, and logs which files, lines, instances and MSCs are at fault, if
+
+* two worker configuration files configure the same `cs7` instance, or
+* an `msc` uses a `cs7` instance that no worker configuration file configures (an `msc` without an
+  explicit instance uses instance 0). If a worker configuration file cannot be read, this is only
+  logged: the instance may be in that file, and the unreadable file is that worker's own failure.
+
+While OsmoBSC runs, each worker must report exactly the `cs7` instances its file configured at start;
+see <<aworker_failed>>.
+
 .Main configuration file, `/etc/osmocom/osmo-bsc.cfg`
 ----
 cs7 instance 0
@@ -106,27 +118,53 @@ running SIGTRAN stack cannot be moved.
   whose `cs7` instance no worker claimed. The default is 20.
 
 `on-worker-failure (restart|shutdown)`::
-  What to do when a worker dies or its IPC link breaks: restart it after `restart-delay` seconds (the
-  default), or terminate OsmoBSC. In both cases the SCCP connections of that worker are dropped first,
-  see <<aworker_failure>>.
+  What to do when a worker dies or its IPC link breaks: restart it after its restart delay (the
+  default, see <<aworker_restart>>), or terminate OsmoBSC. In both cases the SCCP connections of that
+  worker are dropped first, see <<aworker_failure>>. With `shutdown`, any worker failure terminates
+  OsmoBSC, including the ones that would otherwise leave only that worker FAILED.
 
 `restart-delay <0-600>`::
-  Seconds between the loss of a worker and its restart. The default is 5.
+  Seconds between the first unplanned loss of a worker and its restart; every further loss in a row
+  doubles the delay, see <<aworker_restart>>. The default is 5.
+
+`restart-delay-max <1-3600>`::
+  The longest restart delay the doubling reaches. A `restart-delay` above it is used as it is. The
+  default is 60.
+
+`stable-time <1-3600>`::
+  A worker that was ready for at least this many seconds before it was lost is restarted after
+  `restart-delay` again. The default is 60.
+
+`max-restarts <1-32> window <1-86400>`::
+  An unplanned loss that would be restart N within the window makes the worker FAILED instead, so at
+  most N-1 restarts happen within any window, see <<aworker_restart>>. `max-restarts 1` disables
+  automatic restarts. The default is `max-restarts 5 window 300`: at most 4 restarts within 300 s.
 
 ==== Operation
 
-`show a-worker-pool` reports the configuration, the state, process id, restart count and configuration
+`show a-worker-pool` reports the configuration, the state, process id, start count and configuration
 file of every worker, the `cs7` instances each worker reported, the IPC link counters, and for every
-SCCP user whether it is bound in its worker.
+SCCP user whether it is bound in its worker. For a worker that was restarted it also shows the
+pending restart delay or the delay the next loss would cause, and the restarts within the
+`max-restarts` window. For a FAILED worker it shows the reason, the time and what happened.
 
 ----
 OsmoBSC# show a-worker-pool
-A-worker pool: 1 worker(s), on-worker-failure restart, startup-timeout 20 s, restart-delay 5 s
+A-worker pool: 2 worker(s), on-worker-failure restart, startup-timeout 20 s, restart-delay 5 s (max 60 s), stable-time 60 s
+ max-restarts 5 window 300 s: a loss that would be restart 5 within 300 s makes a worker FAILED (at most 4 restarts)
  worker 0: state READY, pid 2048, starts 1, config file /etc/osmocom/osmo-bsc-aworker0.cfg
   cs7 instance 0: point-code 187, m3ua, 1 AS(s)
   IPC link: ready, rx 6 records, tx 4 queued / 4 written, last seq queued 4 / written 4
+ worker 1: state READY, pid 2077, starts 3, config file /etc/osmocom/osmo-bsc-aworker1.cfg
+  unplanned restarts in a row: 2; if lost now, restarted after 20 s (back to 5 s once READY for 60 s)
+  unplanned restarts within the last 300 s: 2 (restart 5 would make it FAILED)
+  cs7 instance 1: point-code 188, m3ua, 1 AS(s)
+  IPC link: ready, rx 6 records, tx 4 queued / 4 written, last seq queued 4 / written 4
  SCCP user 'msc-0': cs7 instance 0, SSN 254, bound
+ SCCP user 'msc-1': cs7 instance 1, SSN 254, bound
 ----
+
+`a-worker-pool reset worker <0-15>` (enable node) starts a FAILED worker again, see <<aworker_failed>>.
 
 The ASP and SCCP state of the A interface is no longer visible in the main process: `show cs7 instance
 0 asp` in OsmoBSC shows nothing, because the ASP lives in the worker. The worker has no VTY of its own,
@@ -159,9 +197,46 @@ those MSCs are flushed. With `on-worker-failure restart` the worker is then rest
 users again, and the MSC relationship is rebuilt with a fresh BSSMAP RESET. Lchans and MGW endpoints of
 the released subscriber connections are cleaned up by the ordinary connection teardown.
 
-A worker that cannot start with its configuration at all (for example a `cs7` instance OsmoBSC cannot
-use, see <<aworker_limits>>) is not restarted in a loop: OsmoBSC logs the reason and shuts down with a
-failure exit code, whatever `on-worker-failure` says.
+[[aworker_restart]]
+==== Restart delay and restart limit
+
+With `on-worker-failure restart`, each worker is restarted on its own schedule; no other worker is
+affected:
+
+* *Backoff.* The restart after the first unplanned loss waits `restart-delay` seconds. Each further loss
+  in a row doubles the delay, up to `restart-delay-max`. With the defaults: 5, 10, 20, 40, 60, 60, ...
+  seconds. A worker that was ready for at least `stable-time` before it was lost starts over at
+  `restart-delay`. Time spent starting (before the worker reported its `cs7` instances) never counts
+  as stable, so a worker that times out at startup keeps backing off.
+* *Limit.* Each worker records the time of each of its unplanned restarts, taken when the lost process
+  is collected. A restart counts while it is less than `window` seconds old. An unplanned loss that
+  would be restart N (`max-restarts N`) within the window makes the worker FAILED with the reason
+  `restart-limit` instead. With the defaults, a worker lost a fifth time within 300 s of the first
+  recorded restart is FAILED after 4 restarts. A stable period resets the backoff but not this record.
+* Only unplanned losses count. A worker stopped because OsmoBSC shuts down is never counted. A
+  worker that cannot use its configuration, or reports the wrong `cs7` instances, is FAILED at once
+  (see <<aworker_failed>>). A start that fails before any process exists (`fork()` failing) is
+  retried after the current delay, at least 1 s, without counting.
+
+[[aworker_failed]]
+==== FAILED workers
+
+Some failures cannot be fixed by restarting. With `on-worker-failure restart` such a worker enters the
+state FAILED and is not restarted until an operator resets it. OsmoBSC and the other workers carry
+on; the SCCP users of the FAILED worker's `cs7` instances stay unavailable. The reasons are:
+
+`config`:: The worker exits with status 66: it cannot use its configuration file (also used when the
+  worker program cannot be executed). The worker's own log says why.
+`ownership`:: The worker reports a set of `cs7` instances other than the one its configuration file had
+  when OsmoBSC started, for example because the file was edited since. Restarting would read the same
+  file again.
+`restart-limit`:: The worker was lost too often, see <<aworker_restart>>.
+
+`show a-worker-pool` shows the reason, the time and what happened. After fixing the cause, `a-worker-pool
+reset worker N` forgets the failure, the backoff and the restart record, and starts only that worker. A
+worker that is not FAILED cannot be reset. Configuration files are read at OsmoBSC start; a fixed file
+takes effect for the worker at its next start, but ownership is still checked against the files as they
+were at OsmoBSC start.
 
 The IPC link itself fails closed. A malformed, truncated, oversized or out-of-sequence record, a
 partial send, a full transmit queue or an allocation failure closes the link rather than guessing, so a

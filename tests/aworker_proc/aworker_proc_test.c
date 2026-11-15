@@ -187,6 +187,8 @@ static struct {
 	unsigned int linger_ms;		/*!< on GOODBYE, exit only after this long (a worker shutting down) */
 	bool exit_config;		/*!< behave like a worker that cannot use its config file */
 	bool no_cs7;			/*!< never send CS7_INFO: the worker never becomes READY */
+	bool cs7_on_usr2;		/*!< send CS7_INFO only once SIGUSR2 arrives: READY when the test says so */
+	volatile sig_atomic_t usr2;
 	struct osmo_timer_list exit_timer;
 	bool got_goodbye;
 	struct aworker_ipc_link *link;
@@ -196,7 +198,7 @@ static struct {
 	struct osmo_timer_list timer;
 } fw;
 
-static void fw_ready_cb(struct aworker_ipc_link *link, const struct aworker_ipc_hello *peer)
+static void fw_send_cs7(struct aworker_ipc_link *link)
 {
 	struct aworker_ipc_cs7_info info = {
 		.count = 1,
@@ -204,10 +206,15 @@ static void fw_ready_cb(struct aworker_ipc_link *link, const struct aworker_ipc_
 	};
 	struct msgb *rec;
 
-	if (fw.no_cs7)
-		return;
 	OSMO_ASSERT(aworker_ipc_enc_cs7_info(ctx, &rec, &info) == 0);
 	aworker_ipc_link_send(link, rec, NULL);
+}
+
+static void fw_ready_cb(struct aworker_ipc_link *link, const struct aworker_ipc_hello *peer)
+{
+	if (fw.no_cs7 || fw.cs7_on_usr2)
+		return;
+	fw_send_cs7(link);
 }
 
 static void fw_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m)
@@ -257,6 +264,11 @@ static void fw_sigusr1(int sig)
 	fw.sever = 1;
 }
 
+static void fw_sigusr2(int sig)
+{
+	fw.usr2 = 1;
+}
+
 /* Every 10 ms: count a heartbeat (proof that this worker's event loop runs) and act on SIGUSR1: drop the IPC link
  * but keep running -- a worker that is broken but alive, which the main process has to take down. */
 static void fw_timer_cb(void *data)
@@ -270,6 +282,10 @@ static void fw_timer_cb(void *data)
 	if (fw.sever && fw.link) {
 		aworker_ipc_link_free(fw.link);	/* closes the socket; no closed_cb */
 		fw.link = NULL;
+	}
+	if (fw.usr2 == 1 && fw.link) {
+		fw.usr2 = 2;
+		fw_send_cs7(fw.link);
 	}
 	osmo_timer_schedule(&fw.timer, 0, 10000);
 }
@@ -325,6 +341,8 @@ static int fake_worker_main(int argc, char **argv)
 			fw.exit_config = true;
 		else if (!strcmp(line, "no_cs7=1"))
 			fw.no_cs7 = true;
+		else if (!strcmp(line, "cs7_on_usr2=1"))
+			fw.cs7_on_usr2 = true;
 	}
 	fclose(f);
 	if (fw.exit_config)
@@ -346,6 +364,7 @@ static int fake_worker_main(int argc, char **argv)
 		signal(SIGTERM, fw_sigterm);
 	}
 	signal(SIGUSR1, fw_sigusr1);
+	signal(SIGUSR2, fw_sigusr2);
 	signal(SIGPIPE, SIG_IGN);
 
 	ctx = talloc_named_const(NULL, 0, "fake_worker");
@@ -1306,8 +1325,11 @@ static void test_p9_ownership_failed(char **argv)
  * still, so a delay is checked to the millisecond: no start 1 ms before it, exactly one start at it.
  ***********************************************************************/
 
+static unsigned long g_fake_ms;	/*!< fake time since fake_clock_on() */
+
 static void fake_clock_on(void)
 {
+	g_fake_ms = 0;
 	osmo_gettimeofday_override = true;
 	gettimeofday(&osmo_gettimeofday_override_time, NULL);
 	osmo_clock_override_enable(CLOCK_MONOTONIC, true);
@@ -1333,6 +1355,7 @@ static void pump(void)
 
 static void fake_advance_ms(unsigned long ms)
 {
+	g_fake_ms += ms;
 	osmo_gettimeofday_override_add(ms / 1000, (ms % 1000) * 1000);
 	osmo_clock_override_add(CLOCK_MONOTONIC, ms / 1000, (ms % 1000) * 1000000);
 	pump();
@@ -1591,8 +1614,9 @@ static void p12_fn(char **argv, struct backoff_result *res)
 	unsigned int forks0;
 	unsigned long end;
 
-	/* Fake time 0: the pool starts; its startup timer (one for the pool, see 2a-5) fires at 80 s. */
-	res->started = backoff_pool_start(argv, NULL, 80);
+	/* Fake time 0: the pool starts. startup-timeout 65 s per start (2a-5): the process started at 15 s, which never
+	 * becomes READY, times out at 80 s. */
+	res->started = backoff_pool_start(argv, NULL, 65);
 	if (!res->started)
 		return;
 	backoff_round(res, 0);			/* lost at 0 s: 5 s; restarted at 5 s, READY */
@@ -1883,6 +1907,271 @@ static void test_p16_stable_keeps_record(char **argv)
 }
 
 /***********************************************************************
+ * Startup timeout per start (P17-P19), on the fake clock; 'startup-timeout 60', the other settings default.
+ ***********************************************************************/
+
+/* Move the fake clock to t_ms (since fake_clock_on()); never backwards. */
+static void fake_advance_to(unsigned long t_ms)
+{
+	if (t_ms > g_fake_ms)
+		fake_advance_ms(t_ms - g_fake_ms);
+	else
+		pump();
+}
+
+/* Worker i was lost with its process still running (SIGTERM sent): let the reap timer collect it (fake time moves
+ * in 10 ms steps) until the pool has decided. \returns true once RESTARTING or FAILED. */
+static bool collected(unsigned int i)
+{
+	unsigned long end = now_ms() + 5000;
+
+	while (!w_restarting_or_failed(&i) && now_ms() < end)
+		fake_advance_ms(10);
+	return w_restarting_or_failed(&i);
+}
+
+static bool w_is(unsigned int i, enum aworker_state st, pid_t pid)
+{
+	struct aworker_pool_worker_info inf = winfo(i);
+	return inf.state == st && (!pid || inf.pid == pid);
+}
+
+/* Lose worker i at the current fake time (crash()), its config file is changed to extra first; then start its next
+ * process after the restart delay. \returns the new process' pid (STARTING), or 0. */
+static pid_t restart_with(unsigned int i, const char *extra)
+{
+	struct aworker_pool_worker_info inf;
+	unsigned int forks0;
+
+	worker_cfg(i, i, extra);
+	if (!crash(i) || winfo(i).state != AWORKER_ST_RESTARTING)
+		return 0;
+	inf = winfo(i);
+	forks0 = g_forks;
+	fake_advance_ms(inf.restart_delay * 1000UL);
+	inf = winfo(i);
+	return g_forks == forks0 + 1 && inf.state == AWORKER_ST_STARTING ? inf.pid : 0;
+}
+
+struct start_result {
+	bool started;
+	bool ok[12];		/*!< the stages, see each test */
+	bool w0_untouched;
+	bool no_shutdown;
+};
+
+static void start_run(char **argv, void (*fn)(char **argv, struct start_result *res), struct start_result *res)
+{
+	int pp[2], status;
+	pid_t bsc;
+
+	OSMO_ASSERT(pipe(pp) == 0);
+	bsc = fork();
+	OSMO_ASSERT(bsc >= 0);
+	if (bsc == 0) {
+		close(pp[0]);
+		memset(res, 0, sizeof(*res));
+		fn(argv, res);
+		res->no_shutdown = !osmo_select_shutdown_requested() && !aworker_pool_shutdown_was_fatal();
+		fake_clock_off();
+		aworker_pool_stop();
+		_exit(write(pp[1], res, sizeof(*res)) == sizeof(*res) ? 0 : 1);
+	}
+	close(pp[1]);
+	CHECK(read(pp[0], res, sizeof(*res)) == sizeof(*res));
+	close(pp[0]);
+	CHECK(collect(bsc, &status, 60000) == bsc);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(res->started);
+	CHECK(res->no_shutdown);
+}
+
+/* P17: two workers restarted at different times, each never READY: each times out exactly 60 s after its own start,
+ * only that worker is affected, and the loss goes through the restart policy (backoff), after which a worker that
+ * reports its cs7 instances is READY and stays so. */
+static void p17_fn(char **argv, struct start_result *res)
+{
+	struct aworker_pool_worker_info i0;
+	pid_t p0, p1, p0b;
+
+	res->started = backoff_pool_start(argv, NULL, 60);
+	if (!res->started)
+		return;
+	p0 = restart_with(0, "no_cs7=1\n");	/* lost at 0 s, started at 5 s: times out at 65 s */
+	fake_advance_to(20000);
+	p1 = restart_with(1, "no_cs7=1\n");	/* lost at 20 s, started at 25 s: times out at 85 s */
+	if (!p0 || !p1)
+		return;
+
+	fake_advance_to(64999);
+	res->ok[0] = w_is(0, AWORKER_ST_STARTING, p0) && w_is(1, AWORKER_ST_STARTING, p1);
+	fake_advance_to(65000);
+	res->ok[1] = !w_is(0, AWORKER_ST_STARTING, 0) && w_is(1, AWORKER_ST_STARTING, p1);
+
+	/* Its next process will report its cs7 instances. */
+	worker_cfg(0, 0, NULL);
+	if (!collected(0))
+		return;
+	i0 = winfo(0);
+	/* one loss more on record, the backoff continued: handled once, by the restart policy */
+	res->ok[2] = i0.state == AWORKER_ST_RESTARTING && i0.restarts_in_window == 2 && i0.restart_delay == 10
+		     && i0.backoff_step == 2 && w_is(1, AWORKER_ST_STARTING, p1);
+	res->ok[3] = restarts_after(0, 10);	/* restarted after 10 s, READY */
+	p0b = winfo(0).pid;
+
+	fake_advance_to(84999);
+	res->ok[4] = w_is(1, AWORKER_ST_STARTING, p1) && w_is(0, AWORKER_ST_READY, p0b);
+	fake_advance_to(85000);
+	res->ok[5] = !w_is(1, AWORKER_ST_STARTING, 0) && collected(1) && winfo(1).restarts_in_window == 2
+		     && w_is(0, AWORKER_ST_READY, p0b);
+
+	/* Worker 0's last start was at about 75 s: it stays READY long past 135 s, its timeout never fires. */
+	fake_advance_to(200000);
+	i0 = winfo(0);
+	res->ok[6] = w_is(0, AWORKER_ST_READY, p0b) && i0.starts == 3 && i0.restarts_in_window == 2;
+}
+
+static void test_p17_startup_timeout_per_start(char **argv)
+{
+	struct start_result res;
+
+	printf("P17: each start has its own startup timeout ('startup-timeout 60')\n");
+	start_run(argv, p17_fn, &res);
+	CHECK(res.ok[0]);
+	CHECK(res.ok[1]);
+	printf("  worker 0 started at 5 s, worker 1 at 25 s, neither READY: at 64.999 s both still starting;\n");
+	printf("  at 65 s worker 0 is timed out, worker 1 keeps its process\n");
+	CHECK(res.ok[2]);
+	printf("  the timeout is one more unplanned loss: second restart in the window, backoff 10 s\n");
+	CHECK(res.ok[3]);
+	printf("  worker 0 restarted after 10 s and became READY\n");
+	CHECK(res.ok[4]);
+	CHECK(res.ok[5]);
+	printf("  worker 1 is timed out at 85 s, its own deadline, not before; worker 0 stays READY with its process\n");
+	CHECK(res.ok[6]);
+	printf("  the READY worker 0 is never timed out later (200 s: same process, no further loss)\n");
+}
+
+/* P18: a worker that becomes READY 1 ms before its deadline is not timed out, then or later. */
+static void p18_fn(char **argv, struct start_result *res)
+{
+	pid_t p1;
+
+	res->started = backoff_pool_start(argv, NULL, 60);
+	if (!res->started)
+		return;
+	p1 = restart_with(1, "cs7_on_usr2=1\n");	/* started at 5 s: deadline 65 s */
+	if (!p1)
+		return;
+	fake_advance_to(64999);
+	res->ok[0] = w_is(1, AWORKER_ST_STARTING, p1);
+	kill(p1, SIGUSR2);
+	res->ok[1] = run_until(w1_ready, NULL, 5000) && winfo(1).pid == p1;	/* the fake clock stands still */
+	fake_advance_to(65000);
+	res->ok[2] = w_is(1, AWORKER_ST_READY, p1);
+	/* 250 s: no further loss (the restart of 0 s is still within the window); 300 s: same process. */
+	fake_advance_to(250000);
+	res->ok[3] = w_is(1, AWORKER_ST_READY, p1) && winfo(1).starts == 2 && winfo(1).restarts_in_window == 1;
+	fake_advance_to(300000);
+	res->ok[3] = res->ok[3] && w_is(1, AWORKER_ST_READY, p1) && winfo(1).starts == 2;
+	res->w0_untouched = winfo(0).state == AWORKER_ST_READY && winfo(0).starts == 1;
+}
+
+static void test_p18_ready_before_deadline(char **argv)
+{
+	struct start_result res;
+
+	printf("P18: a worker that becomes READY just before its startup deadline is not timed out\n");
+	start_run(argv, p18_fn, &res);
+	CHECK(res.ok[0] && res.ok[1]);
+	printf("  started at 5 s, READY at 64.999 s\n");
+	CHECK(res.ok[2] && res.ok[3]);
+	printf("  at 65 s and up to 300 s: READY with the same process, no loss\n");
+	CHECK(res.w0_untouched);
+}
+
+/* P19: the startup timeout of a process never outlives it. Worker 1, never READY:
+ *  A started at 5 s (deadline 65 s), lost at 30 s;  B started at 40 s: not timed out at 65 s;
+ *  B lost at 99 s, 1 s before its deadline; restart after 20 s: at 100 s, while the worker waits, nothing
+ *    happens (no second loss, the restart still at 119 s);
+ *  C started at 119 s: timed out at 179 s, its own deadline.
+ * Then osmo-bsc stops while D is starting: its pending startup timer must go with the pool. */
+static void p19_fn(char **argv, struct start_result *res)
+{
+	struct aworker_pool_worker_info i1;
+	pid_t a, b, c;
+	unsigned long end;
+
+	res->started = backoff_pool_start(argv, NULL, 60);
+	if (!res->started)
+		return;
+	a = restart_with(1, "no_cs7=1\n");		/* lost at 0 s: A started at 5 s */
+	fake_advance_to(30000);
+	b = restart_with(1, "no_cs7=1\n");		/* A lost at 30 s, backoff 10 s: B started at 40 s */
+	if (!a || !b || a == b)
+		return;
+	res->ok[0] = g_fake_ms == 40000;
+	fake_advance_to(65000);
+	res->ok[1] = w_is(1, AWORKER_ST_STARTING, b);
+
+	fake_advance_to(99000);
+	worker_cfg(1, 1, "no_cs7=1\n");
+	if (!crash(1))					/* B lost at 99 s: backoff 20 s, restart at 119 s */
+		return;
+	fake_advance_to(100000);
+	i1 = winfo(1);
+	res->ok[2] = i1.state == AWORKER_ST_RESTARTING && i1.restarts_in_window == 3 && i1.restart_delay == 20
+		     && i1.backoff_step == 3;
+	fake_advance_to(118999);
+	res->ok[2] = res->ok[2] && w_is(1, AWORKER_ST_RESTARTING, 0);
+	fake_advance_to(119000);
+	c = winfo(1).pid;
+	res->ok[2] = res->ok[2] && w_is(1, AWORKER_ST_STARTING, 0) && c != b;
+
+	fake_advance_to(178999);
+	res->ok[3] = w_is(1, AWORKER_ST_STARTING, c);
+	fake_advance_to(179000);
+	res->ok[3] = res->ok[3] && !w_is(1, AWORKER_ST_STARTING, 0) && collected(1);
+	i1 = winfo(1);
+	res->ok[4] = i1.restarts_in_window == 4 && i1.restart_delay == 40;
+	res->w0_untouched = winfo(0).state == AWORKER_ST_READY && winfo(0).starts == 1;
+
+	/* D starts (still never READY); osmo-bsc stops while it is STARTING. D lingers 300 ms after GOODBYE, so its link
+	 * does not close (which would cancel the timer) before aworker_pool_stop() frees it: only the stop itself can
+	 * take that timer down. */
+	worker_cfg(1, 1, "no_cs7=1\nlinger=300\n");
+	fake_advance_ms(i1.restart_delay * 1000UL);
+	res->ok[5] = winfo(1).state == AWORKER_ST_STARTING;
+	/* The fake clock keeps running through the stop (both workers exit by themselves after GOODBYE, so its waits
+	 * end), and then passes D's deadline: a startup timer left behind would now fire on the freed worker. */
+	aworker_pool_stop();
+	fake_advance_ms(120 * 1000);
+	end = now_ms() + 200;
+	while (now_ms() < end)
+		osmo_select_main_ctx(1);
+	fake_clock_off();
+	res->ok[6] = true;
+}
+
+static void test_p19_old_timeout_not_replacement(char **argv)
+{
+	struct start_result res;
+
+	printf("P19: a startup timeout never outlives its process\n");
+	start_run(argv, p19_fn, &res);
+	CHECK(res.ok[0] && res.ok[1]);
+	printf("  process started at 5 s lost at 30 s; its replacement, started at 40 s, is not timed out at 65 s\n");
+	CHECK(res.ok[2]);
+	printf("  that one lost at 99 s: its deadline (100 s) passes while the worker waits, without effect;\n");
+	printf("  the next process starts at 119 s as scheduled\n");
+	CHECK(res.ok[3] && res.ok[4]);
+	printf("  which is timed out at 179 s, its own deadline: fourth restart in the window, backoff 40 s\n");
+	CHECK(res.w0_untouched);
+	CHECK(res.ok[5] && res.ok[6]);
+	printf("  stopping osmo-bsc while a process is starting leaves no startup timer behind\n");
+}
+
+/***********************************************************************
  * main
  ***********************************************************************/
 
@@ -1922,6 +2211,9 @@ int main(int argc, char **argv)
 	test_p14_restart_window(argv);
 	test_p15_stop_not_counted(argv);
 	test_p16_stable_keeps_record(argv);
+	test_p17_startup_timeout_per_start(argv);
+	test_p18_ready_before_deadline(argv);
+	test_p19_old_timeout_not_replacement(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

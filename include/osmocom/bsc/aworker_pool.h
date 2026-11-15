@@ -149,7 +149,7 @@ struct aworker_pool_cfg {
 	unsigned int num_workers;
 	/*! Config file of each worker; cfg_file[i] must be set for every i < num_workers. */
 	char *cfg_file[AWORKER_POOL_MAX_WORKERS];
-	unsigned int startup_timeout;	/*!< seconds to wait for all workers to become ready */
+	unsigned int startup_timeout;	/*!< seconds each started worker process has to become READY */
 	unsigned int restart_delay;	/*!< seconds: restart delay after the first unplanned loss (the backoff base) */
 	unsigned int restart_delay_max;	/*!< seconds: the backoff never waits longer (but never less than restart_delay) */
 	unsigned int stable_time;	/*!< seconds READY before a loss after which the backoff starts over */

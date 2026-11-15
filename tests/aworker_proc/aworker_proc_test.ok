@@ -63,4 +63,20 @@ P16: stable-time resets the backoff, not the restart record
   lost at 0, 5, 15 s (5, 10, 20 s), then READY 60 s and lost: restarted after restart-delay (5 s)
   the restarts of 0, 5 and 15 s still count, and that restart is added: 4 within 300 s
   READY 60 s again, lost at 160 s: restart 5 within 300 s, so FAILED (restart-limit)
+P17: each start has its own startup timeout ('startup-timeout 60')
+  worker 0 started at 5 s, worker 1 at 25 s, neither READY: at 64.999 s both still starting;
+  at 65 s worker 0 is timed out, worker 1 keeps its process
+  the timeout is one more unplanned loss: second restart in the window, backoff 10 s
+  worker 0 restarted after 10 s and became READY
+  worker 1 is timed out at 85 s, its own deadline, not before; worker 0 stays READY with its process
+  the READY worker 0 is never timed out later (200 s: same process, no further loss)
+P18: a worker that becomes READY just before its startup deadline is not timed out
+  started at 5 s, READY at 64.999 s
+  at 65 s and up to 300 s: READY with the same process, no loss
+P19: a startup timeout never outlives its process
+  process started at 5 s lost at 30 s; its replacement, started at 40 s, is not timed out at 65 s
+  that one lost at 99 s: its deadline (100 s) passes while the worker waits, without effect;
+  the next process starts at 119 s as scheduled
+  which is timed out at 179 s, its own deadline: fourth restart in the window, backoff 40 s
+  stopping osmo-bsc while a process is starting leaves no startup timer behind
 PASSED

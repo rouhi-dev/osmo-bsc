@@ -90,6 +90,9 @@ struct aworker {
 	struct aworker_ipc_link *link;
 	struct osmo_timer_list restart_timer;
 	unsigned int starts;			/*!< number of times this worker was started */
+	/*! Startup timeout of the current process: armed when it enters STARTING (link_create(), every start),
+	 * deleted on every way out of STARTING (READY, worker_lost(), aworker_pool_stop()). */
+	struct osmo_timer_list start_timer;
 
 	/* Restart backoff, see restart_delay_for(). All times are CLOCK_MONOTONIC (osmo_clock_gettime()). */
 	unsigned int backoff_step;		/*!< consecutive unplanned restarts since last stable or reset */
@@ -522,6 +525,7 @@ static void users_lose_worker(struct aworker *w)
 
 static int worker_spawn(struct aworker *w);
 static void worker_lost(struct aworker *w, const char *why);
+static void start_timer_cb(void *data);
 
 static unsigned int ms_since(const struct timespec *t)
 {
@@ -835,6 +839,8 @@ static void restart_timer_cb(void *data)
  * collected. */
 static void worker_lost(struct aworker *w, const char *why)
 {
+	/* Whatever the cause, this process can no longer time out at startup. */
+	osmo_timer_del(&w->start_timer);
 	/* Already being taken down: the link is gone and the users were told; collection is under way. */
 	if (w->state == AWORKER_ST_TERMINATING)
 		return;
@@ -964,6 +970,7 @@ static void handle_cs7_info(struct aworker *w, const struct aworker_ipc_msg *m)
 	w->cs7 = m->u.cs7_info;
 	w->cs7_reported = true;
 	w->state = AWORKER_ST_READY;
+	osmo_timer_del(&w->start_timer);
 	w->ready_seen = true;
 	osmo_clock_gettime(CLOCK_MONOTONIC, &w->ready_since);
 
@@ -1116,7 +1123,24 @@ static int link_create(struct aworker *w, int fd)
 	w->main_fd = fd;
 	w->state = AWORKER_ST_STARTING;
 	w->starts++;
+	/* Every start gets the full startup-timeout (re-arming replaces any earlier deadline). */
+	osmo_timer_schedule(&w->start_timer, w->pool->cfg.startup_timeout, 0);
 	return 0;
+}
+
+/* The current process of this worker did not become READY within startup-timeout of its start. The timer is only
+ * pending while the worker is STARTING; the state check keeps a callback that should not run from touching any later
+ * state or process. The loss goes through the usual path: collection, then the failure policy (backoff, restart
+ * limit). Only this worker is affected. */
+static void start_timer_cb(void *data)
+{
+	struct aworker *w = data;
+
+	if (w->state != AWORKER_ST_STARTING)
+		return;
+	LOGW(w, LOGL_ERROR, "not ready %u s after its start (start #%u); treating the worker as lost\n",
+	     w->pool->cfg.startup_timeout, w->starts);
+	worker_lost(w, "startup timeout");
 }
 
 /* Starting a worker process
@@ -1426,25 +1450,9 @@ static void startup_timer_cb(void *data)
 {
 	struct aworker_pool *pool = data;
 	struct aworker_user *au;
-	unsigned int i;
 
-	for (i = 0; i < pool->num; i++) {
-		struct aworker *w = pool->worker[i];
-		/* READY: fine. TERMINATING: already lost and being collected; its failure policy follows. FAILED:
-		 * stays so until it is reset. */
-		if (w->state == AWORKER_ST_READY || w->state == AWORKER_ST_TERMINATING
-		    || w->state == AWORKER_ST_FAILED)
-			continue;
-		LOGW(w, LOGL_ERROR, "not ready %u s after start (state %s); treating the worker as failed\n",
-		     pool->cfg.startup_timeout, get_value_string(state_names, w->state));
-		if (w->link) {
-			/* closed_cb -> worker_lost() applies the configured failure policy. */
-			aworker_ipc_link_close(w->link);
-		} else if (w->state != AWORKER_ST_RESTARTING) {
-			worker_lost(w, "startup timeout");
-		}
-	}
-
+	/* Only a diagnostic, once, startup-timeout after the pool started. The workers themselves time out per start
+	 * (start_timer_cb()). */
 	llist_for_each_entry(au, &pool->users, entry) {
 		if (au->bound)
 			continue;
@@ -1492,6 +1500,7 @@ static struct aworker_pool *pool_alloc(void *ctx, unsigned int num)
 		w->main_fd = -1;
 		w->state = AWORKER_ST_STOPPED;
 		osmo_timer_setup(&w->restart_timer, restart_timer_cb, w);
+		osmo_timer_setup(&w->start_timer, start_timer_cb, w);
 		osmo_timer_setup(&w->reap_timer, reap_timer_cb, w);
 		pool->worker[i] = w;
 	}
@@ -1722,8 +1731,10 @@ void aworker_pool_stop(void)
 	 * fires while the event loop is polled below. */
 	pool->stopping = true;
 	osmo_timer_del(&pool->startup_timer);
-	for (i = 0; i < pool->num; i++)
+	for (i = 0; i < pool->num; i++) {
 		osmo_timer_del(&pool->worker[i]->restart_timer);
+		osmo_timer_del(&pool->worker[i]->start_timer);
+	}
 
 	/* Tell every worker GOODBYE, so that it exits by itself (status 0). Queueing is not enough: osmo-bsc's
 	 * event loop has ended, and freeing a link drops whatever it has not written yet. So keep polling the

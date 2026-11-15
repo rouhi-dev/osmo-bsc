@@ -111,7 +111,8 @@ DEFUN_ATTR(cfg_aworker_no_cfg_file, cfg_aworker_no_cfg_file_cmd,
 
 DEFUN_ATTR(cfg_aworker_startup_timeout, cfg_aworker_startup_timeout_cmd,
 	   "startup-timeout <1-600>",
-	   "How long to wait for the workers to report their cs7 instances before logging an error\n"
+	   "How long each started worker (at osmo-bsc start, restart or reset) has to report its cs7 instances;"
+	   " a worker that does not is treated as lost (see 'on-worker-failure')\n"
 	   "Timeout in seconds\n",
 	   CMD_ATTR_IMMEDIATE)
 {

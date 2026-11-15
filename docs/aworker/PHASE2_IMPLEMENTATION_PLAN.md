@@ -278,3 +278,90 @@ cleared. It was reconstructed from the session record (original file plus every 
 re-run against 04cd7d57a: 46/46 checks, identical to run 7. It is now kept outside the repositories in
 `~/dev/osmo-bsc-a-worker-pool-e2e/run_e2e.py` (run: `python3 -I run_e2e.py <workdir>`), until it moves into gsm-lab
 in 2e.
+
+### 2a-2 — expected ownership map and global checks: committed f487f1a3f
+
+Before any fork, osmo-bsc reads every worker config file the way the worker does: a worker owns exactly the cs7
+instances its file configures with an `asp`, `as` or `listen` node (`aworker.c` `cs7_collect()`). From those files it
+builds the map from cs7 instance to expected worker. Two global errors from §2 now refuse to start, and the log
+names the cs7 instance and the files and lines involved:
+* a cs7 instance claimed by two worker files (the log names the instance, both workers, both files and both lines);
+* an `msc` whose cs7 instance no worker file configures (an msc without an instance counts as instance 0, as in
+  `osmo_bsc_sigtran_init()`).
+
+A worker file that cannot be read is that worker's own error, not a global one. An msc instance that might be in
+such a file is logged, not refused. `aworker_pool_check_ownership()` runs in `main()` right after
+`aworker_pool_check_main_cs7()`. The start functions rebuild the map, refuse a duplicate and keep the map in the
+pool. `aworker_pool_expected_owner()` exposes it. The check is deliberately not yet enforced against CS7_INFO
+(that is 2a-3b).
+
+Tests: `aworker_pool` T10 (real temporary config files; log text checked through a file log target). Five
+mutations each fail T10. Removing the `main()` call is caught only by a real-binary run, not by `make check`: in that
+run osmo-bsc started with an msc no worker serves. Real osmo-bsc: both bad configurations exit 1 before any fork.
+Normal and ASan/UBSan 14/14, E2E 46/46.
+
+### Test fix — P7 control timer: committed 489f1d234
+
+P7 (04cd7d57a) scheduled a `struct osmo_timer_list` on the stack without zeroing it. `osmo_timer_setup()` sets
+only `cb` and `data`, so `osmo_timer_add()` could find stack garbage in `active` and call `rb_erase()` on a node that
+was never in the timer tree. The 2a-3a library change altered the stack layout, after which the P7 child crashed
+(SIGSEGV in `rb_erase()`) in every normal-build run. The ASan build happened to hide the crash. The fix
+zero-initialises the timer. It is a test-only change committed on its own before 2a-3a, and passes 14/14 in both
+builds. With the pending 2a-3a change applied, P7 passed 5 of 5 runs, where it had crashed in every run before.
+
+### 2a-3a — worker-local FAILED state and operator reset: committed bb797c02e
+
+Documented behaviour change: with `on-worker-failure restart` (the default), a worker that exits with
+`AWORKER_EXIT_CONFIG` (66) no longer shuts osmo-bsc down. It enters `AWORKER_ST_FAILED`, and osmo-bsc and the other
+workers continue. `on-worker-failure shutdown` remains the explicit opt-in that ends osmo-bsc on any worker failure.
+* FAILED is entered only after the process is collected (Phase 1 rule), in `worker_apply_policy()`. The cause is
+  either the exit status or a reason recorded in `pending_fail` before the link was closed.
+* It records the reason (`config`, `ownership`), a detail text and the wall-clock time.
+* FAILED is terminal: no restart timer is armed, and the startup timeout skips FAILED workers.
+* Reset: `aworker_pool_reset_worker()` and VTY (enable node) `a-worker-pool reset worker <0-15>` forget the failure and
+  start only that worker. A reset of a worker in any other state is refused (`-EBUSY`, "% worker N is not FAILED").
+* Visibility: `show a-worker-pool` prints `failed: <reason>, at <time>: <detail>` and how to reset.
+  `aworker_pool_worker_info()` carries `fail_reason`, `fail_detail` and `failed_at`.
+
+Deviations from §2:
+* An exec failure in the child exits 66 and is therefore recorded as `config`, not as a separate `exec` reason.
+* The `point-code` reason (worker point code differs from the main file) is not implemented yet. The mismatch is
+  still only logged.
+
+Tests: `aworker_proc` P8 (real fork/exec). Worker 1 exits 66 and becomes FAILED with reason, detail and time, while
+worker 0 stays READY. No `fork()` happens past restart-delay and startup-timeout. A reset of a READY worker is
+refused. After the file is fixed, a reset forks exactly once and the worker becomes READY. Worker 0 keeps its
+process, and no shutdown is requested. Seven mutations each fail P8. Real osmo-bsc: 13/13 scripted checks (show
+output, refused resets, a reset while still broken fails again after one start, a reset after the fix gives READY,
+worker 0's pid unchanged, exit 0). Normal and ASan/UBSan 14/14.
+
+The process tests are numbered in commit order (P5 GOODBYE, P6 lingering workers, P7 restart while stopping, P8
+FAILED/reset, P9 ownership), not as listed in §3.
+
+### 2a-3b — runtime CS7_INFO ownership validation: committed 305f72cc2
+
+`handle_cs7_info()` checks each claim against the 2a-2 map. On a mismatch it closes the link with `pending_fail =
+ownership`, and once the process is collected the worker is FAILED, only that worker, until reset.
+* A claim of an instance that another worker's file configured is refused, even before that worker has reported.
+* A worker whose expectation is known (its file was readable and configures at least one instance) must report
+  exactly that set. Extra and missing instances are both refused, and the detail says which.
+* A worker with no known expectation keeps the Phase 1 first-come duplicate check. That covers no config file (as
+  with `aworker_pool_start_with_fds()`), an unreadable file, or a file that configures nothing. A mutation that
+  treats a file configuring nothing as an empty known expectation fails Phase 1 test P1, which is why the rule
+  exists.
+
+Tests:
+* `aworker_pool` T11 (scripted workers, real config files): an extra claim, a missing instance and a foreign claim
+  each make worker 1 FAILED with that detail, while worker 0 stays READY and its SCCP user available. A matching
+  claim is accepted.
+* `aworker_proc` P9: a mismatch leads to FAILED with no `fork()`. With a matching report restored, a reset makes the
+  worker READY. Worker 0 is untouched.
+
+Mutation results:
+* O1–O3 fail both T11 and P9.
+* O4–O5 fail T11 only; P9 does not cover those cases.
+* O6 fails Phase 1 test P1.
+
+Real osmo-bsc, 12/12 scripted checks: worker 1's file was changed at runtime and the worker SIGKILLed. Its
+replacement went FAILED (ownership), worker 0's pid stayed the same, and restoring the file plus a reset gave READY.
+T1–T10 and P1–P8 unchanged. Normal and ASan/UBSan 14/14, no new warnings, E2E 46/46.

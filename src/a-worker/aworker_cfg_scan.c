@@ -101,7 +101,7 @@ static void note_sigtran_node(struct aworker_cfg_scan_cs7 *c, const char *node, 
 		c->proto_conflict = true;
 }
 
-int aworker_cfg_scan(const char *config_file, struct aworker_cfg_scan *out)
+static void scan_fp(FILE *f, struct aworker_cfg_scan *out)
 {
 	struct aworker_cfg_scan_cs7 *cur = NULL;
 	unsigned int cur_indent = 0, pool_indent = 0;
@@ -109,13 +109,6 @@ int aworker_cfg_scan(const char *config_file, struct aworker_cfg_scan *out)
 	unsigned int lineno = 0;
 	char buf[1024];
 	struct line l;
-	FILE *f;
-
-	memset(out, 0, sizeof(*out));
-
-	f = fopen(config_file, "r");
-	if (!f)
-		return -errno;
 
 	while (fgets(buf, sizeof(buf), f)) {
 		lineno++;
@@ -168,6 +161,32 @@ int aworker_cfg_scan(const char *config_file, struct aworker_cfg_scan *out)
 			note_sigtran_node(cur, "listen", lineno, proto_of(&l, 1));
 		}
 	}
+}
+
+int aworker_cfg_scan(const char *config_file, struct aworker_cfg_scan *out)
+{
+	FILE *f;
+
+	memset(out, 0, sizeof(*out));
+	f = fopen(config_file, "r");
+	if (!f)
+		return -errno;
+	scan_fp(f, out);
+	fclose(f);
+	return 0;
+}
+
+int aworker_cfg_scan_buf(const char *buf, size_t len, struct aworker_cfg_scan *out)
+{
+	FILE *f;
+
+	memset(out, 0, sizeof(*out));
+	if (!len)
+		return 0;
+	f = fmemopen((void *)buf, len, "r");
+	if (!f)
+		return -errno;
+	scan_fp(f, out);
 	fclose(f);
 	return 0;
 }

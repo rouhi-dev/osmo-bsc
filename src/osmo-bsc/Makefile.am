@@ -33,12 +33,7 @@ libbsc_la_SOURCES = \
 	abis_rsl.c \
 	acc.c \
 	assignment_fsm.c \
-	aworker.c \
-	aworker_cfg_scan.c \
-	aworker_ipc.c \
-	aworker_ipc_link.c \
-	aworker_pool.c \
-	aworker_vty.c \
+	aworker_users.c \
 	bsc_ctrl.c \
 	bsc_ctrl_lookup.c \
 	bsc_init.c \
@@ -127,6 +122,7 @@ libbsc_la_SOURCES = \
 	$(NULL)
 
 libbsc_la_LIBADD = \
+	$(top_builddir)/src/a-worker/libaworker.la \
 	$(LIBOSMOCORE_LIBS) \
 	$(LIBOSMOGSM_LIBS) \
 	$(LIBOSMOVTY_LIBS) \

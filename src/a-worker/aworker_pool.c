@@ -42,14 +42,15 @@
 #include <osmocom/core/timer.h>
 #include <osmocom/core/utils.h>
 #include <osmocom/sigtran/osmo_ss7.h>
+#include <osmocom/vty/command.h>
 #include <osmocom/vty/vty.h>
 
 #include <osmocom/bsc/aworker_ipc.h>
 #include <osmocom/bsc/aworker_ipc_link.h>
 #include <osmocom/bsc/aworker_pool.h>
+#include <osmocom/bsc/aworker_pool_internal.h>
 #include <osmocom/bsc/aworker_cfg_scan.h>
-#include <osmocom/bsc/bsc_sccp_backend.h>
-#include <osmocom/bsc/debug.h>
+#include <osmocom/bsc/aworker_cfg_view.h>
 
 /* aworker_pool_stop() runs after the event loop has ended (osmo-bsc is exiting), so it may wait, but only this long
  * after SIGKILL for processes that are still not collected. */
@@ -60,104 +61,6 @@
 
 extern char **environ;
 
-struct aworker_pool;
-
-/*! One SCCP User the main process keeps in a worker. */
-struct aworker_user {
-	struct llist_head entry;		/*!< in aworker_pool.users */
-	struct aworker_pool *pool;
-	uint32_t cs7_id;
-	uint16_t ssn;
-	char name[AWORKER_IPC_MAX_USER_NAME + 1];
-	const struct aworker_sccp_user_ops *ops;
-	struct bsc_sccp_user *user;		/*!< the generic user; owns nothing of this struct */
-
-	/*! Worker this user is currently bound in, and the user_ref valid in it. Both are reset whenever the
-	 * worker is lost, and a fresh user_ref is drawn on the next bind, so that no record of a previous worker
-	 * (or of a previous bind) can ever be attributed to this user. */
-	struct aworker *worker;
-	uint32_t user_ref;
-	bool bind_sent;
-	bool bound;
-};
-
-struct aworker {
-	struct aworker_pool *pool;
-	unsigned int idx;
-	enum aworker_state state;
-	pid_t pid;
-	int main_fd;				/*!< main-process end of the socketpair; owned by link once set */
-	struct aworker_ipc_link *link;
-	struct osmo_timer_list restart_timer;
-	unsigned int starts;			/*!< number of times this worker was started */
-	/*! Startup timeout of the current process: armed when it enters STARTING (link_create(), every start),
-	 * deleted on every way out of STARTING (READY, worker_lost(), aworker_pool_stop()). */
-	struct osmo_timer_list start_timer;
-
-	/* Restart backoff, see restart_delay_for(). All times are CLOCK_MONOTONIC (osmo_clock_gettime()). */
-	unsigned int backoff_step;		/*!< consecutive unplanned restarts since last stable or reset */
-	unsigned int restart_delay_s;		/*!< delay of the restart scheduled last */
-	bool ready_seen;			/*!< the current process reached READY ... */
-	struct timespec ready_since;		/*!< ... at this time */
-	bool stable_at_loss;			/*!< it was READY for at least stable-time when it was lost */
-	/*! Restart limit: times of the recorded unplanned restarts, oldest first, see worker_schedule_restart(). */
-	struct timespec restart_at[AWORKER_MAX_RESTARTS_LIMIT];
-	unsigned int num_restart_at;
-
-	/* Taking the process down without blocking (AWORKER_ST_TERMINATING), see worker_begin_termination(). */
-	struct osmo_timer_list reap_timer;
-	struct timespec term_since;		/*!< when SIGTERM was sent */
-	struct timespec kill_since;		/*!< when SIGKILL was sent */
-	unsigned int reap_poll_ms;		/*!< next waitpid(WNOHANG) poll interval */
-	bool sigkill_sent;
-	bool reap_stuck;			/*!< not collected AWORKER_REAP_STUCK_MS after SIGKILL */
-	pid_t last_pid;				/*!< the process that was lost, for the log after it is collected */
-	char lost_reason[160];			/*!< why it was lost, applied with the failure policy once collected */
-
-	/* AWORKER_ST_FAILED. A cause found while the process still runs is recorded in pending_fail (with its
-	 * fail_detail) and applied by worker_apply_policy(), once the process is collected. */
-	enum aworker_fail_reason pending_fail;
-	enum aworker_fail_reason fail_reason;
-	char fail_detail[200];
-	time_t failed_at;
-
-	/* Clean shutdown, see aworker_pool_stop(). */
-	bool goodbye_queued;
-	uint32_t goodbye_seq;			/*!< sequence number of the queued GOODBYE */
-	bool goodbye_written;			/*!< ... and the kernel took it: the worker is exiting by itself */
-
-	/*! cs7 instances this worker reported in CS7_INFO. */
-	struct aworker_ipc_cs7_info cs7;
-	bool cs7_reported;
-};
-
-/* Which worker is expected to own which cs7 instance, read from the worker config files with the worker's own rule
- * (aworker.c, cs7_collect()): a worker owns exactly the cs7 instances for which its file has an asp, as or listen
- * node. */
-struct ownership {
-	int owner[AWORKER_POOL_MAX_CS7_ID];		/*!< worker index, or -1: no file configures this instance */
-	unsigned int lineno[AWORKER_POOL_MAX_CS7_ID];	/*!< line of its 'cs7 instance' command in that file */
-	bool unreadable[AWORKER_POOL_MAX_WORKERS];	/*!< this worker's file could not be read: what it owns is unknown */
-	unsigned int num_unreadable;
-	/*! The exact set this worker owns is known: its file was read and configures at least one instance. (A
-	 * worker whose file configures none refuses to run anyway.) Its CS7_INFO must match that set. */
-	bool known[AWORKER_POOL_MAX_WORKERS];
-};
-
-struct aworker_pool {
-	void *ctx;
-	/*! Copy taken at start time. Its strings (cfg_file[]) are the pool's own talloc copies: the VTY may replace or
-	 * free the ones in g_cfg at any time, and changes there only take effect when osmo-bsc is restarted. */
-	struct aworker_pool_cfg cfg;
-	unsigned int num;
-	struct aworker *worker[AWORKER_POOL_MAX_WORKERS];
-	struct llist_head users;
-	uint32_t next_user_ref;
-	struct osmo_timer_list startup_timer;
-	struct ownership own;			/*!< expected ownership, built at start */
-	bool no_fork;				/*!< started with aworker_pool_start_with_fds() */
-	bool stopping;
-};
 
 static struct aworker_pool_cfg g_cfg = {
 	.num_workers = 0,
@@ -185,10 +88,6 @@ static unsigned int g_exec_log_argc;
  * available, fall back to g_exec_path. */
 static int g_exec_fd = -1;
 
-#define LOGW(w, lvl, fmt, args...) \
-	LOGP(DAWORKER, lvl, "aworker %u (pid %ld): " fmt, (w)->idx, (long)(w)->pid, ## args)
-#define LOGU(au, lvl, fmt, args...) \
-	LOGP(DAWORKER, lvl, "aworker user '%s' (cs7 %u ssn %u): " fmt, (au)->name, (au)->cs7_id, (au)->ssn, ## args)
 
 static const struct value_string state_names[] = {
 	{ AWORKER_ST_STOPPED, "STOPPED" },
@@ -237,20 +136,189 @@ bool aworker_pool_enabled(void)
  * file is parsed, because parsing an 'asp' node is what creates the ASP and opens its SCTP association; see
  * aworker_cfg_scan.h. It only ever rejects -- the VTY parser remains the single source of the configuration, and
  * a file without an 'a-worker-pool' section is not restricted at all. */
+/* The main configuration file
+ * ===========================
+ *
+ * With an active pool ('workers' > 0 in 'a-worker-pool') the file is opened and read once (aworker_cfg_read_stable()):
+ * the prescan's rules, the model, the BSC's parse and the worker snapshots all use that buffer, and the path is not
+ * opened again. Without a pool, nothing changes: the file is parsed with vty_read_config_file(), as before.
+ *
+ * A file that cannot be read in one stable pass -- larger than AWORKER_CFG_SOURCE_MAX, not a regular file, or changed
+ * while it was read -- is looked at with the path-based scanner only to tell whether it configures a pool: if it does,
+ * it is refused; if it does not, it is handled as before. */
+static struct {
+	char *path;				/*!< the file classified, NULL if none yet */
+	bool pool;				/*!< it configures an active pool: src and model are authoritative */
+	struct aworker_cfg_source *src;
+	struct aworker_cfg_model *model;
+} g_main;
+
+static void main_cfg_reset(void)
+{
+	TALLOC_FREE(g_main.path);
+	TALLOC_FREE(g_main.src);
+	TALLOC_FREE(g_main.model);
+	g_main.pool = false;
+}
+
+static int main_cfg_refuse(const char *config_file, const char *why)
+{
+	/* Logging is not configured yet at this point, so say it on stderr as well. */
+	fprintf(stderr, "%s: %s\n", config_file, why);
+	LOGP(aworker_log_cat, LOGL_FATAL, "%s: %s\n", config_file, why);
+	return -EINVAL;
+}
+
+/* Read and classify the main configuration file (always anew). \returns 0, or -EINVAL if it is refused. */
+static int main_cfg_load(const char *config_file)
+{
+	struct aworker_cfg_scan scan;
+	char why[256];
+	int rc;
+
+	main_cfg_reset();
+	g_main.path = talloc_strdup(NULL, config_file);
+	OSMO_ASSERT(g_main.path);
+
+	rc = aworker_cfg_read_stable(NULL, config_file, AWORKER_CFG_SOURCE_MAX, &g_main.src);
+	if (rc == 0) {
+		rc = aworker_cfg_model_build_buf(NULL, config_file, g_main.src->buf, g_main.src->len, &g_main.model);
+		if (rc < 0)
+			return main_cfg_refuse(config_file, "cannot read the configuration from memory");
+		g_main.pool = g_main.model->num_workers > 0;
+		if (!g_main.pool) {
+			/* No pool: the file is parsed as before; nothing of this read is kept. */
+			TALLOC_FREE(g_main.src);
+			TALLOC_FREE(g_main.model);
+		}
+		return 0;
+	}
+	if (rc != -EFBIG && rc != -EINVAL && rc != -ESTALE) {
+		/* Cannot be opened or read: leave reporting it to vty_read_config_file(), which says it the way it
+		 * always has. There is nothing to restrict if we cannot read the file anyway. */
+		return 0;
+	}
+
+	/* Not readable in one stable pass. Only a pool configuration has to be: anything else goes on as before. */
+	if (aworker_cfg_scan(config_file, &scan) < 0 || !scan.num_workers)
+		return 0;
+	if (rc == -EFBIG)
+		snprintf(why, sizeof(why), "an 'a-worker-pool' configuration file must not be larger than %u octets",
+			 AWORKER_CFG_SOURCE_MAX);
+	else if (rc == -EINVAL)
+		snprintf(why, sizeof(why), "an 'a-worker-pool' configuration must be read from a regular file");
+	else
+		snprintf(why, sizeof(why), "the file changed while it was being read; refusing to start the A-worker"
+			 " pool from a configuration that may be inconsistent. Start osmo-bsc again once the file is"
+			 " no longer being written");
+	return main_cfg_refuse(config_file, why);
+}
+
+/* The rules of the inline form and of decision D-S1 (aworker_cfg_model_check()). \returns 1 if the file uses the inline
+ * form and is consistent, 0 if it does not use the inline form (the file form's own rule follows), -EINVAL if a rule
+ * is broken (every problem is reported with its line). */
+static int prescan_inline(const char *config_file, const struct aworker_cfg_model *m)
+{
+	struct aworker_cfg_problem p[16];
+	unsigned int n, i;
+	int rc;
+
+	n = aworker_cfg_model_check(m, false, p, ARRAY_SIZE(p));
+	for (i = 0; i < n && i < ARRAY_SIZE(p); i++) {
+		/* Logging is not configured yet at this point, so say it on stderr as well. */
+		fprintf(stderr, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
+		LOGP(aworker_log_cat, LOGL_FATAL, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
+	}
+	if (n > ARRAY_SIZE(p))
+		fprintf(stderr, "%s: %u more problem(s) not shown\n", config_file, n - (unsigned int)ARRAY_SIZE(p));
+	rc = n ? -EINVAL : (aworker_cfg_model_is_inline(m) ? 1 : 0);
+	return rc;
+}
+
+/* The main configuration file, if it was parsed as a view: see aworker_pool_config_write_refusal(). */
+static char *g_view_file;
+
+const char *aworker_pool_config_write_refusal(void)
+{
+	static char reason[512];
+
+	if (!g_view_file)
+		return NULL;
+	snprintf(reason, sizeof(reason), "Writing the configuration is refused: '%s' uses the inline A-worker form"
+		 " ('worker <N> cs7-instance <X>'), and this osmo-bsc holds only its view of it, without the asp, as"
+		 " and listen nodes of the worker-owned cs7 instances. A file written from it would lack"
+		 " them, and written over '%s' would delete them. Edit '%s' and restart osmo-bsc instead.",
+		 g_view_file, g_view_file, g_view_file);
+	return reason;
+}
+
+/* Parse len octets of text with the VTY parser. */
+static int parse_text(const char *text, size_t len)
+{
+	FILE *f;
+	int rc;
+
+	f = len ? fmemopen((void *)text, len, "r") : fopen("/dev/null", "r");
+	if (!f)
+		return -errno;
+	rc = vty_read_config_filep(f, NULL);
+	fclose(f);
+	return rc;
+}
+
+int aworker_pool_read_config(const char *config_file)
+{
+	size_t len;
+	char *view;
+	int rc;
+
+	/* Classified by aworker_pool_prescan_config() already, unless that was not called for this file. */
+	if (!g_main.path || strcmp(g_main.path, config_file)) {
+		rc = main_cfg_load(config_file);
+		if (rc < 0)
+			return rc;
+	}
+	if (!g_main.pool)
+		return vty_read_config_file(config_file, NULL);
+
+	if (!aworker_cfg_model_is_inline(g_main.model)) {
+		/* File form: the whole file, from the buffer read once. As vty_read_config_file() does, the file is
+		 * recorded as the VTY's config file whatever the parse result. */
+		rc = parse_text(g_main.src->buf, g_main.src->len);
+		host_config_set(config_file);
+		return rc;
+	}
+
+	view = aworker_cfg_model_view(g_main.model, g_main.model, AWORKER_CFG_VIEW_BSC, 0, &len);
+	/* From here on the running configuration is never complete: refuse every write, even if parsing fails. */
+	osmo_talloc_replace_string(NULL, &g_view_file, config_file);
+	rc = parse_text(view, len);
+	talloc_free(view);
+	if (rc == 0)
+		LOGP(aworker_log_cat, LOGL_NOTICE, "'%s' uses the inline A-worker form: parsed without the asp / as /"
+		     " listen nodes of the worker-owned cs7 instances, which belong to the workers."
+		     " Writing the configuration (VTY 'write file [PATH]', 'write', 'write memory', 'copy"
+		     " running-config startup-config'; CTRL 'write-config-file') is refused, as it would write it"
+		     " without those nodes.\n", config_file);
+	return rc;
+}
+
 int aworker_pool_prescan_config(const char *config_file)
 {
 	const struct aworker_cfg_scan_cs7 *c;
 	struct aworker_cfg_scan scan;
 	int rc;
 
-	rc = aworker_cfg_scan(config_file, &scan);
-	if (rc < 0) {
-		/* Leave reporting an unreadable file to vty_read_config_file(), which says it the way it always
-		 * has. There is nothing to restrict if we cannot read the file anyway. */
-		return 0;
-	}
-	if (!scan.num_workers)
-		return 0;
+	rc = main_cfg_load(config_file);
+	if (rc < 0)
+		return rc;
+	if (!g_main.pool)
+		return 0;	/* no pool: nothing to restrict */
+	rc = prescan_inline(config_file, g_main.model);
+	if (rc)
+		return rc < 0 ? rc : 0;
+	if (aworker_cfg_scan_buf(g_main.src->buf, g_main.src->len, &scan) < 0)
+		return main_cfg_refuse(config_file, "cannot read the configuration from memory");
 	c = aworker_cfg_scan_first_sigtran(&scan);
 	if (!c)
 		return 0;
@@ -265,7 +333,7 @@ int aworker_pool_prescan_config(const char *config_file)
 		" 'worker <N> config-file FILE', and keep only 'point-code', 'point-code format' and the"
 		" 'sccp-address' book in the main configuration file.\n",
 		config_file, c->node_lineno, c->node, c->id, c->lineno, scan.num_workers);
-	LOGP(DAWORKER, LOGL_FATAL,
+	LOGP(aworker_log_cat, LOGL_FATAL,
 	     "%s:%u: '%s' is not allowed inside 'cs7 instance %u' (line %u) when 'a-worker-pool' is configured\n",
 	     config_file, c->node_lineno, c->node, c->id, c->lineno);
 	return -EINVAL;
@@ -274,6 +342,18 @@ int aworker_pool_prescan_config(const char *config_file)
 /***********************************************************************
  * Expected ownership of the cs7 instances
  ***********************************************************************/
+
+/* Whether the first num_workers workers use the inline form. */
+static bool pool_is_inline(const struct aworker_pool_cfg *cfg)
+{
+	unsigned int i;
+
+	for (i = 0; i < cfg->num_workers && i < AWORKER_POOL_MAX_WORKERS; i++) {
+		if (cfg->has_cs7_instance[i])
+			return true;
+	}
+	return false;
+}
 
 /* Scan the config files of the first cfg->num_workers workers into \a own. A cs7 instance configured in two of them is
  * a contradiction in the pool configuration itself: logged naming both files, \returns -EINVAL. A file that cannot
@@ -291,11 +371,33 @@ static int ownership_build(const struct aworker_pool_cfg *cfg, struct ownership 
 		struct aworker_cfg_scan scan;
 		int src;
 
+		if (cfg->has_cs7_instance[i]) {
+			uint32_t id = cfg->cs7_instance[i];
+			int prev = id < AWORKER_POOL_MAX_CS7_ID ? own->owner[id] : -1;
+
+			if (cfg->cfg_file[i]) {
+				LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': worker %u has both 'config-file' and"
+				     " 'cs7-instance'; a worker uses exactly one form\n", i);
+				rc = -EINVAL;
+				continue;
+			}
+			if (id >= AWORKER_POOL_MAX_CS7_ID)
+				continue;	/* refused by the VTY */
+			if (prev >= 0 && prev != (int)i) {
+				LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': cs7 instance %u is assigned to worker %d"
+				     " and to worker %u; each cs7 instance belongs to exactly one worker\n", id, prev, i);
+				rc = -EINVAL;
+				continue;
+			}
+			own->owner[id] = i;
+			own->known[i] = true;
+			continue;
+		}
 		if (!cfg->cfg_file[i])
 			continue;
 		src = aworker_cfg_scan(cfg->cfg_file[i], &scan);
 		if (src < 0) {
-			LOGP(DAWORKER, LOGL_ERROR, "aworker %u: cannot read its config file '%s': %s; which cs7"
+			LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u: cannot read its config file '%s': %s; which cs7"
 			     " instances it owns is unknown\n", i, cfg->cfg_file[i], strerror(-src));
 			own->unreadable[i] = true;
 			own->num_unreadable++;
@@ -313,7 +415,7 @@ static int ownership_build(const struct aworker_pool_cfg *cfg, struct ownership 
 			}
 			prev = own->owner[sc->id];
 			if (prev >= 0 && prev != (int)i) {
-				LOGP(DAWORKER, LOGL_FATAL, "'a-worker-pool': cs7 instance %u is configured in two worker"
+				LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': cs7 instance %u is configured in two worker"
 				     " config files: worker %d '%s' (line %u) and worker %u '%s' (line %u). Each cs7"
 				     " instance must be configured, with its asp / as, in exactly one worker config"
 				     " file.\n", sc->id, prev, cfg->cfg_file[prev], own->lineno[sc->id], i,
@@ -349,14 +451,20 @@ int aworker_pool_check_ownership(const struct aworker_pool_msc_ref *mscs, unsign
 			continue;
 		if (own.num_unreadable) {
 			/* It may be in a file we could not read: that worker fails on its own when it starts. */
-			LOGP(DAWORKER, LOGL_ERROR, "'a-worker-pool': msc %d uses cs7 instance %u, which none of the"
+			LOGP(aworker_log_cat, LOGL_ERROR, "'a-worker-pool': msc %d uses cs7 instance %u, which none of the"
 			     " readable worker config files configures (%u could not be read)\n", mscs[i].nr, id,
 			     own.num_unreadable);
 			continue;
 		}
-		LOGP(DAWORKER, LOGL_FATAL, "'a-worker-pool': msc %d uses cs7 instance %u, but no worker config file"
-		     " configures that instance with an asp / as, so no A-worker would ever serve this msc. Add"
-		     " 'cs7 instance %u' with its asp to exactly one worker config file.\n", mscs[i].nr, id, id);
+		if (pool_is_inline(&g_cfg))
+			LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': msc %d uses cs7 instance %u, but no worker"
+			     " owns that instance, so no A-worker would ever serve this msc. Add 'worker <N> cs7-instance"
+			     " %u'.\n", mscs[i].nr, id, id);
+		else
+			LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': msc %d uses cs7 instance %u, but no worker config"
+			     " file configures that instance with an asp / as, so no A-worker would ever serve this msc."
+			     " Add 'cs7 instance %u' with its asp to exactly one worker config file.\n", mscs[i].nr, id,
+			     id);
 		rc = -EINVAL;
 	}
 	return rc;
@@ -381,7 +489,7 @@ int aworker_pool_check_main_cs7(void)
 		for (p = OSMO_SS7_ASP_PROT_SUA; p < _NUM_OSMO_SS7_ASP_PROT; p++) {
 			if (!osmo_ss7_as_find_by_proto(inst, p))
 				continue;
-			LOGP(DAWORKER, LOGL_FATAL,
+			LOGP(aworker_log_cat, LOGL_FATAL,
 			     "'a-worker-pool' is configured, but 'cs7 instance %u' of the main process has the"
 			     " %s Application Server. The A-workers own the SIGTRAN stack; the main process"
 			     " must only configure 'point-code', 'point-code format' and the 'sccp-address' book."
@@ -393,130 +501,17 @@ int aworker_pool_check_main_cs7(void)
 	return rc;
 }
 
-/***********************************************************************
- * Lookups
- ***********************************************************************/
+/* Set by the SCCP user side, see struct aworker_pool_user_hooks. */
+static const struct aworker_pool_user_hooks *g_user_hooks;
 
-/* The worker that owns cs7 instance cs7_id, or NULL if no ready worker reported it. */
-static struct aworker *worker_by_cs7(struct aworker_pool *pool, uint32_t cs7_id)
+void aworker_pool_set_user_hooks(const struct aworker_pool_user_hooks *hooks)
 {
-	unsigned int i, j;
-
-	for (i = 0; i < pool->num; i++) {
-		struct aworker *w = pool->worker[i];
-		if (w->state != AWORKER_ST_READY)
-			continue;
-		for (j = 0; j < w->cs7.count; j++) {
-			if (w->cs7.e[j].cs7_id == cs7_id)
-				return w;
-		}
-	}
-	return NULL;
+	g_user_hooks = hooks;
 }
 
-static const struct aworker_ipc_cs7_entry *cs7_entry(const struct aworker *w, uint32_t cs7_id)
+struct aworker_pool *aworker_pool_get(void)
 {
-	unsigned int j;
-
-	for (j = 0; j < w->cs7.count; j++) {
-		if (w->cs7.e[j].cs7_id == cs7_id)
-			return &w->cs7.e[j];
-	}
-	return NULL;
-}
-
-/* A user of this worker by the user_ref we assigned to it. Only refs of the current bind match. */
-static struct aworker_user *user_by_ref(struct aworker *w, uint32_t user_ref)
-{
-	struct aworker_user *au;
-
-	llist_for_each_entry(au, &w->pool->users, entry) {
-		if (au->worker == w && au->bind_sent && au->user_ref == user_ref)
-			return au;
-	}
-	return NULL;
-}
-
-static struct aworker_user *user_by_cs7_ssn(struct aworker_pool *pool, uint32_t cs7_id, uint16_t ssn)
-{
-	struct aworker_user *au;
-
-	llist_for_each_entry(au, &pool->users, entry) {
-		if (au->cs7_id == cs7_id && au->ssn == ssn)
-			return au;
-	}
-	return NULL;
-}
-
-/***********************************************************************
- * User state transitions
- ***********************************************************************/
-
-static void user_set_unavailable(struct aworker_user *au)
-{
-	bool was_bound = au->bound;
-
-	au->worker = NULL;
-	au->bind_sent = false;
-	au->bound = false;
-	if (was_bound && au->ops && au->ops->unavailable)
-		au->ops->unavailable(au->user);
-}
-
-/* Queue a USER_BIND for this user in its worker. */
-static void user_try_bind(struct aworker_user *au)
-{
-	struct aworker_pool *pool = au->pool;
-	struct aworker *w;
-	struct msgb *rec;
-	uint32_t seq;
-	int rc;
-
-	if (au->bind_sent || pool->stopping)
-		return;
-	w = worker_by_cs7(pool, au->cs7_id);
-	if (!w)
-		return;
-
-	/* A fresh user_ref per bind: records of an earlier bind or of a dead worker can never match. */
-	au->user_ref = pool->next_user_ref++;
-	if (!pool->next_user_ref)
-		pool->next_user_ref = 1;
-	au->worker = w;
-
-	rc = aworker_ipc_enc_user_bind(pool->ctx, &rec, au->user_ref, au->cs7_id, au->ssn, au->name);
-	if (rc < 0) {
-		LOGU(au, LOGL_ERROR, "cannot encode USER_BIND: %s\n", strerror(-rc));
-		au->worker = NULL;
-		return;
-	}
-	rc = aworker_ipc_link_send(w->link, rec, &seq);
-	if (rc < 0) {
-		LOGU(au, LOGL_ERROR, "cannot send USER_BIND to worker %u: %s\n", w->idx, strerror(-rc));
-		au->worker = NULL;
-		return;
-	}
-	au->bind_sent = true;
-	LOGU(au, LOGL_INFO, "USER_BIND sent to worker %u (user_ref %u, seq %u)\n", w->idx, au->user_ref, seq);
-}
-
-static void users_try_bind_all(struct aworker_pool *pool)
-{
-	struct aworker_user *au;
-
-	llist_for_each_entry(au, &pool->users, entry)
-		user_try_bind(au);
-}
-
-/* Every user that was bound in, or waiting for, this worker loses it. */
-static void users_lose_worker(struct aworker *w)
-{
-	struct aworker_user *au;
-
-	llist_for_each_entry(au, &w->pool->users, entry) {
-		if (au->worker == w)
-			user_set_unavailable(au);
-	}
+	return g_pool;
 }
 
 /***********************************************************************
@@ -554,7 +549,7 @@ static void worker_fail(struct aworker *w, enum aworker_fail_reason reason, cons
 	osmo_strlcpy(w->fail_detail, detail, sizeof(w->fail_detail));
 	w->failed_at = time(NULL);
 	osmo_timer_del(&w->restart_timer);
-	LOGP(DAWORKER, LOGL_ERROR, "aworker %u (pid %ld): FAILED (%s): %s. It is not restarted; osmo-bsc and the"
+	LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u (pid %ld): FAILED (%s): %s. It is not restarted; osmo-bsc and the"
 	     " other workers continue. Fix the cause, then 'a-worker-pool reset worker %u'.\n", w->idx,
 	     (long)w->last_pid, aworker_fail_reason_name(reason), w->fail_detail, w->idx);
 }
@@ -642,7 +637,7 @@ static void worker_schedule_restart(struct aworker *w)
 	osmo_clock_gettime(CLOCK_MONOTONIC, &w->restart_at[w->num_restart_at++]);
 
 	if (w->stable_at_loss && w->backoff_step) {
-		LOGP(DAWORKER, LOGL_NOTICE, "aworker %u: it was READY for at least stable-time (%u s) before it was"
+		LOGP(aworker_log_cat, LOGL_NOTICE, "aworker %u: it was READY for at least stable-time (%u s) before it was"
 		     " lost: the restart delay starts over at restart-delay\n", w->idx, pool->cfg.stable_time);
 		w->backoff_step = 0;
 	}
@@ -650,7 +645,7 @@ static void worker_schedule_restart(struct aworker *w)
 	w->restart_delay_s = restart_delay_for(&pool->cfg, w->backoff_step);
 	if (w->backoff_step < 32)
 		w->backoff_step++;
-	LOGP(DAWORKER, LOGL_ERROR, "aworker %u (pid %ld): worker lost (%s); restarting in %u s (unplanned restart"
+	LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u (pid %ld): worker lost (%s); restarting in %u s (unplanned restart"
 	     " %u in a row)\n", w->idx, (long)w->last_pid, w->lost_reason, w->restart_delay_s, w->backoff_step);
 	w->state = AWORKER_ST_RESTARTING;
 	osmo_timer_schedule(&w->restart_timer, w->restart_delay_s, 0);
@@ -693,14 +688,14 @@ static void worker_apply_policy(struct aworker *w, bool config_error)
 			worker_fail(w, fail, detail);
 			return;
 		}
-		LOGP(DAWORKER, LOGL_ERROR, "aworker %u: worker lost (%s)\n", w->idx, why);
+		LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u: worker lost (%s)\n", w->idx, why);
 		return;
 	}
 
 	switch (pool->cfg.on_failure) {
 	case AWORKER_FAILURE_SHUTDOWN:
 		/* The explicit opt-in: any worker failure ends osmo-bsc, including one restarting cannot fix. */
-		LOGP(DAWORKER, LOGL_FATAL, "aworker %u (pid %ld): worker lost (%s) and 'on-worker-failure"
+		LOGP(aworker_log_cat, LOGL_FATAL, "aworker %u (pid %ld): worker lost (%s) and 'on-worker-failure"
 		     " shutdown' is configured; shutting down osmo-bsc\n", w->idx, pid,
 		     fail != AWORKER_FAIL_NONE ? detail : why);
 		g_fatal = true;
@@ -860,7 +855,8 @@ static void worker_lost(struct aworker *w, const char *why)
 
 	/* No SCCP operation is ever replayed: whatever was in flight towards this worker is treated as lost, and
 	 * every SCCP connection of its cs7 instances is torn down by the users' 'unavailable' call-back. */
-	users_lose_worker(w);
+	if (g_user_hooks)
+		g_user_hooks->worker_lost(w);
 
 	if (w->pid > 0) {
 		w->last_pid = w->pid;
@@ -980,77 +976,30 @@ static void handle_cs7_info(struct aworker *w, const struct aworker_ipc_msg *m)
 		     e->cs7_id, e->primary_pc, osmo_ss7_asp_protocol_name(e->asp_proto), e->num_as);
 	}
 
-	users_try_bind_all(pool);
+	if (g_user_hooks)
+		g_user_hooks->worker_ready(pool);
 }
 
-static void handle_bind_result(struct aworker *w, const struct aworker_ipc_msg *m)
-{
-	struct aworker_user *au = user_by_ref(w, m->user_ref);
 
-	if (!au) {
+/* A message for an SCCP user. Without a user side there are no users, so every user_ref is unknown: the same
+ * messages and actions as the user side's handlers for an unknown user_ref. */
+static void user_msg_rx(struct aworker *w, const struct aworker_ipc_msg *m)
+{
+	if (g_user_hooks) {
+		g_user_hooks->rx(w, m);
+		return;
+	}
+	switch (m->type) {
+	case AWORKER_IPC_MT_USER_BIND_RESULT:
 		LOGW(w, LOGL_NOTICE, "USER_BIND_RESULT for unknown user_ref %u, ignoring\n", m->user_ref);
 		return;
-	}
-	if (m->u.bind_result != AWORKER_IPC_BIND_OK) {
-		LOGU(au, LOGL_ERROR, "worker %u refused USER_BIND: result %u\n", w->idx, m->u.bind_result);
-		/* Leave bind_sent set: the worker told us this cs7/ssn combination does not work, so do not spin
-		 * on it. It is retried when the worker is restarted. */
-		au->bound = false;
-		return;
-	}
-	if (au->bound) {
-		LOGU(au, LOGL_NOTICE, "duplicate USER_BIND_RESULT, ignoring\n");
-		return;
-	}
-	au->bound = true;
-	LOGU(au, LOGL_NOTICE, "bound in worker %u\n", w->idx);
-	if (au->ops && au->ops->available)
-		au->ops->available(au->user);
-}
-
-static void handle_scu_up(struct aworker *w, const struct aworker_ipc_msg *m)
-{
-	struct aworker_user *au = user_by_ref(w, m->user_ref);
-	struct osmo_scu_prim *prim;
-	struct msgb *upmsg;
-
-	if (!au) {
-		/* Can legitimately race an unbind, or be a record of a user we gave up on. */
+	case AWORKER_IPC_MT_SCU_UP:
 		LOGW(w, LOGL_NOTICE, "SCU_UP for unknown user_ref %u, dropping\n", m->user_ref);
 		return;
-	}
-	if (!au->bound) {
-		LOGU(au, LOGL_NOTICE, "SCU_UP before USER_BIND_RESULT, dropping\n");
-		return;
-	}
-	upmsg = aworker_ipc_build_scu_prim(au->pool->ctx, m);
-	if (!upmsg) {
-		LOGU(au, LOGL_ERROR, "cannot allocate SCCP primitive, dropping SCU_UP\n");
-		return;
-	}
-	prim = (struct osmo_scu_prim *)msgb_data(upmsg);
-	/* Same contract as the in-process backend: the up-call owns the msgb. */
-	au->user->prim_cb(au->user, &prim->oph);
-}
-
-static void handle_tx_failed(struct aworker *w, const struct aworker_ipc_msg *m)
-{
-	const struct aworker_ipc_tx_failed *f = &m->u.tx_failed;
-	struct aworker_user *au = user_by_ref(w, m->user_ref);
-
-	if (!au) {
+	default:
 		LOGW(w, LOGL_NOTICE, "TX_FAILED for unknown user_ref %u, ignoring\n", m->user_ref);
 		return;
 	}
-	LOGU(au, f->disposition == AWORKER_IPC_TXF_NOT_EXECUTED ? LOGL_ERROR : LOGL_FATAL,
-	     "worker %u could not send %s (seq %u, conn_id %u): %s, code %u, lib_rc %d%s\n",
-	     w->idx, aworker_ipc_msg_type_name(f->ref_type), f->ref_seq, f->conn_id,
-	     f->disposition == AWORKER_IPC_TXF_NOT_EXECUTED ? "not executed" : "executed with an error",
-	     f->code, f->lib_rc,
-	     f->disposition == AWORKER_IPC_TXF_NOT_EXECUTED ? "" :
-	     " -- the operation may or may not have reached the network and is NOT retried");
-	if (au->ops && au->ops->tx_failed)
-		au->ops->tx_failed(au->user, f);
 }
 
 static void link_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m)
@@ -1062,13 +1011,9 @@ static void link_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_m
 		handle_cs7_info(w, m);
 		return;
 	case AWORKER_IPC_MT_USER_BIND_RESULT:
-		handle_bind_result(w, m);
-		return;
 	case AWORKER_IPC_MT_SCU_UP:
-		handle_scu_up(w, m);
-		return;
 	case AWORKER_IPC_MT_TX_FAILED:
-		handle_tx_failed(w, m);
+		user_msg_rx(w, m);
 		return;
 	case AWORKER_IPC_MT_GOODBYE:
 		LOGW(w, LOGL_NOTICE, "worker says GOODBYE (reason %u)\n", m->u.goodbye_reason);
@@ -1111,7 +1056,7 @@ static int link_create(struct aworker *w, int fd)
 		.worker_idx = w->idx,
 		.pid = (uint32_t)getpid(),
 		.ident = "osmo-bsc",
-		.log_cat = DAWORKER,
+		.log_cat = aworker_log_cat,
 	};
 	int rc;
 
@@ -1216,7 +1161,7 @@ void aworker_pool_set_exec(const char *argv0, int argc, char **argv)
 		close(g_exec_fd);
 	g_exec_fd = fd_above_stdio(open("/proc/self/exe", O_RDONLY | O_CLOEXEC), true);
 	if (g_exec_fd < 0)
-		LOGP(DAWORKER, LOGL_NOTICE, "cannot open /proc/self/exe (%s): workers will be started from the path '%s',"
+		LOGP(aworker_log_cat, LOGL_NOTICE, "cannot open /proc/self/exe (%s): workers will be started from the path '%s',"
 		     " so replacing that file while osmo-bsc runs would make a restarted worker a different binary\n",
 		     strerror(errno), g_exec_path);
 
@@ -1410,14 +1355,14 @@ static int worker_spawn(struct aworker *w)
 
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sp) < 0) {
 		rc = -errno;
-		LOGP(DAWORKER, LOGL_ERROR, "aworker %u: socketpair() failed: %s\n", w->idx, strerror(-rc));
+		LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u: socketpair() failed: %s\n", w->idx, strerror(-rc));
 		return rc;
 	}
 
 	pid = fork();
 	if (pid < 0) {
 		rc = -errno;
-		LOGP(DAWORKER, LOGL_ERROR, "aworker %u: fork() failed: %s\n", w->idx, strerror(-rc));
+		LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u: fork() failed: %s\n", w->idx, strerror(-rc));
 		close(sp[0]);
 		close(sp[1]);
 		return rc;
@@ -1449,17 +1394,11 @@ static int worker_spawn(struct aworker *w)
 static void startup_timer_cb(void *data)
 {
 	struct aworker_pool *pool = data;
-	struct aworker_user *au;
 
 	/* Only a diagnostic, once, startup-timeout after the pool started. The workers themselves time out per start
 	 * (start_timer_cb()). */
-	llist_for_each_entry(au, &pool->users, entry) {
-		if (au->bound)
-			continue;
-		LOGU(au, LOGL_ERROR, "still not bound %u s after start: no worker owns cs7 instance %u."
-		     " Check that exactly one worker config file configures an 'asp' on it.\n",
-		     pool->cfg.startup_timeout, au->cs7_id);
-	}
+	if (g_user_hooks)
+		g_user_hooks->startup_report(pool);
 }
 
 static struct aworker_pool *pool_alloc(void *ctx, unsigned int num)
@@ -1513,8 +1452,11 @@ static void ownership_log(const struct aworker_pool *pool)
 
 	for (id = 0; id < AWORKER_POOL_MAX_CS7_ID; id++) {
 		int w = pool->own.owner[id];
-		if (w >= 0)
-			LOGP(DAWORKER, LOGL_INFO, "cs7 instance %u is expected to be owned by worker %d ('%s', line"
+		if (w >= 0 && pool->cfg.has_cs7_instance[w])
+			LOGP(aworker_log_cat, LOGL_INFO, "cs7 instance %u is expected to be owned by worker %d ('worker %d"
+			     " cs7-instance %u')\n", id, w, w, id);
+		else if (w >= 0)
+			LOGP(aworker_log_cat, LOGL_INFO, "cs7 instance %u is expected to be owned by worker %d ('%s', line"
 			     " %u)\n", id, w, pool->cfg.cfg_file[w], pool->own.lineno[id]);
 	}
 }
@@ -1537,8 +1479,17 @@ int aworker_pool_start(void *ctx)
 		return 0;
 
 	for (i = 0; i < g_cfg.num_workers; i++) {
+		if (!g_cfg.cfg_file[i] && g_cfg.has_cs7_instance[i]) {
+			/* Parsed and checked, but a worker cannot be started from the inline form yet: its worker
+			 * reads a config file of its own. */
+			LOGP(aworker_log_cat, LOGL_FATAL,
+			     "'a-worker-pool': worker %u uses the inline form ('worker %u cs7-instance %u'), from which"
+			     " this osmo-bsc cannot start workers yet. Use 'worker %u config-file FILE'.\n", i, i,
+			     g_cfg.cs7_instance[i], i);
+			return -EINVAL;
+		}
 		if (!g_cfg.cfg_file[i]) {
-			LOGP(DAWORKER, LOGL_FATAL,
+			LOGP(aworker_log_cat, LOGL_FATAL,
 			     "'a-worker-pool': 'workers %u' is configured but worker %u has no config file."
 			     " Add 'worker %u config-file FILE'.\n", g_cfg.num_workers, i, i);
 			return -EINVAL;
@@ -1566,7 +1517,7 @@ int aworker_pool_start(void *ctx)
 		}
 	}
 
-	LOGP(DAWORKER, LOGL_NOTICE, "A-worker pool started: %u worker(s), on-worker-failure %s,"
+	LOGP(aworker_log_cat, LOGL_NOTICE, "A-worker pool started: %u worker(s), on-worker-failure %s,"
 	     " startup-timeout %u s, restart-delay %u s (max %u s), stable-time %u s, max-restarts %u window %u s\n",
 	     pool->num, get_value_string(aworker_failure_policy_names, pool->cfg.on_failure),
 	     pool->cfg.startup_timeout, pool->cfg.restart_delay,
@@ -1721,7 +1672,6 @@ static void stop_processes(struct aworker_pool *pool)
 void aworker_pool_stop(void)
 {
 	struct aworker_pool *pool = g_pool;
-	struct aworker_user *au;
 	bool goodbye_delivered = false;
 	unsigned int i;
 
@@ -1773,14 +1723,8 @@ void aworker_pool_stop(void)
 	stop_processes(pool);
 
 	/* The users outlive the pool (they are owned by the A interface code), so detach them explicitly. */
-	while (!llist_empty(&pool->users)) {
-		au = llist_first_entry(&pool->users, struct aworker_user, entry);
-		llist_del(&au->entry);
-		au->pool = NULL;
-		au->worker = NULL;
-		au->bind_sent = false;
-		au->bound = false;
-	}
+	if (g_user_hooks)
+		g_user_hooks->pool_stopped(pool);
 
 	g_pool = NULL;
 	talloc_free(pool);
@@ -1885,276 +1829,11 @@ bool aworker_pool_cs7_info(uint32_t cs7_id, struct aworker_ipc_cs7_entry *out)
 }
 
 /***********************************************************************
- * SCCP User backend: main process -> worker
- ***********************************************************************/
-
-/* Common tail of all transmit operations: hand the record to the link. */
-static int user_send(struct aworker_user *au, struct msgb *rec, uint8_t type, uint32_t conn_id)
-{
-	uint32_t seq = 0;
-	int rc;
-
-	rc = aworker_ipc_link_send(au->worker->link, rec, &seq);
-	if (rc < 0) {
-		LOGU(au, LOGL_ERROR, "cannot send %s (conn_id %u) to worker %u: %s\n",
-		     aworker_ipc_msg_type_name(type), conn_id, au->worker->idx, strerror(-rc));
-		return rc;
-	}
-	LOGU(au, LOGL_DEBUG, "sent %s (conn_id %u, seq %u) to worker %u\n", aworker_ipc_msg_type_name(type),
-	     conn_id, seq, au->worker->idx);
-	return 0;
-}
-
-/* NULL if this user cannot currently transmit. */
-static struct aworker_user *tx_user(struct bsc_sccp_user *user)
-{
-	struct aworker_user *au = user->worker_priv;
-
-	if (!au || !au->bound || !au->worker || !au->worker->link)
-		return NULL;
-	if (aworker_ipc_link_get_state(au->worker->link) != AWORKER_IPC_LINK_READY)
-		return NULL;
-	return au;
-}
-
-/* The SCCP operations are bounded by what the pinned libosmo-sigtran transmit path can encode; see
- * aworker_ipc_sccp_max_data(). Checking here keeps the error synchronous (the caller sees -EMSGSIZE and frees
- * nothing twice); the worker checks again before it calls the library. */
-static int check_len(struct aworker_user *au, uint8_t type, unsigned int len)
-{
-	int rc = aworker_ipc_sccp_check_data(type, len);
-
-	if (rc < 0)
-		LOGU(au, LOGL_ERROR, "%s: %u octets of user data exceed the %d the A interface supports\n",
-		     aworker_ipc_msg_type_name(type), len, aworker_ipc_sccp_max_data(type));
-	return rc;
-}
-
-static int w_tx_unitdata_msg(struct bsc_sccp_user *user,
-			     const struct osmo_sccp_addr *calling_addr,
-			     const struct osmo_sccp_addr *called_addr,
-			     struct msgb *msg)
-{
-	struct aworker_user *au = tx_user(user);
-	struct msgb *rec;
-	int rc;
-
-	if (!au) {
-		msgb_free(msg);
-		return -ENOTCONN;
-	}
-	if ((rc = check_len(au, AWORKER_IPC_MT_TX_UNITDATA, msgb_length(msg))) < 0) {
-		msgb_free(msg);
-		return rc;
-	}
-	/* The encoder always takes ownership of msg, like osmo_sccp_tx_unitdata_msg(). */
-	rc = aworker_ipc_enc_tx_unitdata(au->pool->ctx, &rec, au->user_ref, calling_addr, called_addr, msg);
-	if (rc < 0) {
-		LOGU(au, LOGL_ERROR, "cannot encode TX_UNITDATA: %s\n", strerror(-rc));
-		return rc;
-	}
-	return user_send(au, rec, AWORKER_IPC_MT_TX_UNITDATA, AWORKER_IPC_CONN_ID_NONE);
-}
-
-static int w_tx_conn_req_msg(struct bsc_sccp_user *user, uint32_t conn_id,
-			     const struct osmo_sccp_addr *calling_addr,
-			     const struct osmo_sccp_addr *called_addr,
-			     struct msgb *msg)
-{
-	struct aworker_user *au = tx_user(user);
-	struct msgb *rec;
-	int rc;
-
-	if (!au) {
-		msgb_free(msg);
-		return -ENOTCONN;
-	}
-	if ((rc = check_len(au, AWORKER_IPC_MT_TX_CONN_REQ, msgb_length(msg))) < 0) {
-		msgb_free(msg);
-		return rc;
-	}
-	rc = aworker_ipc_enc_tx_conn_req(au->pool->ctx, &rec, au->user_ref, conn_id, calling_addr, called_addr,
-					 msg);
-	if (rc < 0) {
-		LOGU(au, LOGL_ERROR, "cannot encode TX_CONN_REQ (conn_id %u): %s\n", conn_id, strerror(-rc));
-		return rc;
-	}
-	return user_send(au, rec, AWORKER_IPC_MT_TX_CONN_REQ, conn_id);
-}
-
-static int w_tx_conn_resp(struct bsc_sccp_user *user, uint32_t conn_id,
-			  const struct osmo_sccp_addr *resp_addr,
-			  const uint8_t *data, unsigned int len)
-{
-	struct aworker_user *au = tx_user(user);
-	struct msgb *rec;
-	int rc;
-
-	if (!au)
-		return -ENOTCONN;
-	if ((rc = check_len(au, AWORKER_IPC_MT_TX_CONN_RESP, len)) < 0)
-		return rc;
-	rc = aworker_ipc_enc_tx_conn_resp(au->pool->ctx, &rec, au->user_ref, conn_id, resp_addr, data, len);
-	if (rc < 0) {
-		LOGU(au, LOGL_ERROR, "cannot encode TX_CONN_RESP (conn_id %u): %s\n", conn_id, strerror(-rc));
-		return rc;
-	}
-	return user_send(au, rec, AWORKER_IPC_MT_TX_CONN_RESP, conn_id);
-}
-
-static int w_tx_data_msg(struct bsc_sccp_user *user, uint32_t conn_id, struct msgb *msg)
-{
-	struct aworker_user *au = tx_user(user);
-	struct msgb *rec;
-	int rc;
-
-	if (!au) {
-		msgb_free(msg);
-		return -ENOTCONN;
-	}
-	if ((rc = check_len(au, AWORKER_IPC_MT_TX_DATA, msgb_length(msg))) < 0) {
-		msgb_free(msg);
-		return rc;
-	}
-	rc = aworker_ipc_enc_tx_data(au->pool->ctx, &rec, au->user_ref, conn_id, msg);
-	if (rc < 0) {
-		LOGU(au, LOGL_ERROR, "cannot encode TX_DATA (conn_id %u): %s\n", conn_id, strerror(-rc));
-		return rc;
-	}
-	return user_send(au, rec, AWORKER_IPC_MT_TX_DATA, conn_id);
-}
-
-static int w_tx_disconn(struct bsc_sccp_user *user, uint32_t conn_id,
-			const struct osmo_sccp_addr *resp_addr, uint32_t cause)
-{
-	struct aworker_user *au = tx_user(user);
-	struct msgb *rec;
-	int rc;
-
-	if (!au)
-		return -ENOTCONN;
-	rc = aworker_ipc_enc_tx_disconn(au->pool->ctx, &rec, au->user_ref, conn_id, resp_addr, cause);
-	if (rc < 0) {
-		LOGU(au, LOGL_ERROR, "cannot encode TX_DISCONN (conn_id %u): %s\n", conn_id, strerror(-rc));
-		return rc;
-	}
-	return user_send(au, rec, AWORKER_IPC_MT_TX_DISCONN, conn_id);
-}
-
-const struct bsc_sccp_backend_ops bsc_sccp_backend_worker_ops = {
-	.name = "worker",
-	.tx_unitdata_msg = w_tx_unitdata_msg,
-	.tx_conn_req_msg = w_tx_conn_req_msg,
-	.tx_conn_resp = w_tx_conn_resp,
-	.tx_data_msg = w_tx_data_msg,
-	.tx_disconn = w_tx_disconn,
-};
-
-/***********************************************************************
- * SCCP User binding
- ***********************************************************************/
-
-struct bsc_sccp_user *aworker_sccp_user_bind(void *ctx, struct osmo_ss7_instance *ss7,
-					     struct bsc_sccp_inst *bsc_sccp, const char *name,
-					     bsc_sccp_user_prim_cb prim_cb, uint16_t ssn,
-					     const struct aworker_sccp_user_ops *ops)
-{
-	struct bsc_sccp_user *user;
-	struct aworker_user *au;
-	uint32_t cs7_id;
-
-	OSMO_ASSERT(ss7);
-	OSMO_ASSERT(bsc_sccp);
-	OSMO_ASSERT(prim_cb);
-	OSMO_ASSERT(name && *name && strlen(name) <= AWORKER_IPC_MAX_USER_NAME);
-
-	if (!g_pool) {
-		LOGP(DAWORKER, LOGL_ERROR, "cannot bind SCCP user '%s': the A-worker pool is not running\n", name);
-		return NULL;
-	}
-	cs7_id = osmo_ss7_instance_get_id(ss7);
-	if (user_by_cs7_ssn(g_pool, cs7_id, ssn)) {
-		LOGP(DAWORKER, LOGL_ERROR, "cannot bind SCCP user '%s': cs7 instance %u SSN %u is already bound\n",
-		     name, cs7_id, ssn);
-		return NULL;
-	}
-
-	user = talloc_zero(ctx, struct bsc_sccp_user);
-	if (!user)
-		return NULL;
-	au = talloc_zero(user, struct aworker_user);
-	if (!au) {
-		talloc_free(user);
-		return NULL;
-	}
-
-	au->pool = g_pool;
-	au->cs7_id = cs7_id;
-	au->ssn = ssn;
-	OSMO_STRLCPY_ARRAY(au->name, name);
-	au->ops = ops;
-	au->user = user;
-
-	*user = (struct bsc_sccp_user){
-		.ops = &bsc_sccp_backend_worker_ops,
-		.prim_cb = prim_cb,
-		.ss7 = ss7,
-		.bsc_sccp = bsc_sccp,
-		.worker_priv = au,
-	};
-
-	llist_add_tail(&au->entry, &g_pool->users);
-	LOGU(au, LOGL_NOTICE, "SCCP user registered for the A-worker pool\n");
-	user_try_bind(au);
-	return user;
-}
-
-struct bsc_sccp_user *aworker_sccp_user_find(uint32_t cs7_id, uint16_t ssn)
-{
-	struct aworker_user *au;
-
-	if (!g_pool)
-		return NULL;
-	au = user_by_cs7_ssn(g_pool, cs7_id, ssn);
-	return au ? au->user : NULL;
-}
-
-void aworker_sccp_user_unbind(struct bsc_sccp_user *user)
-{
-	struct aworker_user *au;
-
-	if (!user)
-		return;
-	au = user->worker_priv;
-	if (au) {
-		if (au->bind_sent && au->worker && au->worker->link) {
-			struct msgb *rec;
-			if (aworker_ipc_enc_user_unbind(au->pool->ctx, &rec, au->user_ref) == 0)
-				aworker_ipc_link_send(au->worker->link, rec, NULL);
-		}
-		if (au->pool)
-			llist_del(&au->entry);
-	}
-	talloc_free(user);
-}
-
-bool aworker_sccp_user_ready(const struct bsc_sccp_user *user)
-{
-	const struct aworker_user *au;
-
-	if (!user || user->ops != &bsc_sccp_backend_worker_ops)
-		return false;
-	au = user->worker_priv;
-	return au && au->bound;
-}
-
-/***********************************************************************
  * Diagnostics
  ***********************************************************************/
 
 void aworker_pool_dump_vty(struct vty *vty)
 {
-	struct aworker_user *au;
 	unsigned int i, j;
 
 	if (!aworker_pool_enabled()) {
@@ -2230,8 +1909,6 @@ void aworker_pool_dump_vty(struct vty *vty)
 			VTY_NEWLINE);
 	}
 
-	llist_for_each_entry(au, &g_pool->users, entry) {
-		vty_out(vty, " SCCP user '%s': cs7 instance %u, SSN %u, %s%s", au->name, au->cs7_id, au->ssn,
-			au->bound ? "bound" : (au->bind_sent ? "bind pending" : "no worker"), VTY_NEWLINE);
-	}
+	if (g_user_hooks)
+		g_user_hooks->dump(vty, g_pool);
 }

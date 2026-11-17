@@ -1,0 +1,83 @@
+W: snapshot mode, the real aworker_run() in a child, really parsed
+  worker 1's view, sealed snapshot (worker 1):
+    child: view check: 0 problem(s)
+    child: parse started; snapshot descriptor closed then
+    child: parse result 0; afterwards: cs7 instances 1, listening sockets 1
+    child: exit: parses 1; snapshot descriptor closed; cs7 instances 1; listening sockets 1
+    main process: CS7_INFO with 1 cs7 instance(s), the first 1
+    exit code 0
+  worker 1's view in a memfd without seals (worker 1):
+    child: exit: parses 0; snapshot descriptor closed; cs7 instances 0; listening sockets 0
+    main process: no CS7_INFO
+    exit code 66
+  a descriptor that is not open (worker 1):
+    child: exit: parses 0; snapshot descriptor closed; cs7 instances 0; listening sockets 0
+    main process: no CS7_INFO
+    exit code 66
+  worker 1's view, given to worker 0 (worker 0):
+    child: view check: 2 problem(s)
+    child: exit: parses 0; snapshot descriptor closed; cs7 instances 0; listening sockets 0
+    main process: no CS7_INFO
+    exit code 66
+  the same with the view check bypassed (test only): one cs7 instance, but not the declared one (worker 0):
+    child: view check: 2 problem(s), ignored (test bypass)
+    child: parse started; snapshot descriptor closed then
+    child: parse result 0; afterwards: cs7 instances 1, listening sockets 1
+    child: exit: parses 1; snapshot descriptor closed; cs7 instances 1; listening sockets 1
+    main process: no CS7_INFO
+    exit code 66
+  worker 0's view with worker 1's cs7 instance (its listen and asp nodes) added (worker 0):
+    child: view check: 1 problem(s)
+    child: exit: parses 0; snapshot descriptor closed; cs7 instances 0; listening sockets 0
+    main process: no CS7_INFO
+    exit code 66
+  the same with the view check bypassed (test only): the check after the parse refuses it (worker 0):
+    child: view check: 1 problem(s), ignored (test bypass)
+    child: parse started; snapshot descriptor closed then
+    child: parse result 0; afterwards: cs7 instances 2, listening sockets 1
+    child: exit: parses 1; snapshot descriptor closed; cs7 instances 2; listening sockets 1
+    main process: no CS7_INFO
+    exit code 66
+  worker 1's view with its cs7 instance in a second section, view check bypassed (test only) (worker 1):
+    child: view check: 1 problem(s), ignored (test bypass)
+    child: parse started; snapshot descriptor closed then
+    child: parse result 0; afterwards: cs7 instances 1, listening sockets 1
+    child: exit: parses 1; snapshot descriptor closed; cs7 instances 1; listening sockets 1
+    main process: no CS7_INFO
+    exit code 66
+  worker 1's view with a 'log file' (worker 1):
+    child: view check: 1 problem(s)
+    child: exit: parses 0; snapshot descriptor closed; cs7 instances 0; listening sockets 0
+    main process: no CS7_INFO
+    exit code 66
+    the log file exists: no
+  worker 1's view with an 'exit' (worker 1):
+    child: view check: 1 problem(s)
+    child: exit: parses 0; snapshot descriptor closed; cs7 instances 0; listening sockets 0
+    main process: no CS7_INFO
+    exit code 66
+  legacy config file (worker 1):
+    child: exit: parses 0; snapshot descriptor none; cs7 instances 1; listening sockets 1
+    main process: CS7_INFO with 1 cs7 instance(s), the first 1
+    exit code 0
+  legacy config file with an 'a-worker-pool' section (worker 1):
+    child: exit: parses 0; snapshot descriptor none; cs7 instances 1; listening sockets 0
+    main process: no CS7_INFO
+    exit code 66
+R-1: the osmo-bsc command line (descriptors 900 and up are not open)
+  --aworker-snapshot-fd without --aworker-fd: exit 2
+  with --aworker-config as well: exit 2
+  the same descriptor as --aworker-fd: exit 2
+  descriptor 2: exit 2
+  descriptor 0: exit 2
+  not a number: exit 2
+  without --aworker-index: exit 2
+  --aworker-index 'abc': exit 2
+  --aworker-index '+1': exit 2
+  --aworker-index 16: exit 2
+  valid options, descriptor not open: exit 66
+  legacy: --aworker-index 'abc' (not checked): exit 67
+  legacy: --aworker-fd without --aworker-config: exit 2
+  legacy: --aworker-config without --aworker-fd: exit 2
+  --help: exit 0; lists --aworker-snapshot-fd: yes
+PASSED

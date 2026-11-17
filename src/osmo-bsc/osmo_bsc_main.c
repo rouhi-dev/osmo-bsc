@@ -41,6 +41,7 @@
 #include <osmocom/bsc/lb.h>
 #include <osmocom/bsc/meas_feed.h>
 #include <osmocom/bsc/aworker.h>
+#include <osmocom/bsc/aworker_log.h>
 #include <osmocom/bsc/aworker_pool.h>
 
 #include <osmocom/ctrl/control_cmd.h>
@@ -98,7 +99,9 @@ static int daemonize = 0;
 /* Set by --aworker-*: this process is an A-worker started by an osmo-bsc main process, not a BSC. */
 static int aworker_fd = -1;
 static unsigned int aworker_index;
+static const char *aworker_index_arg = NULL;	/* as given, for the strict check of snapshot mode */
 static const char *aworker_config = NULL;
+static int aworker_snapshot_fd = -1;
 
 static void print_usage(void)
 {
@@ -123,6 +126,8 @@ static void print_help(void)
 	printf("     --aworker-fd N		Run as an A-worker on this IPC socket.\n");
 	printf("     --aworker-index N		Index of this worker in the pool.\n");
 	printf("     --aworker-config file	Config file of this worker (cs7 instances only).\n");
+	printf("     --aworker-snapshot-fd N	Configuration snapshot of this worker (inline form), instead of\n"
+	       "				--aworker-config.\n");
 
 	printf("\nVTY reference generation:\n");
 	printf("     --vty-ref-mode MODE	VTY reference generation mode (e.g. 'expert').\n");
@@ -162,10 +167,23 @@ static void handle_long_options(const char *prog_name, const int long_option)
 	}
 	case 4:
 		aworker_index = atoi(optarg);
+		aworker_index_arg = optarg;
 		break;
 	case 5:
 		aworker_config = optarg;
 		break;
+	case 6: {
+		char *end = NULL;
+		long fd = strtol(optarg, &end, 10);
+		/* 0, 1 and 2 are the standard streams; the main process always passes a descriptor above them. */
+		if (!end || *end || !*optarg || fd < 3 || fd > INT_MAX) {
+			fprintf(stderr, "%s: --aworker-snapshot-fd needs a file descriptor above 2, not '%s'\n",
+				prog_name, optarg);
+			exit(2);
+		}
+		aworker_snapshot_fd = (int)fd;
+		break;
+	}
 	default:
 		fprintf(stderr, "%s: error parsing cmdline options\n", prog_name);
 		exit(2);
@@ -192,6 +210,7 @@ static void handle_options(int argc, char **argv)
 			{"aworker-fd", 1, &long_option, 3},
 			{"aworker-index", 1, &long_option, 4},
 			{"aworker-config", 1, &long_option, 5},
+			{"aworker-snapshot-fd", 1, &long_option, 6},
 			{0, 0, 0, 0}
 		};
 
@@ -550,7 +569,7 @@ static int bsc_read_config(const char *config_file)
 {
 	int rc;
 
-	rc = vty_read_config_file(config_file, NULL);
+	rc = aworker_pool_read_config(config_file);
 	if (rc < 0) {
 		LOGP(DNM, LOGL_FATAL, "Failed to parse the config file: '%s' (%s)\n", config_file, strerror(-rc));
 		return rc;
@@ -687,6 +706,8 @@ static struct vty_app_info vty_info = {
 	"There is NO WARRANTY, to the extent permitted by law.\r\n",
 	.version	= PACKAGE_VERSION,
 	.go_parent_cb	= bsc_vty_go_parent,
+	/* Refuses every 'write' of the configuration if osmo-bsc.cfg was parsed as a view (inline A-worker form). */
+	.config_is_consistent = aworker_pool_vty_config_is_consistent,
 	.usr_attr_desc	= {
 		[BSC_VTY_ATTR_RESTART_ABIS_OML_LINK] = \
 			"This command applies on A-bis OML link (re)establishment",
@@ -764,141 +785,6 @@ static void signal_handler(int signum)
 	}
 }
 
-static const struct log_info_cat osmo_bsc_categories[] = {
-	[DRLL] = {
-		.name = "DRLL",
-		.description = "A-bis Radio Link Layer (RLL)",
-		.color = "\033[1;31m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DMM] = {
-		.name = "DMM",
-		.description = "Layer3 Mobility Management (MM)",
-		.color = "\033[1;33m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DRR] = {
-		.name = "DRR",
-		.description = "Layer3 Radio Resource (RR)",
-		.color = "\033[1;34m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DRSL] = {
-		.name = "DRSL",
-		.description = "A-bis Radio Signalling Link (RSL)",
-		.color = "\033[1;35m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DCHAN] = {
-		.name = "DCHAN",
-		.description = "lchan FSM",
-		.color = "\033[1;32m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DTS] = {
-		.name = "DTS",
-		.description = "timeslot FSM",
-		.color = "\033[1;31m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DAS] = {
-		.name = "DAS",
-		.description = "assignment FSM",
-		.color = "\033[1;33m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DNM] =	{
-		.name = "DNM",
-		.description = "A-bis Network Management / O&M (NM/OML)",
-		.color = "\033[1;36m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DPAG]	= {
-		.name = "DPAG",
-		.description = "Paging Subsystem",
-		.color = "\033[1;38m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DMEAS] = {
-		.name = "DMEAS",
-		.description = "Radio Measurement Processing",
-		.enabled = 0, .loglevel = LOGL_NOTICE,
-	},
-	[DMSC] = {
-		.name = "DMSC",
-		.description = "Mobile Switching Center",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DHO] = {
-		.name = "DHO",
-		.description = "Hand-Over Process",
-		.color = "\033[1;38m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DHODEC] = {
-		.name = "DHODEC",
-		.description = "Hand-Over Decision",
-		.color = "\033[1;38m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DREF] = {
-		.name = "DREF",
-		.description = "Reference Counting",
-		.enabled = 0, .loglevel = LOGL_NOTICE,
-	},
-	[DCTRL] = {
-		.name = "DCTRL",
-		.description = "Control interface",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DFILTER] = {
-		.name = "DFILTER",
-		.description = "BSC/NAT IMSI based filtering",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DPCU] = {
-		.name = "DPCU",
-		.description = "PCU Interface",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DLCLS] = {
-		.name = "DLCLS",
-		.description = "Local Call, Local Switch",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DCBS] = {
-		.name = "DCBS",
-		.description = "Cell Broadcast System",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DLCS] = {
-		.name = "DLCS",
-		.description = "Location Services",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DASCI] = {
-		.name = "DASCI",
-		.description = "Advanced Speech Call Items (VGCS/VBS)",
-		.color = "\033[1;38m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DRESET] = {
-		.name = "DRESET",
-		.description = "RESET/ACK on A and Lb interfaces",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DLOOP] = {
-		.name = "DLOOP",
-		.description = "Control loops",
-		.color = "\033[0;34m",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-	[DAWORKER] = {
-		.name = "DAWORKER",
-		.description = "A-interface worker pool (SIGTRAN worker processes and their IPC)",
-		.enabled = 1, .loglevel = LOGL_NOTICE,
-	},
-};
 
 static int filter_fn(const struct log_context *ctx, struct log_target *tar)
 {
@@ -1012,19 +898,47 @@ int main(int argc, char **argv)
 	OSMO_ASSERT(osmo_ss7_init() == 0);
 	osmo_ss7_vty_init_asp(tall_bsc_ctx);
 	osmo_sccp_vty_init();
-	aworker_pool_vty_init();
+	aworker_pool_vty_init(tall_bsc_ctx);
 
 	/* parse options */
 	handle_options(argc, argv);
 
 	/* An A-worker shares nothing with the main process: it reads its own config file (cs7 instances only),
 	 * owns their SIGTRAN stacks and does not open any of the BSC's own sockets. This never returns. */
+	if (aworker_snapshot_fd >= 0) {
+		/* Snapshot mode (inline form, D-6): its own, strict combination rules; the legacy ones below are
+		 * unchanged. */
+		char *end = NULL;
+		long idx;
+
+		if (aworker_fd < 0) {
+			fprintf(stderr, "--aworker-snapshot-fd requires --aworker-fd\n");
+			exit(2);
+		}
+		if (aworker_config) {
+			fprintf(stderr, "--aworker-snapshot-fd and --aworker-config cannot be combined\n");
+			exit(2);
+		}
+		if (aworker_snapshot_fd == aworker_fd) {
+			fprintf(stderr, "--aworker-snapshot-fd must differ from --aworker-fd (%d)\n", aworker_fd);
+			exit(2);
+		}
+		/* Digits only: no sign, no blanks. */
+		idx = aworker_index_arg && *aworker_index_arg >= '0' && *aworker_index_arg <= '9'
+		      ? strtol(aworker_index_arg, &end, 10) : -1;
+		if (!aworker_index_arg || !end || *end || idx < 0 || idx >= AWORKER_POOL_MAX_WORKERS) {
+			fprintf(stderr, "--aworker-snapshot-fd requires --aworker-index with a worker index from 0 to %d\n",
+				AWORKER_POOL_MAX_WORKERS - 1);
+			exit(2);
+		}
+		aworker_run(tall_bsc_ctx, aworker_fd, (unsigned int)idx, NULL, aworker_snapshot_fd);
+	}
 	if (aworker_fd >= 0) {
 		if (!aworker_config) {
 			fprintf(stderr, "--aworker-fd requires --aworker-config\n");
 			exit(2);
 		}
-		aworker_run(aworker_fd, aworker_index, aworker_config);
+		aworker_run(tall_bsc_ctx, aworker_fd, aworker_index, aworker_config, -1);
 	}
 	if (aworker_config) {
 		fprintf(stderr, "--aworker-config requires --aworker-fd\n");

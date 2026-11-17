@@ -1,0 +1,176 @@
+S-1: a snapshot is a sealed memfd
+  create (worker 3): ok
+  descriptor above 2: yes; close-on-exec: yes; name: /memfd:bsc-aworker-3 (deleted)
+  seals shrink, grow, write, seal: all four
+  regular file: yes; link count: 0; size: the view's; contents: the view
+  verify: ok
+  write protection:
+    write(): EPERM
+    pwrite() at offset 0: EPERM
+    pwrite() past the end: EPERM
+    ftruncate() shorter: EPERM
+    ftruncate() longer: EPERM
+    fallocate() past the end: EPERM
+    fallocate(PUNCH_HOLE): EPERM
+    adding a seal (seals cannot be removed; F_SEAL_SEAL forbids any change): EPERM
+    mmap(PROT_WRITE, MAP_SHARED): EPERM
+    reopened read-write through /proc/self/fd/N: opened
+      write() on it: EPERM
+  contents afterwards: unchanged
+  verify with the parent's copy changed: -ESTALE
+  verify with another size: -ESTALE
+  verify with a seal missing: -EPERM
+S-2: memfd flags, the EINVAL-only retry, never fewer seals
+  first try: ok; memfd_create() calls: 1 (with NOEXEC_SEAL); seals: all four; noexec: yes
+  flags of the first try: CLOEXEC yes, ALLOW_SEALING yes, NOEXEC_SEAL yes
+  NOEXEC_SEAL refused with EINVAL: ok; memfd_create() calls: 2 (with NOEXEC_SEAL, without NOEXEC_SEAL); seals: all four; noexec: no
+  EINVAL twice: -EINVAL; memfd_create() calls: 2 (with NOEXEC_SEAL, without NOEXEC_SEAL)
+  EMFILE (no retry): -EMFILE; memfd_create() calls: 1 (with NOEXEC_SEAL)
+  ENOSYS (no retry; every fallback directory refused here): -ENOSYS; memfd_create() calls: 1 (with NOEXEC_SEAL)
+  F_ADD_SEALS fails: -EPERM; memfd_create() calls: 1 (with NOEXEC_SEAL)
+  F_SEAL_SHRINK missing afterwards: -EPERM; memfd_create() calls: 1 (with NOEXEC_SEAL)
+  F_SEAL_GROW missing afterwards: -EPERM; memfd_create() calls: 1 (with NOEXEC_SEAL)
+  F_SEAL_WRITE missing afterwards: -EPERM; memfd_create() calls: 1 (with NOEXEC_SEAL)
+  F_SEAL_SEAL missing afterwards: -EPERM; memfd_create() calls: 1 (with NOEXEC_SEAL)
+  after the retry (no exec seal: yes), a worker reads it:
+    read: ok
+S-7: size limits
+  create, 0 octets: -EINVAL
+  create, AWORKER_CFG_SNAPSHOT_MAX + 1 octets: -EFBIG
+  create, AWORKER_CFG_SNAPSHOT_MAX octets: ok
+    read, AWORKER_CFG_SNAPSHOT_MAX octets: ok
+    read, AWORKER_CFG_SNAPSHOT_MAX + 1 octets (sealed elsewhere): -EFBIG
+    read, 0 octets (sealed elsewhere): -EINVAL
+S-7: what a worker accepts (S-8: the descriptor is closed afterwards, except descriptors 0, 1, 2 and the IPC socket, which are not snapshots)
+    the snapshot: ok
+    a memfd with all four seals made elsewhere: ok
+    a memfd without seals: -EPERM
+    a memfd without F_SEAL_SHRINK: -EPERM
+    a memfd without F_SEAL_GROW: -EPERM
+    a memfd without F_SEAL_WRITE: -EPERM
+    a memfd without F_SEAL_SEAL: -EPERM
+    a linked file, read-only: -EPERM
+    a linked file, writable: -EPERM
+    an unlinked file on a file system: -EPERM
+    a pipe: -EINVAL
+    a closed descriptor: -EBADF
+    a snapshot that cannot be read completely: -EIO
+    verify of a snapshot that cannot be read completely: -ESTALE
+    no descriptor (-1): -EBADF
+    descriptor 0 (left open): -EINVAL
+    descriptor 1 (left open): -EINVAL
+    descriptor 2 (left open): -EINVAL
+    the IPC socket (left open): -EINVAL
+S-9: pread() from offset 0, the file offset untouched
+    offset at the end: ok
+      file offset before: 129, after: 129
+    offset in the middle: ok
+      file offset before: 17, after: 17
+    offset at 0: ok
+      file offset before: 0, after: 0
+S-10: this environment (details on stderr)
+  checked
+S-3: the fallback's WARNING
+  sealed memfd available: fallback not used, WARNING not logged
+  no memfd, $RUNTIME_DIRECTORY usable: ok, in the test's directory 'ok'
+  WARNING, word for word as specified: yes
+S-4: the candidate directories, in order
+  $RUNTIME_DIRECTORY, /dev/shm and /tmp usable: ok, in the test's directory 'ok'
+  $RUNTIME_DIRECTORY not set: ok, in /dev/shm
+  $RUNTIME_DIRECTORY not set, /dev/shm missing: ok, in /tmp
+  $RUNTIME_DIRECTORY with two entries: the first one: ok, in the test's directory 'ok'
+  $TMPDIR usable, every candidate unusable: $TMPDIR is not used: -ENOSYS
+  $RUNTIME_DIRECTORY a symbolic link to a usable directory: -ENOSYS
+    the symbolic link refused: it is a symbolic link
+  $RUNTIME_DIRECTORY a file: -ENOSYS
+    the file refused: it is not a directory
+  $RUNTIME_DIRECTORY mode 0777, ours: ok, in the test's directory 'w777'
+  $RUNTIME_DIRECTORY mode 0770, ours: ok, in the test's directory 'w770'
+  $RUNTIME_DIRECTORY mode 1777 (sticky), ours: ok, in the test's directory 'sticky'
+  $RUNTIME_DIRECTORY mode 0700, root's, not sticky: -ENOSYS
+    root's directory that is not sticky refused: not this user's, and not a sticky directory owned by root
+  $RUNTIME_DIRECTORY mode 0777, root's, not sticky: -ENOSYS
+    root's writable directory that is not sticky refused: not this user's, and not a sticky directory owned by root
+  $RUNTIME_DIRECTORY mode 1777 (sticky), root's: ok, in the test's directory 'sticky'
+  $RUNTIME_DIRECTORY mode 1777 (sticky), another user's: -ENOSYS
+    another user's sticky directory refused: not this user's, and not a sticky directory owned by root
+  $RUNTIME_DIRECTORY mode 0777, another user's, not sticky: -ENOSYS
+    another user's writable directory refused: not this user's, and not a sticky directory owned by root
+  $RUNTIME_DIRECTORY mode 0700, another user's: -ENOSYS
+    another user's directory refused: not this user's, and not a sticky directory owned by root
+  $RUNTIME_DIRECTORY relative: -ENOSYS
+    the relative path refused: not an absolute path
+  $RUNTIME_DIRECTORY empty: -ENOSYS
+  every candidate refused: a symbolic link, a file, another user's writable directory: -ENOSYS
+    $RUNTIME_DIRECTORY refused: it is a symbolic link
+    /dev/shm refused: it is not a directory
+    /tmp refused: not this user's, and not a sticky directory owned by root
+S-5: the fallback's file
+  with O_TMPFILE:
+  made: ok, in the test's directory 'ok'
+    private directory: named bsc-aworker-snap.<12 hex digits>: yes; created with mode 0700; mode 0700 and ours when the file was made
+    file created with O_TMPFILE: yes
+    snapshot: regular file yes, links 0, mode 0400, ours, read-only descriptor yes, the file created yes
+    write() on it: EBADF; contents: the view; verify: ok
+    private directory removed: yes
+    a worker reads it: ok
+  with a name (O_TMPFILE not supported):
+  made: ok, in the test's directory 'ok'
+    private directory: named bsc-aworker-snap.<12 hex digits>: yes; created with mode 0700; mode 0700 and ours when the file was made
+    file created with a name: O_CREAT yes, O_EXCL yes, O_NOFOLLOW yes
+    snapshot: regular file yes, links 0, mode 0400, ours, read-only descriptor yes, the file created yes
+    write() on it: EBADF; contents: the view; verify: ok
+    private directory removed: yes
+    a worker reads it: ok
+  with a name (O_TMPFILE made, but no read-only descriptor of it through /proc):
+  made: ok, in the test's directory 'ok'
+    private directory: named bsc-aworker-snap.<12 hex digits>: yes; created with mode 0700; mode 0700 and ours when the file was made
+    file created with a name: O_CREAT yes, O_EXCL yes, O_NOFOLLOW yes
+    snapshot: regular file yes, links 0, mode 0400, ours, read-only descriptor yes, the file created yes
+    write() on it: EBADF; contents: the view; verify: ok
+    private directory removed: yes
+    a worker reads it: ok
+  with a name (the read-only descriptor through /proc is another file):
+  made: ok, in the test's directory 'ok'
+    another file refused: yes
+    private directory: named bsc-aworker-snap.<12 hex digits>: yes; created with mode 0700; mode 0700 and ours when the file was made
+    file created with a name: O_CREAT yes, O_EXCL yes, O_NOFOLLOW yes
+    snapshot: regular file yes, links 0, mode 0400, ours, read-only descriptor yes, the file created yes
+    write() on it: EBADF; contents: the view; verify: ok
+    private directory removed: yes
+    a worker reads it: ok
+  a private directory name already taken once:
+  made: ok, in the test's directory 'ok'
+    mkdirat() calls: 2
+  no file can be made at all (neither O_TMPFILE nor a name):
+  in the test's directory: -ENOSYS
+    private directory removed: yes
+  the named file made, but no read-only descriptor of it:
+  in the test's directory: -ENOSYS
+    its name and the private directory removed: yes
+  changed after it was made (same user, through /proc):
+  made: ok, in the test's directory 'ok'
+    made writable: verify -EPERM
+        a worker reads it: -EPERM
+    contents changed, mode 0400 again: verify -ESTALE
+  held on a read-write descriptor instead of its read-only one:
+  made: ok, in the test's directory 'ok'
+    verify: -EPERM
+  what a worker refuses that looks like the fallback's file:
+    mode 0400, read-only descriptor, but still linked: -EPERM
+    mode 0400, unlinked, but a read-write descriptor: -EPERM
+    mode 0400, unlinked, read-only descriptor, but another user's: -EPERM
+  another user's by the time it is checked:
+  made: ok, in the test's directory 'ok'
+    verify: -EPERM
+S-6: directories left over by an earlier process
+  made in a directory with left-overs: ok, in the test's directory 'left'
+    bsc-aworker-snap.left1: reported
+    bsc-aworker-snap.left2: reported
+    bsc-aworker-snap.link: not reported
+    bsc-aworker-snap.file: not reported
+    other-dir: not reported
+    left-over warnings: 2
+    all of them unchanged afterwards (inode, mode, modification time, contents): yes
+    the new private directory removed: yes
+PASSED

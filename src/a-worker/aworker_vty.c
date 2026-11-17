@@ -25,8 +25,6 @@
 #include <osmocom/vty/vty.h>
 
 #include <osmocom/bsc/aworker_pool.h>
-#include <osmocom/bsc/debug.h>
-#include <osmocom/bsc/gsm_data.h>
 #include <osmocom/bsc/vty.h>
 
 /* The pool configuration only takes effect at start-up: the workers are forked before the main process opens any
@@ -37,6 +35,9 @@
 		vty_out((vty), "%% Changes to 'a-worker-pool' take effect after restarting osmo-bsc%s", \
 			VTY_NEWLINE); \
 	} while (0)
+
+/* Parent of the strings the configuration commands store (config file names), see aworker_pool_vty_init(). */
+static void *g_vty_ctx;
 
 static struct cmd_node aworker_pool_node = {
 	AWORKER_POOL_NODE,
@@ -85,7 +86,13 @@ DEFUN_ATTR(cfg_aworker_cfg_file, cfg_aworker_cfg_file_cmd,
 		vty_out(vty, "%% Worker index must be below %u%s", AWORKER_POOL_MAX_WORKERS, VTY_NEWLINE);
 		return CMD_WARNING;
 	}
-	osmo_talloc_replace_string(tall_bsc_ctx, &cfg->cfg_file[idx], argv[1]);
+	if (cfg->has_cs7_instance[idx]) {
+		vty_out(vty, "%% Worker %u already uses the inline form 'worker %u cs7-instance %u'; a worker uses"
+			" exactly one form ('no worker %u cs7-instance' first)%s", idx, idx, cfg->cs7_instance[idx], idx,
+			VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+	osmo_talloc_replace_string(g_vty_ctx, &cfg->cfg_file[idx], argv[1]);
 	if (!cfg->cfg_file[idx])
 		return CMD_WARNING;
 	AWORKER_RESTART_NOTE(vty);
@@ -187,6 +194,61 @@ DEFUN_ATTR(cfg_aworker_on_failure, cfg_aworker_on_failure_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUN_ATTR(cfg_aworker_cs7_instance, cfg_aworker_cs7_instance_cmd,
+	   "worker <0-15> cs7-instance <0-15>",
+	   "Configure one worker of the pool\n" "Worker index\n"
+	   "The worker owns this cs7 instance of this configuration file (inline form): its asp / as / listen nodes"
+	   " are parsed by that worker only, never by the BSC\n"
+	   "cs7 instance number\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	unsigned int idx = atoi(argv[0]);
+	unsigned int cs7 = atoi(argv[1]);
+
+	if (idx >= AWORKER_POOL_MAX_WORKERS) {
+		vty_out(vty, "%% Worker index must be below %u%s", AWORKER_POOL_MAX_WORKERS, VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+	if (cfg->cfg_file[idx]) {
+		vty_out(vty, "%% Worker %u already uses 'worker %u config-file %s'; a worker uses exactly one form"
+			" ('no worker %u config-file' first)%s", idx, idx, cfg->cfg_file[idx], idx, VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+	cfg->has_cs7_instance[idx] = true;
+	cfg->cs7_instance[idx] = cs7;
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
+DEFUN_ATTR(cfg_aworker_no_cs7_instance, cfg_aworker_no_cs7_instance_cmd,
+	   "no worker <0-15> cs7-instance",
+	   NO_STR "Remove a worker's inline cs7 instance\n" "Worker index\n" "Inline cs7 instance\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	unsigned int idx = atoi(argv[0]);
+
+	if (idx >= AWORKER_POOL_MAX_WORKERS) {
+		vty_out(vty, "%% Worker index must be below %u%s", AWORKER_POOL_MAX_WORKERS, VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+	cfg->has_cs7_instance[idx] = false;
+	cfg->cs7_instance[idx] = 0;
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
+int aworker_pool_vty_config_is_consistent(struct vty *vty)
+{
+	const char *refusal = aworker_pool_config_write_refusal();
+
+	if (!refusal)
+		return 1;
+	vty_out(vty, "%% %s%s", refusal, VTY_NEWLINE);
+	return 0;
+}
+
 static int config_write_aworker_pool(struct vty *vty)
 {
 	const struct aworker_pool_cfg *cfg = aworker_pool_cfg();
@@ -201,7 +263,7 @@ static int config_write_aworker_pool(struct vty *vty)
 		   || cfg->on_failure != AWORKER_FAILURE_RESTART;
 
 	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
-		if (cfg->cfg_file[i])
+		if (cfg->cfg_file[i] || cfg->has_cs7_instance[i])
 			any = true;
 	}
 	if (!any)
@@ -212,6 +274,8 @@ static int config_write_aworker_pool(struct vty *vty)
 	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
 		if (cfg->cfg_file[i])
 			vty_out(vty, " worker %u config-file %s%s", i, cfg->cfg_file[i], VTY_NEWLINE);
+		if (cfg->has_cs7_instance[i])
+			vty_out(vty, " worker %u cs7-instance %u%s", i, cfg->cs7_instance[i], VTY_NEWLINE);
 	}
 	if (cfg->startup_timeout != AWORKER_STARTUP_TIMEOUT_DEFAULT)
 		vty_out(vty, " startup-timeout %u%s", cfg->startup_timeout, VTY_NEWLINE);
@@ -263,8 +327,9 @@ DEFUN(aworker_reset_worker, aworker_reset_worker_cmd,
 	}
 }
 
-void aworker_pool_vty_init(void)
+void aworker_pool_vty_init(void *ctx)
 {
+	g_vty_ctx = ctx;
 	install_element_ve(&show_aworker_pool_cmd);
 	install_element(ENABLE_NODE, &aworker_reset_worker_cmd);
 
@@ -273,6 +338,8 @@ void aworker_pool_vty_init(void)
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_workers_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_cfg_file_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_no_cfg_file_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_cs7_instance_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_no_cs7_instance_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_startup_timeout_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_restart_delay_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_restart_delay_max_cmd);

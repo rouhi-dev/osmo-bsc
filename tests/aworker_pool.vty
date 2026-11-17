@@ -1,0 +1,65 @@
+OsmoBSC> enable
+OsmoBSC# configure terminal
+OsmoBSC(config)# a-worker-pool
+OsmoBSC(config-a-worker-pool)# list
+...
+  workers <0-16>
+  worker <0-15> config-file FILE
+  no worker <0-15> config-file
+  worker <0-15> cs7-instance <0-15>
+  no worker <0-15> cs7-instance
+...
+
+OsmoBSC(config-a-worker-pool)# worker 0 ?
+  config-file   Configuration file the worker reads; it must contain the cs7 instance(s) of this worker, with their asp / as / route nodes, and nothing else
+  cs7-instance  The worker owns this cs7 instance of this configuration file (inline form): its asp / as / listen nodes are parsed by that worker only, never by the BSC
+
+OsmoBSC(config-a-worker-pool)# worker 0 cs7-instance ?
+  <0-15>  cs7 instance number
+
+OsmoBSC(config-a-worker-pool)# no worker 0 ?
+  config-file   Configuration file
+  cs7-instance  Inline cs7 instance
+
+OsmoBSC(config-a-worker-pool)# worker 16 cs7-instance 0
+% Unknown command.
+OsmoBSC(config-a-worker-pool)# worker 0 cs7-instance 16
+% Unknown command.
+
+OsmoBSC(config-a-worker-pool)# workers 2
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# worker 0 cs7-instance 0
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# worker 1 cs7-instance 1
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# show running-config
+...
+a-worker-pool
+ workers 2
+ worker 0 cs7-instance 0
+ worker 1 cs7-instance 1
+...
+
+OsmoBSC(config-a-worker-pool)# worker 0 config-file worker0.cfg
+% Worker 0 already uses the inline form 'worker 0 cs7-instance 0'; a worker uses exactly one form ('no worker 0 cs7-instance' first)
+OsmoBSC(config-a-worker-pool)# no worker 0 cs7-instance
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# worker 0 config-file worker0.cfg
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# worker 0 cs7-instance 0
+% Worker 0 already uses 'worker 0 config-file worker0.cfg'; a worker uses exactly one form ('no worker 0 config-file' first)
+OsmoBSC(config-a-worker-pool)# show running-config
+...
+a-worker-pool
+ workers 2
+ worker 0 config-file worker0.cfg
+ worker 1 cs7-instance 1
+...
+
+OsmoBSC(config-a-worker-pool)# no worker 0 config-file
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# no worker 1 cs7-instance
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# workers 0
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# end

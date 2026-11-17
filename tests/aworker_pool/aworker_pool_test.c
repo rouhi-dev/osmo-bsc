@@ -1125,6 +1125,81 @@ static void test_t11_ownership_claims(void)
 	TALLOC_FREE(cfg->cfg_file[1]);
 }
 
+/***********************************************************************
+ * T12: expected ownership with the inline form ('worker N cs7-instance X')
+ ***********************************************************************/
+
+static void test_t12_inline_ownership(void)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	const struct aworker_pool_msc_ref ok_mscs[] = { { .nr = 0, .cs7_id = 0 }, { .nr = 1, .cs7_id = 1 } };
+	const struct aworker_pool_msc_ref bad_mscs[] = { { .nr = 0, .cs7_id = 0 }, { .nr = 7, .cs7_id = 3 } };
+	int sp[2][2];
+	const char *log;
+	unsigned int i;
+
+	printf("T12: expected cs7 ownership with the inline form\n");
+	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++)
+		TALLOC_FREE(cfg->cfg_file[i]);
+	cfg->num_workers = 2;
+	cfg->has_cs7_instance[0] = true;
+	cfg->cs7_instance[0] = 0;
+	cfg->has_cs7_instance[1] = true;
+	cfg->cs7_instance[1] = 1;
+
+	/* The map comes from the declarations; every msc's instance owned. */
+	CHECK(aworker_pool_check_ownership(ok_mscs, ARRAY_SIZE(ok_mscs)) == 0);
+	for (i = 0; i < 2; i++)
+		OSMO_ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp[i]) == 0);
+	CHECK(aworker_pool_start_with_fds(ctx, (int[]){ sp[0][0], sp[1][0] }, 2) == 0);
+	CHECK(aworker_pool_expected_owner(0) == 0);
+	CHECK(aworker_pool_expected_owner(1) == 1);
+	CHECK(aworker_pool_expected_owner(2) == -1);
+	aworker_pool_stop();
+	for (i = 0; i < 2; i++)
+		close(sp[i][1]);
+	printf("  'worker 0 cs7-instance 0', 'worker 1 cs7-instance 1': instance 0 -> worker 0, 1 -> worker 1\n");
+
+	/* An msc on an instance no worker owns is refused, with the inline form's hint. */
+	t10_capture_begin();
+	CHECK(aworker_pool_check_ownership(bad_mscs, ARRAY_SIZE(bad_mscs)) == -EINVAL);
+	log = t10_capture_end();
+	CHECK(strstr(log, "msc 7 uses cs7 instance 3, but no worker owns that instance") != NULL);
+	CHECK(strstr(log, "Add 'worker <N> cs7-instance 3'") != NULL);
+	printf("  an msc on an instance no worker owns is refused, naming 'worker <N> cs7-instance <X>'\n");
+
+	/* Two workers on one instance. */
+	cfg->cs7_instance[1] = 0;
+	t10_capture_begin();
+	CHECK(aworker_pool_check_ownership(ok_mscs, 1) == -EINVAL);
+	log = t10_capture_end();
+	CHECK(strstr(log, "cs7 instance 0 is assigned to worker 0 and to worker 1") != NULL);
+	cfg->cs7_instance[1] = 1;
+	printf("  two workers on one instance are refused\n");
+
+	/* Both forms on one worker (the VTY refuses this; the ownership check does not rely on it). */
+	cfg->cfg_file[0] = talloc_strdup(ctx, "/nonexistent/w0.cfg");
+	t10_capture_begin();
+	CHECK(aworker_pool_check_ownership(ok_mscs, ARRAY_SIZE(ok_mscs)) == -EINVAL);
+	log = t10_capture_end();
+	CHECK(strstr(log, "worker 0 has both 'config-file' and 'cs7-instance'; a worker uses exactly one form") != NULL);
+	TALLOC_FREE(cfg->cfg_file[0]);
+	printf("  a worker with both forms is refused\n");
+
+	/* Workers are not started from the inline form yet: the start is refused before anything is forked. */
+	t10_capture_begin();
+	CHECK(aworker_pool_start(ctx) == -EINVAL);
+	log = t10_capture_end();
+	CHECK(aworker_pool_num_workers() == 0);
+	CHECK(strstr(log, "worker 0 uses the inline form ('worker 0 cs7-instance 0'), from which this osmo-bsc"
+			  " cannot start workers yet") != NULL);
+	printf("  starting workers from the inline form is refused (no pool, nothing started)\n");
+
+	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++)
+		cfg->has_cs7_instance[i] = false;
+	cfg->num_workers = 0;
+}
+
 int main(void)
 {
 	size_t blocks;
@@ -1157,6 +1232,7 @@ int main(void)
 	OSMO_ASSERT(mkdtemp(t10_dir));
 	test_t10_expected_ownership();
 	test_t11_ownership_claims();
+	test_t12_inline_ownership();
 	if (!failures) {
 		char cmd[300];
 		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", t10_dir);

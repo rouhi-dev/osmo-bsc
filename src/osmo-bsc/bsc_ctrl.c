@@ -48,6 +48,7 @@
 #include <osmocom/bsc/ctrl.h>
 #include <osmocom/bsc/handover_ctrl.h>
 #include <osmocom/bsc/neighbor_ident.h>
+#include <osmocom/bsc/aworker_pool.h>
 
 static int verify_net_apply_config_file(struct ctrl_cmd *cmd, const char *value, void *_data)
 {
@@ -106,6 +107,14 @@ CTRL_CMD_DEFINE_WO(net_apply_config_file, "apply-config-file");
 
 static int verify_net_write_config_file(struct ctrl_cmd *cmd, const char *value, void *_data)
 {
+	/* Inline A-worker form: the running configuration lacks the workers' nodes (and no config file is recorded,
+	 * so 'overwrite' would have no file to write). */
+	const char *refusal = aworker_pool_config_write_refusal();
+
+	if (refusal) {
+		cmd->reply = talloc_strdup(cmd, refusal);
+		return 1;
+	}
 	return 0;
 }
 static int set_net_write_config_file(struct ctrl_cmd *cmd, void *_data)

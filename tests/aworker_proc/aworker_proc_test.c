@@ -2053,19 +2053,45 @@ static void test_p17_startup_timeout_per_start(char **argv)
 	printf("  the READY worker 0 is never timed out later (200 s: same process, no further loss)\n");
 }
 
+/* P18's worker writes its heartbeats to a file of its own, which no earlier process wrote to. */
+static char p18_hb[PATH_MAX];
+
+/* True once that worker has counted its first heartbeat: its 10 ms timer runs, so its SIGUSR2 handler -- installed
+ * before that timer is set up (fake_worker_main()) -- is in place. Sending SIGUSR2 earlier would kill it (default
+ * action). */
+static bool p18_heartbeat(void *data)
+{
+	unsigned long v = 0;
+	FILE *f = fopen(p18_hb, "r");
+
+	if (f) {
+		if (fscanf(f, "%lu", &v) != 1)
+			v = 0;
+		fclose(f);
+	}
+	return v >= 1;
+}
+
 /* P18: a worker that becomes READY 1 ms before its deadline is not timed out, then or later. */
 static void p18_fn(char **argv, struct start_result *res)
 {
+	char extra[PATH_MAX + 64];
 	pid_t p1;
 
 	res->started = backoff_pool_start(argv, NULL, 60);
 	if (!res->started)
 		return;
-	p1 = restart_with(1, "cs7_on_usr2=1\n");	/* started at 5 s: deadline 65 s */
+	snprintf(p18_hb, sizeof(p18_hb), "%s/p18_heartbeat1", g_dir);
+	snprintf(extra, sizeof(extra), "cs7_on_usr2=1\nheartbeat=%s\n", p18_hb);
+	p1 = restart_with(1, extra);	/* started at 5 s: deadline 65 s */
 	if (!p1)
 		return;
 	fake_advance_to(64999);
 	res->ok[0] = w_is(1, AWORKER_ST_STARTING, p1);
+	/* Only once its SIGUSR2 handler is in place (real time; the fake clock stands still meanwhile). */
+	res->ok[4] = run_until(p18_heartbeat, NULL, 10000);
+	if (!res->ok[4])
+		return;
 	kill(p1, SIGUSR2);
 	res->ok[1] = run_until(w1_ready, NULL, 5000) && winfo(1).pid == p1;	/* the fake clock stands still */
 	fake_advance_to(65000);
@@ -2084,6 +2110,8 @@ static void test_p18_ready_before_deadline(char **argv)
 
 	printf("P18: a worker that becomes READY just before its startup deadline is not timed out\n");
 	start_run(argv, p18_fn, &res);
+	/* The worker counted a heartbeat (its SIGUSR2 handler is in place) before SIGUSR2 was sent. */
+	CHECK(res.ok[4]);
 	CHECK(res.ok[0] && res.ok[1]);
 	printf("  started at 5 s, READY at 64.999 s\n");
 	CHECK(res.ok[2] && res.ok[3]);

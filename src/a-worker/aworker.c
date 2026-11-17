@@ -18,6 +18,8 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -33,14 +35,16 @@
 #include <osmocom/sigtran/sccp_helpers.h>
 #include <osmocom/sigtran/sccp_sap.h>
 #include <osmocom/vty/command.h>
+#include <osmocom/vty/vty.h>
 
 #include <osmocom/bsc/aworker.h>
 #include <osmocom/bsc/aworker_cfg_scan.h>
+#include <osmocom/bsc/aworker_cfg_view.h>
 #include <osmocom/bsc/aworker_ipc.h>
 #include <osmocom/bsc/aworker_ipc_link.h>
 #include <osmocom/bsc/aworker_pool.h>
-#include <osmocom/bsc/debug.h>
-#include <osmocom/bsc/gsm_data.h>
+#include <osmocom/bsc/aworker_log.h>
+#include <osmocom/bsc/aworker_snapshot.h>
 
 /* One cs7 instance this worker owns, with its SCCP instance. */
 struct aworker_cs7 {
@@ -66,7 +70,11 @@ struct aworker_wuser {
 static struct {
 	void *ctx;
 	unsigned int idx;
-	const char *cfg_file;
+	const char *cfg_file;		/*!< legacy config file, or the snapshot's name (diagnostics) */
+	bool snapshot;			/*!< snapshot mode: the configuration is snap_text, not the file */
+	const char *snap_text;
+	size_t snap_len;
+	int own_cs7;			/*!< snapshot mode: the cs7 instance the view declares for this worker */
 	struct aworker_ipc_link *link;
 	struct llist_head cs7s;		/*!< struct aworker_cs7 */
 	struct llist_head users;	/*!< struct aworker_wuser */
@@ -76,9 +84,9 @@ static struct {
 	struct msgb *cs7_info;
 } g_w;
 
-#define LOGAW(lvl, fmt, args...) LOGP(DAWORKER, lvl, "aworker %u: " fmt, g_w.idx, ## args)
+#define LOGAW(lvl, fmt, args...) LOGP(aworker_log_cat, lvl, "aworker %u: " fmt, g_w.idx, ## args)
 #define LOGWU(wu, lvl, fmt, args...) \
-	LOGP(DAWORKER, lvl, "aworker %u user '%s' (cs7 %u ssn %u, ref %u): " fmt, g_w.idx, (wu)->name, \
+	LOGP(aworker_log_cat, lvl, "aworker %u user '%s' (cs7 %u ssn %u, ref %u): " fmt, g_w.idx, (wu)->name, \
 	     (wu)->cs7_id, (wu)->ssn, (wu)->user_ref, ## args)
 
 /***********************************************************************
@@ -524,12 +532,14 @@ static int cs7_collect(void)
 	unsigned int i, count = 0;
 	int rc;
 
-	rc = aworker_cfg_scan(g_w.cfg_file, &scan);
+	/* What was parsed: the snapshot's buffer itself, or (legacy) the file. */
+	rc = g_w.snapshot ? aworker_cfg_scan_buf(g_w.snap_text, g_w.snap_len, &scan) : aworker_cfg_scan(g_w.cfg_file, &scan);
 	if (rc < 0) {
 		LOGAW(LOGL_FATAL, "cannot read the worker config file '%s': %s\n", g_w.cfg_file, strerror(-rc));
 		return rc;
 	}
-	if (scan.num_workers) {
+	/* The view of the inline form includes the 'a-worker-pool' section (D-6); a legacy config file must not. */
+	if (scan.num_workers && !g_w.snapshot) {
 		LOGAW(LOGL_FATAL, "the worker config file '%s' has an 'a-worker-pool' section. A worker must not"
 		      " start workers of its own; that section belongs in the main configuration file.\n",
 		      g_w.cfg_file);
@@ -594,6 +604,19 @@ static int cs7_collect(void)
 		      " A worker config file must contain the cs7 instance(s) this worker owns, with their"
 		      " asp / as nodes.\n", g_w.cfg_file);
 		return -EINVAL;
+	}
+	if (g_w.snapshot) {
+		/* What the parse created must be exactly what the view declares for this worker: its one cs7
+		 * instance (D-13 checked the text; this checks the result). */
+		struct aworker_cs7 *c;
+		llist_for_each_entry(c, &g_w.cs7s, entry) {
+			if (count != 1 || (int)c->cs7_id != g_w.own_cs7) {
+				LOGAW(LOGL_FATAL, "%s: the cs7 instances with transport nodes (%u, among them cs7 instance"
+				      " %u) are not exactly the cs7 instance %d declared for this worker\n", g_w.cfg_file,
+				      count, c->cs7_id, g_w.own_cs7);
+				return -EINVAL;
+			}
+		}
 	}
 	return 0;
 }
@@ -689,20 +712,75 @@ static void worker_cleanup(void)
 	}
 }
 
-void aworker_run(int fd, unsigned int worker_idx, const char *cfg_file)
+/* Snapshot mode, before anything is parsed: read the snapshot (its descriptor is closed whatever happens), check the
+ * view (D-13), and find the cs7 instance it declares for this worker. Exits with AWORKER_EXIT_CONFIG on any refusal. */
+static void snapshot_take(int snapshot_fd, int ipc_fd)
+{
+	struct aworker_cfg_problem p[16];
+	struct aworker_cfg_model *m;
+	char why[256], *text;
+	size_t len;
+	unsigned int n, i;
+	int rc;
+
+	rc = aworker_snapshot_read(g_w.ctx, snapshot_fd, ipc_fd, &text, &len, why, sizeof(why));
+	if (rc < 0) {
+		LOGAW(LOGL_FATAL, "configuration snapshot refused: %s\n", why);
+		exit(AWORKER_EXIT_CONFIG);
+	}
+	n = aworker_cfg_check_worker_view(text, len, g_w.idx, p, ARRAY_SIZE(p));
+	if (n) {
+		for (i = 0; i < n && i < ARRAY_SIZE(p); i++)
+			LOGAW(LOGL_FATAL, "configuration snapshot refused: line %u: %s\n", p[i].lineno, p[i].msg);
+		if (n > ARRAY_SIZE(p))
+			LOGAW(LOGL_FATAL, "configuration snapshot refused: %u more problem(s)\n",
+			      n - (unsigned int)ARRAY_SIZE(p));
+		exit(AWORKER_EXIT_CONFIG);
+	}
+	if (aworker_cfg_model_build_buf(g_w.ctx, g_w.cfg_file, text, len, &m) < 0) {
+		LOGAW(LOGL_FATAL, "configuration snapshot refused: cannot read it\n");
+		exit(AWORKER_EXIT_CONFIG);
+	}
+	/* aworker_cfg_check_worker_view() made sure this worker is declared inline, and only inline. */
+	g_w.own_cs7 = (int)m->decl[g_w.idx].cs7_id;
+	talloc_free(m);
+	g_w.snapshot = true;
+	g_w.snap_text = text;
+	g_w.snap_len = len;
+}
+
+/* Parse the configuration: the snapshot's buffer, or (legacy) the file. */
+static int parse_config(void)
+{
+	FILE *f;
+	int rc;
+
+	if (!g_w.snapshot)
+		return vty_read_config_file(g_w.cfg_file, NULL);
+	f = fmemopen((void *)g_w.snap_text, g_w.snap_len, "r");
+	if (!f)
+		return -errno;
+	rc = vty_read_config_filep(f, NULL);
+	fclose(f);
+	return rc;
+}
+
+void aworker_run(void *ctx, int fd, unsigned int worker_idx, const char *cfg_file, int snapshot_fd)
 {
 	struct aworker_ipc_link_cfg cfg = {
 		.role = AWORKER_IPC_ROLE_WORKER,
 		.worker_idx = (uint16_t)worker_idx,
 		.ident = "osmo-bsc",
-		.log_cat = DAWORKER,
+		.log_cat = aworker_log_cat,
 	};
 	int rc;
 
-	g_w.ctx = talloc_named_const(tall_bsc_ctx, 0, "aworker");
+	g_w.ctx = talloc_named_const(ctx, 0, "aworker");
 	OSMO_ASSERT(g_w.ctx);
 	g_w.idx = worker_idx;
-	g_w.cfg_file = cfg_file;
+	g_w.cfg_file = cfg_file ? cfg_file : talloc_asprintf(g_w.ctx, "configuration snapshot (fd %d)", snapshot_fd);
+	OSMO_ASSERT(g_w.cfg_file);
+	g_w.own_cs7 = -1;
 	g_w.exit_code = AWORKER_EXIT_OK;
 	INIT_LLIST_HEAD(&g_w.cs7s);
 	INIT_LLIST_HEAD(&g_w.users);
@@ -713,8 +791,15 @@ void aworker_run(int fd, unsigned int worker_idx, const char *cfg_file)
 	signal(SIGINT, w_signal_handler);
 	signal(SIGTERM, w_signal_handler);
 
-	LOGAW(LOGL_NOTICE, "A-worker starting: pid %ld, IPC fd %d, config file '%s'\n", (long)getpid(), fd,
-	      cfg_file);
+	if (cfg_file)
+		LOGAW(LOGL_NOTICE, "A-worker starting: pid %ld, IPC fd %d, config file '%s'\n", (long)getpid(), fd,
+		      cfg_file);
+	else
+		LOGAW(LOGL_NOTICE, "A-worker starting: pid %ld, IPC fd %d, configuration snapshot on fd %d\n",
+		      (long)getpid(), fd, snapshot_fd);
+	/* Snapshot mode: read it (and close its descriptor) and check it first, before anything else is done. */
+	if (!cfg_file)
+		snapshot_take(snapshot_fd, fd);
 
 	rc = aworker_ipc_link_alloc(&g_w.link, g_w.ctx, fd, &cfg, &w_link_ops, NULL);
 	if (rc < 0) {
@@ -723,9 +808,9 @@ void aworker_run(int fd, unsigned int worker_idx, const char *cfg_file)
 	}
 
 	/* Reading this file is what creates the ASPs and opens the SCTP associations -- in this process only. */
-	rc = vty_read_config_file(cfg_file, NULL);
+	rc = parse_config();
 	if (rc < 0) {
-		LOGAW(LOGL_FATAL, "cannot parse the worker config file '%s': %s\n", cfg_file, strerror(-rc));
+		LOGAW(LOGL_FATAL, "cannot parse the worker config file '%s': %s\n", g_w.cfg_file, strerror(-rc));
 		worker_cleanup();
 		exit(AWORKER_EXIT_CONFIG);
 	}

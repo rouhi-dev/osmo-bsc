@@ -147,8 +147,12 @@ struct aworker_pool_cfg {
 	/*! Number of workers; 0 disables worker mode (the default: osmo-bsc then runs the SIGTRAN stack
 	 * in-process, exactly as without this feature). */
 	unsigned int num_workers;
-	/*! Config file of each worker; cfg_file[i] must be set for every i < num_workers. */
+	/*! Config file of each worker (file form); every worker i < num_workers has either this or an inline
+	 * cs7 instance, never both. */
 	char *cfg_file[AWORKER_POOL_MAX_WORKERS];
+	/*! Inline form: worker i owns 'cs7 instance cs7_instance[i]' of the main configuration file itself. */
+	bool has_cs7_instance[AWORKER_POOL_MAX_WORKERS];
+	uint8_t cs7_instance[AWORKER_POOL_MAX_WORKERS];
 	unsigned int startup_timeout;	/*!< seconds each started worker process has to become READY */
 	unsigned int restart_delay;	/*!< seconds: restart delay after the first unplanned loss (the backoff base) */
 	unsigned int restart_delay_max;	/*!< seconds: the backoff never waits longer (but never less than restart_delay) */
@@ -161,7 +165,7 @@ struct aworker_pool_cfg {
 /* Configuration and VTY */
 struct aworker_pool_cfg *aworker_pool_cfg(void);
 bool aworker_pool_enabled(void);
-void aworker_pool_vty_init(void);
+void aworker_pool_vty_init(void *ctx);
 /*! Scan the main configuration file for the 'a-worker-pool' section and, if worker mode is configured there,
  * refuse any 'asp', 'as' or 'listen' node inside a 'cs7 instance': reading those would create ASPs and open SCTP
  * associations in the main process, which the workers own. This runs BEFORE the configuration file is parsed, so
@@ -169,6 +173,22 @@ void aworker_pool_vty_init(void);
  * \returns 0 if the file may be parsed, -EINVAL if it must not be (the reason is printed to stderr and logged),
  *	    -errno if the file cannot be read. */
 int aworker_pool_prescan_config(const char *config_file);
+/*! Parse the main configuration file. With the inline form ('worker <N> cs7-instance <X>'), only the BSC view is
+ * parsed: the asp / as / listen nodes of the worker-owned cs7 instances are left out (see
+ * aworker_cfg_view.h), the file is not recorded as the VTY's config file, and every way of writing the
+ * configuration is refused from then on (aworker_pool_config_write_refusal()). Otherwise this is
+ * vty_read_config_file(), exactly as before.
+ * \returns 0, or a negative error as vty_read_config_file() returns it. */
+int aworker_pool_read_config(const char *config_file);
+/*! Why the running configuration must not be written to a file, or NULL if it may be. It must not once the main
+ * configuration file was parsed as a view (the inline form): the BSC holds only its part of the configuration, so any
+ * file written from it lacks the workers' nodes -- and written over osmo-bsc.cfg, it would delete them. */
+const char *aworker_pool_config_write_refusal(void);
+/*! For vty_app_info.config_is_consistent, which libosmovty asks before every 'write file [PATH]', 'write',
+ * 'write memory' and 'copy running-config startup-config', and before it records PATH. Says why and \returns 0
+ * if aworker_pool_config_write_refusal() refuses, 1 otherwise. */
+struct vty;
+int aworker_pool_vty_config_is_consistent(struct vty *vty);
 /*! Second line of defence, run after the configuration file was parsed: refuse a main-process cs7 instance that
  * has an Application Server. \returns 0 or -EINVAL (errors are logged). */
 int aworker_pool_check_main_cs7(void);

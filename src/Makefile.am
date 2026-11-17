@@ -14,6 +14,7 @@ AM_CFLAGS = \
 	$(NULL)
 
 SUBDIRS = \
+	a-worker \
 	osmo-bsc \
 	utils \
 	$(NULL)

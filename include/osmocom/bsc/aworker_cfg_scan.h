@@ -46,6 +46,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define AWORKER_CFG_SCAN_MAX_CS7	16
@@ -79,6 +80,10 @@ struct aworker_cfg_scan {
  * \param[out] out  the result; fully overwritten.
  * \returns 0, or -errno if the file cannot be read. */
 int aworker_cfg_scan(const char *config_file, struct aworker_cfg_scan *out);
+
+/*! Scan a configuration held in memory, with exactly the same rules as aworker_cfg_scan().
+ * \returns 0, or -errno if the buffer cannot be read as a stream. */
+int aworker_cfg_scan_buf(const char *buf, size_t len, struct aworker_cfg_scan *out);
 
 /*! The scanned section with this cs7 instance id, or NULL. */
 const struct aworker_cfg_scan_cs7 *aworker_cfg_scan_find(const struct aworker_cfg_scan *scan, uint32_t cs7_id);

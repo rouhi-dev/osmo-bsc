@@ -70,6 +70,11 @@ PKG_CHECK_MODULES(LIBOSMONETIF, libosmo-netif >= 1.8.0)
 PKG_CHECK_MODULES(LIBOSMOSIGTRAN, libosmo-sigtran >= 2.3.0)
 PKG_CHECK_MODULES(LIBOSMOMGCPCLIENT, libosmo-mgcp-client >= 1.16.0)
 
+dnl checks for library functions
+dnl A-worker snapshots (src/a-worker/aworker_snapshot.c): memfd_create() of the C library if it has one; without it, the
+dnl module makes the system call itself.
+AC_CHECK_FUNCS([memfd_create])
+
 dnl checks for header files
 AC_HEADER_STDC
 
@@ -232,6 +237,7 @@ AC_OUTPUT(
     include/osmocom/Makefile
     include/osmocom/bsc/Makefile
     src/Makefile
+    src/a-worker/Makefile
     src/osmo-bsc/Makefile
     src/ipaccess/Makefile
     src/utils/Makefile
@@ -240,9 +246,13 @@ AC_OUTPUT(
     tests/abis/Makefile
     tests/acc/Makefile
     tests/aworker_cfg_scan/Makefile
+    tests/aworker_cfg_view/Makefile
+    tests/aworker_cfg_write/Makefile
     tests/aworker_ipc/Makefile
     tests/aworker_pool/Makefile
     tests/aworker_proc/Makefile
+    tests/aworker_snapshot/Makefile
+    tests/aworker_worker/Makefile
     tests/bsc/Makefile
     tests/codec_pref/Makefile
     tests/gsm0408/Makefile

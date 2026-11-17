@@ -1,0 +1,976 @@
+Part A: views and rule checks
+== inline-basic
+  inline: yes
+  check: 0 problem(s)
+  check (supervisor mode): 0 problem(s)
+  BSC view (36 lines; file 36 lines):
+     1|! two A links, each owned by a worker
+     2|log stderr
+     3| logging filter all 1
+     4| logging level set-all notice
+     5|line vty
+     6| bind 127.0.0.1
+     7|cs7 instance 0
+     8| point-code 0.23.3
+     9| sccp-address msc0
+    10|  routing-indicator PC
+    11|  point-code 0.23.1
+    22|cs7 instance 1
+    23| point-code 0.23.4
+    24| sccp-address msc0b
+    25|  routing-indicator PC
+    26|  point-code 0.23.1
+    30|a-worker-pool
+    31| workers 2
+    32| worker 0 cs7-instance 0
+    33| worker 1 cs7-instance 1
+    34| restart-delay 5
+    35|network
+    36| network country code 001
+  Supervisor view (36 lines; file 36 lines):
+     2|log stderr
+     3| logging filter all 1
+     4| logging level set-all notice
+    30|a-worker-pool
+    31| workers 2
+    32| worker 0 cs7-instance 0
+    33| worker 1 cs7-instance 1
+    34| restart-delay 5
+  worker 0 view (36 lines; file 36 lines):
+     2|log stderr
+     3| logging filter all 1
+     4| logging level set-all notice
+     7|cs7 instance 0
+     8| point-code 0.23.3
+     9| sccp-address msc0
+    10|  routing-indicator PC
+    11|  point-code 0.23.1
+    12| asp asp-a0 2905 0 m3ua
+    13|  remote-ip 10.0.0.10
+    14|  ! a comment inside the asp
+    15|  local-ip 10.0.0.1
+    16|  role asp
+    17|  transport-role client
+    18|  no shutdown
+    19| as as-a0 m3ua
+    20|  asp asp-a0
+    21|  routing-key 0 0.23.3
+    30|a-worker-pool
+    31| workers 2
+    32| worker 0 cs7-instance 0
+    33| worker 1 cs7-instance 1
+    34| restart-delay 5
+  worker 1 view (36 lines; file 36 lines):
+     2|log stderr
+     3| logging filter all 1
+     4| logging level set-all notice
+    22|cs7 instance 1
+    23| point-code 0.23.4
+    24| sccp-address msc0b
+    25|  routing-indicator PC
+    26|  point-code 0.23.1
+    27| asp asp-a1 2905 0 m3ua
+    28|  remote-ip 10.0.0.10
+    29|  no shutdown
+    30|a-worker-pool
+    31| workers 2
+    32| worker 0 cs7-instance 0
+    33| worker 1 cs7-instance 1
+    34| restart-delay 5
+== layout
+  inline: yes
+  check: 0 problem(s)
+  BSC view (16 lines; file 16 lines):
+     1|a-worker-pool
+     2|	workers 1
+     3|	worker 0 cs7-instance 2
+     5|log file /tmp/x.log
+     6|	logging level set-all info
+     7|cs7 instance 2
+     8|	 point-code 1.2.3
+  Supervisor view (16 lines; file 16 lines):
+     1|a-worker-pool
+     2|	workers 1
+     3|	worker 0 cs7-instance 2
+     5|log file /tmp/x.log
+     6|	logging level set-all info
+  worker 0 view (16 lines; file 16 lines):
+     1|a-worker-pool
+     2|	workers 1
+     3|	worker 0 cs7-instance 2
+     7|cs7 instance 2
+     8|	 point-code 1.2.3
+     9|	 asp a2 2905 0 m3ua
+    10|	 	description not!a!comment
+    11|	 	! a comment
+    13|	 	remote-ip 10.0.0.2
+    14|	 no asp gone
+    15|	 listen m3ua 2906
+    16|	 	local-ip 10.0.0.3
+== bad-indent-in-owned
+  inline: yes
+  check: 1 problem(s)
+    line 5: inconsistent indentation: leading whitespace must match the lines around it and reflect the node levels (the VTY parser refuses this line)
+== transport-outside-owned
+  inline: yes
+  check: 2 problem(s)
+    line 5: asp, as and listen are only allowed in a cs7 instance owned by a worker, and no worker owns cs7 instance 5 ('worker <N> cs7-instance 5'); with the inline form the BSC never runs a SIGTRAN transport itself
+    line 7: asp, as and listen are only allowed in a cs7 instance owned by a worker, and this cs7 instance is not a valid instance number; with the inline form the BSC never runs a SIGTRAN transport itself
+== owned-without-transport
+  inline: yes
+  check: 1 problem(s)
+    line 1: 'cs7 instance 0' is owned by worker 0 but has no asp, as or listen node: the worker would own nothing
+== overlong-line
+  inline: yes
+  check: 1 problem(s)
+    line 3: line longer than 510 characters inside a worker-owned cs7 instance
+== exit-end
+  inline: yes
+  check: 2 problem(s)
+    line 3: 'exit' / 'end' inside a worker-owned cs7 instance: the node structure of this section must follow from the indentation alone
+    line 7: 'exit' / 'end' inside 'a-worker-pool': the node structure of this section must follow from the indentation alone
+== duplicate-owned-section
+  inline: yes
+  check: 1 problem(s)
+    line 3: 'cs7 instance 0' owned by worker 0 appears more than once (first at line 1); a worker-owned instance is configured in one section
+== both-forms-one-worker
+  inline: yes
+  check: 1 problem(s)
+    line 6: worker 0 is configured twice: 'worker 0 config-file' (line 5) and 'worker 0 cs7-instance' (line 6); a worker uses exactly one form
+== mixed-pool
+  inline: yes
+  check: 1 problem(s)
+    line 6: worker 0 uses 'config-file' (line 5) and worker 1 uses 'cs7-instance' (line 6); all workers of a pool use the same form
+== file-form-supervisor-mode
+  inline: no
+  check: 0 problem(s)
+  check (supervisor mode): 1 problem(s)
+    line 5: worker 0 uses 'config-file', but the Supervisor accepts only the inline form 'worker 0 cs7-instance <N>' with the cs7 instance in this file
+== inline-supervisor-mode
+  inline: yes
+  check: 0 problem(s)
+  check (supervisor mode): 0 problem(s)
+== missing-owned-section
+  inline: yes
+  check: 1 problem(s)
+    line 6: worker 1 owns cs7 instance 7, but this file has no 'cs7 instance 7' section
+== two-workers-one-instance
+  inline: yes
+  check: 1 problem(s)
+    line 6: cs7 instance 0 is assigned to worker 0 (line 5) and to worker 1; each cs7 instance belongs to exactly one worker
+== protocol-conflict
+  inline: yes
+  check: 1 problem(s)
+    line 2: 'cs7 instance 0' (owned by worker 0) names more than one ASP protocol
+== declaration-beyond-workers
+  inline: yes
+  check: 1 problem(s)
+    line 4: asp, as and listen are only allowed in a cs7 instance owned by a worker, and no worker owns cs7 instance 2 ('worker <N> cs7-instance 2'); with the inline form the BSC never runs a SIGTRAN transport itself
+== dedent-between-levels
+  inline: yes
+  check: 2 problem(s)
+    line 1: 'cs7 instance 0' is owned by worker 0 but has no asp, as or listen node: the worker would own nothing
+    line 3: inconsistent indentation: leading whitespace must match the lines around it and reflect the node levels (the VTY parser refuses this line)
+== highest-instance
+  inline: yes
+  check: 0 problem(s)
+  BSC view (5 lines; file 5 lines):
+     1|cs7 instance 15
+     3|a-worker-pool
+     4| workers 1
+     5| worker 0 cs7-instance 15
+  Supervisor view (5 lines; file 5 lines):
+     3|a-worker-pool
+     4| workers 1
+     5| worker 0 cs7-instance 15
+  worker 0 view (5 lines; file 5 lines):
+     1|cs7 instance 15
+     2| asp a 2905 0 m3ua
+     3|a-worker-pool
+     4| workers 1
+     5| worker 0 cs7-instance 15
+== declaration-removed
+  inline: no
+  check: 0 problem(s)
+== number-with-trailing-characters
+  inline: no
+  check: 0 problem(s)
+== file-form
+  inline: no
+  check: 0 problem(s)
+== pool-disabled
+  inline: no
+  check: 0 problem(s)
+Part B: views parsed by the real VTY parsers
+  BSC view:
+    parse: ok
+    cs7 instance 0: point-code 0.23.3
+    cs7 instance 1: point-code 0.23.4
+    sccp-address msc0: cs7 instance 0, point-code 0.23.1
+    sccp-address msc0b: cs7 instance 1, point-code 0.23.1
+    listening sockets: 0
+  Supervisor view:
+    parse: ok
+    listening sockets: 0
+  worker 0 view:
+    parse: ok
+    cs7 instance 0: point-code 0.23.3
+      AS m3ua
+      ASP asp-a0 (m3ua)
+    sccp-address msc0: cs7 instance 0, point-code 0.23.1
+    listening sockets: 0
+  worker 1 view:
+    parse: ok
+    cs7 instance 1: point-code 0.23.4
+      ASP asp-a1 (m3ua)
+    sccp-address msc0b: cs7 instance 1, point-code 0.23.1
+    listening sockets: 1
+  BSC view == legacy main file: yes
+  worker 0 view == legacy worker 0 file: yes
+  worker 1 view == legacy worker 1 file: yes
+  whole file (for comparison):
+    parse: ok
+    cs7 instance 0: point-code 0.23.3
+      AS m3ua
+      ASP asp-a0 (m3ua)
+    cs7 instance 1: point-code 0.23.4
+      ASP asp-a1 (m3ua)
+    sccp-address msc0: cs7 instance 0, point-code 0.23.1
+    sccp-address msc0b: cs7 instance 1, point-code 0.23.1
+    listening sockets: 1
+  worker-only parse error, BSC view:
+    parse: ok
+    cs7 instance 0: point-code 0.23.3
+    listening sockets: 0
+  worker-only parse error, worker 0 view:
+    parse: refused
+    cs7 instance 0: point-code 0.23.3
+      ASP asp-a0 (m3ua)
+    listening sockets: 0
+  unusable local address, worker 0 view:
+    parse: ok
+    cs7 instance 0: point-code 0.23.3
+      ASP asp-a0 (m3ua)
+    listening sockets: 0
+Part C: osmo-bsc entry points
+  prescan inline consistent: 0
+  prescan both forms on one worker: -22
+  prescan file form with an asp in the main file: -22
+  prescan no pool, asp in the main file: 0
+  read inline file:
+    parse: ok
+    VTY config file: none (write file refuses)
+    cs7 instance 0: point-code 0.23.3
+    cs7 instance 1: point-code 0.23.4
+    sccp-address msc0: cs7 instance 0, point-code 0.23.1
+    sccp-address msc0b: cs7 instance 1, point-code 0.23.1
+    listening sockets: 0
+  read file without a pool:
+    parse: ok
+    VTY config file: set (write file saves to it)
+    cs7 instance 0: point-code 0.23.3
+    cs7 instance 1: point-code 0.23.4
+    sccp-address msc0: cs7 instance 0, point-code 0.23.1
+    sccp-address msc0b: cs7 instance 1, point-code 0.23.1
+    listening sockets: 0
+  VTY config-file then cs7-instance: -22
+  VTY cs7-instance then config-file: -22
+  VTY cs7-instance, no ..., config-file: 0
+  written configuration:
+    a-worker-pool
+     workers 2
+     worker 0 cs7-instance 3
+     worker 1 cs7-instance 0
+  written configuration, inline declaration only:
+    a-worker-pool
+     workers 0
+     worker 2 cs7-instance 5
+Part D: the source configuration is read once
+  D1: aworker_cfg_read_stable()
+    unchanged file: ok
+    size == limit: ok
+    size == limit + 1: -EFBIG (too large)
+    missing file: -ENOENT
+    directory: -EINVAL (not a regular file)
+    FIFO (does not block): -EINVAL (not a regular file); opened 0 time(s)
+    written in place during the read, contents restored (times only): -ESTALE (changed while read)
+    read differs from the file (second pass only): -ESTALE (changed while read)
+    another file renamed over the path (same contents): -ESTALE (changed while read)
+    grew during the read: -ESTALE (changed while read)
+    shrank during the read: -ESTALE (changed while read)
+    symlink pointed at another file during the read (file read untouched): -ESTALE (changed while read)
+    replaced by a FIFO between the check and the open (does not block): -EINVAL (not a regular file)
+  D2: one open and one buffer for a pool configuration; no pool: as before
+    inline pool:
+      prescan 0, read 0; opened 1 time(s); cs7 instance 0 point-code 0.23.3; VTY config file none
+    inline pool, file rewritten after the prescan (the buffer is parsed):
+      prescan 0, read 0; opened 2 time(s) (one of them the test rewriting it); cs7 instance 0 point-code 0.23.3; VTY config file none
+    inline pool, read without a prescan:
+      prescan 0, read 0; opened 1 time(s); cs7 instance 0 point-code 0.23.3; VTY config file none
+    file-form pool:
+      prescan 0, read 0; opened 1 time(s); cs7 instance 0 point-code 0.23.3; VTY config file set
+    file-form pool, file rewritten after the prescan (the buffer is parsed):
+      prescan 0, read 0; opened 2 time(s) (one of them the test rewriting it); cs7 instance 0 point-code 0.23.3; VTY config file set
+    no pool (legacy: parsed from the path):
+      prescan 0, read 0; opened 2 time(s); cs7 instance 0 point-code 0.23.3; VTY config file set
+    no pool, file rewritten after the prescan (legacy: the new contents):
+      prescan 0, read 0; opened 3 time(s) (one of them the test rewriting it); cs7 instance 0 point-code 0.23.5; VTY config file set
+  D3: a file not readable in one stable pass: refused with a pool, as before without
+    file-form pool, exactly 16 MiB: prescan 0
+    file-form pool, 16 MiB + 1: prescan -22
+    no pool, 16 MiB + 1: prescan 0
+    inline pool, changed while read: prescan -22
+    no pool, changed while read: prescan 0
+    inline pool from a FIFO: prescan -22
+  D4: one check alone in charge (fstat() and pread() wrapped)
+    short read (SR6): the file is truncated to 17 of its 34 octets right before it is read:
+      1. BEFORE_OPEN hook
+      2. fstat #1 = 34 octets
+      3. file truncated to 17 octets
+      4. pread(offset 0, 34 octets) = 17
+      5. pread(offset 17, 17 octets) = 0
+      result: -ESTALE (changed while read); buffer returned: no
+      AFTER_READ hook called 0 time(s); pread() 2 time(s); fstat() 1 time(s)
+    grown after the growth probe, times unchanged (SR1):
+      1. BEFORE_OPEN hook
+      2. fstat #1 = 34 octets
+      3. pread(offset 0, 34 octets) = 34
+      4. pread(offset 34, 1 octets) = 0
+      5. AFTER_READ hook (34 octets)
+      6. fstat #2 = 36 octets (2 octets really appended first); mtime and ctime of fstat #1 reported
+      result: -ESTALE (changed while read); buffer returned: no
+      afterwards: the file has 36 octets, its first 34 unchanged: yes; the path names the file read (device and inode): yes; the file read (inode) is the one that grew: yes
+    control: times of the first fstat() reported, file unchanged:
+      1. BEFORE_OPEN hook
+      2. fstat #1 = 34 octets
+      3. pread(offset 0, 34 octets) = 34
+      4. pread(offset 34, 1 octets) = 0
+      5. AFTER_READ hook (34 octets)
+      6. fstat #2 = 34 octets; mtime and ctime of fstat #1 reported
+      7. pread(offset 0, 34 octets) = 34
+      result: ok; buffer returned: yes
+  D5: file-form pool, parsed by path (as before) and from the buffer read once
+    valid; comments, an empty line, the last line without a newline:
+      by path:   prescan 0, read 0; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code 0.23.3
+      by buffer: prescan 0, read 0; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code 0.23.3
+      VTY config file: the same, the file
+      'show running-config': identical (76 lines)
+      stderr: identical (0 octets)
+      'show running-config' (both):
+        | 
+        | Current configuration:
+        | !
+        | !
+        | log stderr blocking-io
+        |  logging filter all 1
+        |  logging color 1
+        |  logging print category-hex 1
+        |  logging print category 0
+        |  logging print thread-id 0
+        |  logging timestamp 0
+        |  logging print file 0
+        |  (the ' logging level' lines are not shown)
+        | !
+        | line vty
+        |  no login
+        | !
+        | cs7 instance 0
+        |  network-indicator international
+        |  point-code 0.23.3
+        | a-worker-pool
+        |  workers 2
+        |  worker 0 config-file /nonexistent/w0.cfg
+        |  worker 1 config-file /nonexistent/w1.cfg
+        | end
+    invalid: an unknown command, more configuration after it:
+      by path:   prescan 0, read -22; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code 0.23.3
+      by buffer: prescan 0, read -22; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code 0.23.3
+      VTY config file: the same, the file
+      'show running-config': identical (75 lines)
+      stderr: identical (89 octets)
+      stderr, by path:
+        | There is no such command.
+        | Error occurred during reading the below line:
+        | no-such-command
+        | 
+      stderr, by buffer:
+        | There is no such command.
+        | Error occurred during reading the below line:
+        | no-such-command
+        | 
+    invalid: an argument the command does not accept:
+      by path:   prescan 0, read -22; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code (no PC)
+      by buffer: prescan 0, read -22; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code (no PC)
+      VTY config file: the same, the file
+      'show running-config': identical (71 lines)
+      stderr: identical (182 octets)
+      stderr, by path:
+        | \x1b[38;5;43m<0024> 0: Error parsing Pointcode 'not-a-point-code'\x1b[0;m
+        | Error occurred during reading the below line:
+        |  point-code not-a-point-code
+        | 
+        | Invalid point code (not-a-point-code)
+      stderr, by buffer:
+        | \x1b[38;5;43m<0024> 0: Error parsing Pointcode 'not-a-point-code'\x1b[0;m
+        | Error occurred during reading the below line:
+        |  point-code not-a-point-code
+        | 
+        | Invalid point code (not-a-point-code)
+    NUL octets: inside a line, at the start of a line, inside a pool line, at the very end:
+      by path:   prescan 0, read 0; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code 0.23.3
+      by buffer: prescan 0, read 0; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code 0.23.3
+      VTY config file: the same, the file
+      'show running-config': identical (75 lines)
+      stderr: identical (0 octets)
+      'show running-config' (both):
+        | 
+        | Current configuration:
+        | !
+        | !
+        | log stderr blocking-io
+        |  logging filter all 1
+        |  logging color 1
+        |  logging print category-hex 1
+        |  logging print category 0
+        |  logging print thread-id 0
+        |  logging timestamp 0
+        |  logging print file 0
+        |  (the ' logging level' lines are not shown)
+        | !
+        | line vty
+        |  no login
+        | !
+        | cs7 instance 0
+        |  network-indicator international
+        |  point-code 0.23.3
+        | a-worker-pool
+        |  workers 1
+        |  worker 0 config-file /nonexistent/w0.cfg
+        | end
+      stderr, by path:
+        | (empty)
+      stderr, by buffer:
+        | (empty)
+    NUL octet right after the pool node's name:
+      by path:   prescan 0, read 0; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code 0.23.3
+      by buffer: prescan 0, read 0; file opened 1 time(s); 'show running-config' 0; cs7 instance 0 point-code 0.23.3
+      VTY config file: the same, the file
+      'show running-config': identical (75 lines)
+      stderr: identical (0 octets)
+      stderr, by path:
+        | (empty)
+      stderr, by buffer:
+        | (empty)
+Part E: worker logging views (D-2)
+  E1: logging target scoping in the real VTY parser
+    nothing (the targets a process starts with):
+      parse: 0; log targets afterwards:
+        log stderr blocking-io
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 0
+         logging level: notice for all categories
+      log file on disk: no
+    'log file' with a tab-indented 'logging level set-all info' (as in the layout case):
+      parse: 0; log targets afterwards:
+        log stderr blocking-io
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 0
+         logging level: notice for all categories
+        log file <dir>/e1.log
+         logging filter all 0
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 1
+         logging level: info for all categories
+      log file on disk: yes
+    the same line not indented: refused, it exists only inside a 'log' node:
+      parse: -22; log targets afterwards:
+        log stderr blocking-io
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 0
+         logging level: notice for all categories
+        log file <dir>/e1.log
+         logging filter all 0
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 1
+         logging level: notice for all categories
+      log file on disk: yes
+    stderr settings before and after a file target with its own settings:
+      parse: 0; log targets afterwards:
+        log stderr
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 1
+         logging print thread-id 0
+         logging timestamp 0
+         logging print level 1
+         logging print file 0
+         logging level: notice for all categories
+        log file <dir>/e1.log
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 1
+         logging print file 1
+         logging level: info for the other categories
+         logging level rsl debug
+      log file on disk: yes
+    the same without the file target's six lines:
+      parse: 0; log targets afterwards:
+        log stderr
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 1
+         logging print thread-id 0
+         logging timestamp 0
+         logging print level 1
+         logging print file 0
+         logging level: notice for all categories
+      log file on disk: no
+    targets other than the file, with and without the file target's lines: identical
+    'no log file' removes the file target:
+      parse: 0; log targets afterwards:
+        log stderr blocking-io
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 0
+         logging level: notice for all categories
+      log file on disk: yes
+    'no log file' for a file target that does not exist: refused:
+      parse: -22; log targets afterwards:
+        log stderr blocking-io
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 0
+         logging level: notice for all categories
+      log file on disk: no
+  E2: views of a file with every kind of log target, two workers
+== logging-all
+  inline: yes
+  check: 0 problem(s)
+  BSC view (45 lines; file 45 lines):
+     1|! logging, every kind of target
+     2|log stderr
+     3| logging filter all 1
+     4| logging level set-all notice
+     5|log file /var/log/osmocom/osmo-bsc.log
+     6| logging filter all 1
+     7| logging level set-all info
+     8| logging level rsl debug
+     9| ! a comment inside the file target
+    10| logging print file 1
+    11| logging print category 1
+    12| logging timestamp 1
+    14|log syslog daemon
+    15| logging level set-all error
+    16|log systemd-journal raw
+    17| logging level set-all notice
+    18|log gsmtap 127.0.0.1
+    19| logging level set-all fatal
+    20|log alarms 98
+    21| logging level set-all error
+    22|log emscripten
+    23| logging level set-all notice
+    24|log file /var/log/osmocom/second.log blocking-io
+    25|	logging level set-all debug
+    26|no log file /var/log/osmocom/old.log
+    27|no log syslog
+    28|no log gsmtap
+    29|no log stderr
+    30|log stderr
+    31| logging print level 1
+    32|line vty
+    33| bind 127.0.0.1
+    34|cs7 instance 0
+    35| point-code 0.23.3
+    38|cs7 instance 1
+    39| point-code 0.23.4
+    42|a-worker-pool
+    43| workers 2
+    44| worker 0 cs7-instance 0
+    45| worker 1 cs7-instance 1
+  Supervisor view (45 lines; file 45 lines):
+     2|log stderr
+     3| logging filter all 1
+     4| logging level set-all notice
+     5|log file /var/log/osmocom/osmo-bsc.log
+     6| logging filter all 1
+     7| logging level set-all info
+     8| logging level rsl debug
+     9| ! a comment inside the file target
+    10| logging print file 1
+    11| logging print category 1
+    12| logging timestamp 1
+    14|log syslog daemon
+    15| logging level set-all error
+    16|log systemd-journal raw
+    17| logging level set-all notice
+    18|log gsmtap 127.0.0.1
+    19| logging level set-all fatal
+    20|log alarms 98
+    21| logging level set-all error
+    22|log emscripten
+    23| logging level set-all notice
+    24|log file /var/log/osmocom/second.log blocking-io
+    25|	logging level set-all debug
+    30|log stderr
+    31| logging print level 1
+    42|a-worker-pool
+    43| workers 2
+    44| worker 0 cs7-instance 0
+    45| worker 1 cs7-instance 1
+  worker 0 view (45 lines; file 45 lines):
+     2|log stderr
+     3| logging filter all 1
+     4| logging level set-all notice
+    14|log syslog daemon
+    15| logging level set-all error
+    16|log systemd-journal raw
+    17| logging level set-all notice
+    18|log gsmtap 127.0.0.1
+    19| logging level set-all fatal
+    20|log alarms 98
+    21| logging level set-all error
+    22|log emscripten
+    23| logging level set-all notice
+    27|no log syslog
+    28|no log gsmtap
+    29|no log stderr
+    30|log stderr
+    31| logging print level 1
+    34|cs7 instance 0
+    35| point-code 0.23.3
+    36| asp asp-a0 2905 0 m3ua
+    37|  remote-ip 10.0.0.10
+    42|a-worker-pool
+    43| workers 2
+    44| worker 0 cs7-instance 0
+    45| worker 1 cs7-instance 1
+  worker 1 view (45 lines; file 45 lines):
+     2|log stderr
+     3| logging filter all 1
+     4| logging level set-all notice
+    14|log syslog daemon
+    15| logging level set-all error
+    16|log systemd-journal raw
+    17| logging level set-all notice
+    18|log gsmtap 127.0.0.1
+    19| logging level set-all fatal
+    20|log alarms 98
+    21| logging level set-all error
+    22|log emscripten
+    23| logging level set-all notice
+    27|no log syslog
+    28|no log gsmtap
+    29|no log stderr
+    30|log stderr
+    31| logging print level 1
+    38|cs7 instance 1
+    39| point-code 0.23.4
+    40| asp asp-a1 2905 0 m3ua
+    41|  remote-ip 10.0.0.11
+    42|a-worker-pool
+    43| workers 2
+    44| worker 0 cs7-instance 0
+    45| worker 1 cs7-instance 1
+== logging-bad-indent-in-file-target
+  inline: yes
+  check: 2 problem(s)
+    line 8: worker 0 owns cs7 instance 0, but this file has no 'cs7 instance 0' section
+    line 3: inconsistent indentation: leading whitespace must match the lines around it and reflect the node levels (the VTY parser refuses this line)
+  BSC view (8 lines; file 8 lines):
+     1|log file /var/log/osmocom/osmo-bsc.log
+     2| logging level set-all info
+     3|	logging timestamp 1
+     4|log stderr
+     5| logging level set-all notice
+     6|a-worker-pool
+     7| workers 1
+     8| worker 0 cs7-instance 0
+  Supervisor view (8 lines; file 8 lines):
+     1|log file /var/log/osmocom/osmo-bsc.log
+     2| logging level set-all info
+     3|	logging timestamp 1
+     4|log stderr
+     5| logging level set-all notice
+     6|a-worker-pool
+     7| workers 1
+     8| worker 0 cs7-instance 0
+  worker 0 view (8 lines; file 8 lines):
+     4|log stderr
+     5| logging level set-all notice
+     6|a-worker-pool
+     7| workers 1
+     8| worker 0 cs7-instance 0
+  E3: the BSC view and the worker views, really parsed
+    BSC view:
+      parse: 0; log targets afterwards:
+        log stderr
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 1
+         logging print thread-id 0
+         logging timestamp 0
+         logging print level 1
+         logging print file 0
+         logging level: notice for all categories
+        log file <dir>/e3.log
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 1
+         logging print file 1
+         logging level: info for the other categories
+         logging level rsl debug
+        log alarms 98
+         logging filter all 0
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 1
+         logging level: error for all categories
+      log file on disk: yes
+    worker 0 view:
+      parse: 0; log targets afterwards:
+        log stderr
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 1
+         logging print thread-id 0
+         logging timestamp 0
+         logging print level 1
+         logging print file 0
+         logging level: notice for all categories
+        log alarms 98
+         logging filter all 0
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 1
+         logging level: error for all categories
+      log file on disk: no
+    worker 0: file target: none; every other target as the BSC has it: yes
+    worker 1 view:
+      parse: 0; log targets afterwards:
+        log stderr
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 1
+         logging print thread-id 0
+         logging timestamp 0
+         logging print level 1
+         logging print file 0
+         logging level: notice for all categories
+        log alarms 98
+         logging filter all 0
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 1
+         logging level: error for all categories
+      log file on disk: no
+    worker 1: file target: none; every other target as the BSC has it: yes
+    'no log file', BSC view:
+      parse: 0; log targets afterwards:
+        log stderr
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 0
+         logging level: info for all categories
+      log file on disk: yes
+    'no log file', worker 0 view:
+      parse: 0; log targets afterwards:
+        log stderr
+         logging filter all 1
+         logging color 1
+         logging print category-hex 1
+         logging print category 0
+         logging print thread-id 0
+         logging timestamp 0
+         logging print file 0
+         logging level: info for all categories
+      log file on disk: no
+  E4: no 'log file' in a worker view, whatever the model says
+    empty: line 0
+    stderr only: line 0
+    commented out: line 0
+    'log file' on line 2: line 2
+    'no log file', indented: line 2
+    'log file' indented below another node: line 2
+    tab between the keywords: line 1
+    'logfile' (another word): line 0
+    'log files' (another word): line 0
+    worker view from the model: made, no 'log file'
+    worker view from a model that does not mark the file target: none (refused)
+    BSC view from that model: made, with the file target (the BSC keeps it)
+  E5: the model's marks (log_file, no_log)
+    'no log file /x.log': log_file 1, no_log 1
+    'no  log\tfile /x.log': log_file 1, no_log 1
+    'no log stderr': log_file 0, no_log 1
+    'no log syslog': log_file 0, no_log 1
+    'no log gsmtap': log_file 0, no_log 1
+    'log file /x.log': log_file 1, no_log 0
+    ' logging level set-all info': log_file 1, no_log 0
+    ' ! a comment': log_file 1, no_log 0
+    'log stderr': log_file 0, no_log 0
+    ' logging level set-all info': log_file 0, no_log 0
+    'no logging level force-all': log_file 0, no_log 0
+    'nolog file /x.log': log_file 0, no_log 0
+    '! no log file /x.log': log_file 0, no_log 0
+    'log stderr': log_file 0, no_log 0
+    'log stderr': log_file 0, no_log 0
+Part F: the worker-view check (D-13)
+  F1: the builder's worker views pass the check
+    inline-basic (worker 0): accepted
+    inline-basic (worker 1): accepted
+    real (worker 0): accepted
+    real (worker 1): accepted
+    logging-all (worker 0): accepted
+    logging-all (worker 1): accepted
+    d2-inline (worker 0): accepted
+  F2: one case per rule
+    valid (worker 0): accepted
+    valid, with comments, blank lines and the other targets' forms (worker 0): accepted
+    'log file' (worker 0): REFUSED
+      line 11: 'log file' / 'no log file' in a worker view: a worker never writes the BSC's log files (D-2)
+    'no log file' (worker 0): REFUSED
+      line 11: 'log file' / 'no log file' in a worker view: a worker never writes the BSC's log files (D-2)
+    'log file' indented below 'log stderr' (worker 0): REFUSED
+      line 2: 'log' / 'no log' below another command: log targets are configured at the top level only
+      line 2: 'log file' / 'no log file' in a worker view: a worker never writes the BSC's log files (D-2)
+    'log stderr' indented below the cs7 instance (worker 0): REFUSED
+      line 11: 'log' / 'no log' below another command: log targets are configured at the top level only
+    'logging ...' at the top level (worker 0): REFUSED
+      line 11: 'logging' is not part of a worker view (only 'log' targets, 'no log', 'a-worker-pool' and the worker's own cs7 instance are)
+    'logging ...' below the cs7 instance (worker 0): REFUSED
+      line 11: 'logging ...' outside a 'log <target>' section
+    another worker's cs7 instance, with a transport (worker 0): REFUSED
+      line 11: cs7 instance 1 is not worker 0's (it owns only cs7 instance 0)
+    another cs7 instance, configuration only (worker 0): REFUSED
+      line 11: cs7 instance 5 is not worker 0's (it owns only cs7 instance 0)
+    a cs7 instance that is not a valid number (worker 0): REFUSED
+      line 11: a cs7 instance that is not a valid instance number (worker 0: it owns only cs7 instance 0)
+    another cs7 command (worker 0): REFUSED
+      line 11: 'cs7' is not part of a worker view (only 'log' targets, 'no log', 'a-worker-pool' and the worker's own cs7 instance are)
+    worker 1's view, checked as worker 0 (worker 0): REFUSED
+      line 3: worker 0 owns cs7 instance 0, but the worker view has no 'cs7 instance 0' section
+      line 5: cs7 instance 1 is not worker 0's (it owns only cs7 instance 0)
+    own cs7 instance missing (worker 0): REFUSED
+      line 3: worker 0 owns cs7 instance 0, but the worker view has no 'cs7 instance 0' section
+    own cs7 instance twice (worker 0): REFUSED
+      line 11: 'cs7 instance 0' appears more than once in the worker view (first at line 7)
+    own cs7 instance without a transport (worker 0): REFUSED
+      line 4: 'cs7 instance 0' has no asp, as or listen node: worker 0 would own nothing
+    a transport below another command than its cs7 instance (worker 0): REFUSED
+      line 6: 'line' is not part of a worker view (only 'log' targets, 'no log', 'a-worker-pool' and the worker's own cs7 instance are)
+    no 'a-worker-pool' section (worker 0): REFUSED
+      line 0: the worker view has no 'a-worker-pool' section, so it does not declare worker 0
+      line 1: cs7 instance 0 is not worker 0's (it owns none here)
+    worker not declared (worker 2, 'workers 2') (worker 2): REFUSED
+      line 3: the 'a-worker-pool' section does not declare worker 2 ('workers 2')
+      line 7: cs7 instance 0 is not worker 2's (it owns none here)
+    worker index beyond the largest pool (worker 16): REFUSED
+      line 3: the 'a-worker-pool' section does not declare worker 16 ('workers 2')
+      line 7: cs7 instance 0 is not worker 16's (it owns none here)
+    worker declared with 'config-file' only (worker 0): REFUSED
+      line 3: worker 0 is not declared with the inline form 'worker 0 cs7-instance <X>'; it is declared with 'config-file'
+      line 4: cs7 instance 0 is not worker 0's (it owns none here)
+    worker declared in both forms (worker 0): REFUSED
+      line 4: worker 0 is declared twice: 'worker 0 config-file' (line 3) and 'worker 0 cs7-instance' (line 4)
+      line 5: cs7 instance 0 is not worker 0's (it owns none here)
+    'line vty' (a BSC section) (worker 0): REFUSED
+      line 11: 'line' is not part of a worker view (only 'log' targets, 'no log', 'a-worker-pool' and the worker's own cs7 instance are)
+    'network' (a BSC section) (worker 0): REFUSED
+      line 11: 'network' is not part of a worker view (only 'log' targets, 'no log', 'a-worker-pool' and the worker's own cs7 instance are)
+    'msc 0' (a BSC section) (worker 0): REFUSED
+      line 11: 'msc' is not part of a worker view (only 'log' targets, 'no log', 'a-worker-pool' and the worker's own cs7 instance are)
+    'exit' below the cs7 instance (worker 0): REFUSED
+      line 11: 'exit' / 'end' in a worker view: its node structure must follow from the indentation alone
+    'exit' in a log target (worker 0): REFUSED
+      line 2: 'exit' / 'end' in a worker view: its node structure must follow from the indentation alone
+    'end' at the top level (worker 0): REFUSED
+      line 11: 'exit' / 'end' in a worker view: its node structure must follow from the indentation alone
+    inconsistent indentation (worker 0): REFUSED
+      line 11: inconsistent indentation: leading whitespace must match the lines around it and reflect the node levels (the VTY parser refuses this line)
+    a line longer than the parser reads at once (worker 0): REFUSED
+      line 11: line longer than 510 characters
+      line 12: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' is not part of a worker view (only 'log' targets, 'no log', 'a-worker-pool' and the worker's own cs7 instance are)
+    empty (worker 0): REFUSED
+      line 0: the worker view is empty
+    exactly AWORKER_CFG_SNAPSHOT_MAX octets (worker 0): accepted
+    AWORKER_CFG_SNAPSHOT_MAX + 1 octets (worker 0): REFUSED
+      line 0: the worker view has 1048577 octets, more than the 1048576 a worker accepts
+  F3: refused views are never parsed: no cs7 instance, no ASP, no socket
+    worker 1's view (worker 1):
+      check: ok; parse: ok
+      cs7 instances afterwards: 1
+    cs7 instance 1: point-code 0.23.4
+      ASP asp-a1 (m3ua)
+    sccp-address msc0b: cs7 instance 1, point-code 0.23.1
+    listening sockets: 1
+    worker 1's view, given to worker 0 (worker 0):
+      check: 2 problem(s), first on line 34; not parsed
+      cs7 instances afterwards: 0
+    listening sockets: 0
+    worker 1's view with a 'log file' (worker 1):
+      check: 1 problem(s), first on line 36; not parsed
+      cs7 instances afterwards: 0
+    listening sockets: 0
+    worker 1's view with an 'exit' (worker 1):
+      check: 1 problem(s), first on line 36; not parsed
+      cs7 instances afterwards: 0
+    listening sockets: 0
+    worker 0's view with worker 1's cs7 instance added (worker 0):
+      check: 1 problem(s), first on line 36; not parsed
+      cs7 instances afterwards: 0
+    listening sockets: 0
+PASSED

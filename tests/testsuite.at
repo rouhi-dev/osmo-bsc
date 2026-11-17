@@ -19,6 +19,18 @@ cat $abs_srcdir/aworker_cfg_scan/aworker_cfg_scan_test.ok > expout
 AT_CHECK([$abs_top_builddir/tests/aworker_cfg_scan/aworker_cfg_scan_test], [], [expout], [ignore])
 AT_CLEANUP
 
+AT_SETUP([aworker_cfg_view])
+AT_KEYWORDS([aworker_cfg_view])
+cat $abs_srcdir/aworker_cfg_view/aworker_cfg_view_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_cfg_view/aworker_cfg_view_test], [], [expout], [ignore])
+AT_CLEANUP
+
+AT_SETUP([aworker_cfg_write])
+AT_KEYWORDS([aworker_cfg_write])
+cat $abs_srcdir/aworker_cfg_write/aworker_cfg_write_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_cfg_write/aworker_cfg_write_test], [], [expout], [ignore])
+AT_CLEANUP
+
 AT_SETUP([aworker_ipc])
 AT_KEYWORDS([aworker_ipc])
 cat $abs_srcdir/aworker_ipc/aworker_ipc_test.ok > expout
@@ -35,6 +47,24 @@ AT_SETUP([aworker_proc])
 AT_KEYWORDS([aworker_proc])
 cat $abs_srcdir/aworker_proc/aworker_proc_test.ok > expout
 AT_CHECK([$abs_top_builddir/tests/aworker_proc/aworker_proc_test], [], [expout], [ignore])
+AT_CLEANUP
+
+AT_SETUP([aworker_snapshot])
+AT_KEYWORDS([aworker_snapshot])
+cat $abs_srcdir/aworker_snapshot/aworker_snapshot_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_snapshot/aworker_snapshot_test], [], [expout], [ignore])
+AT_CLEANUP
+
+AT_SETUP([aworker_snapshot_syscall])
+AT_KEYWORDS([aworker_snapshot_syscall])
+cat $abs_srcdir/aworker_snapshot/aworker_snapshot_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_snapshot/aworker_snapshot_syscall_test], [], [expout], [ignore])
+AT_CLEANUP
+
+AT_SETUP([aworker_worker])
+AT_KEYWORDS([aworker_worker])
+cat $abs_srcdir/aworker_worker/aworker_worker_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_worker/aworker_worker_test $abs_top_builddir/src/osmo-bsc/osmo-bsc], [], [expout], [ignore])
 AT_CLEANUP
 
 AT_SETUP([bsc])

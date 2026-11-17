@@ -32,9 +32,18 @@
  * process. It then binds the SCCP users the main process asks for and forwards SCCP operations in both
  * directions over the IPC link.
  *
+ * Snapshot mode (inline form, S2-2 decision D-6): instead of a config file, the worker gets its view of the main
+ * configuration file as a snapshot (aworker_snapshot.h) on snapshot_fd. It reads it completely and closes the
+ * descriptor (aworker_snapshot_read()), checks the view (aworker_cfg_check_worker_view(), D-13) and only then parses
+ * it -- a view refused by either is never parsed, so no ASP and no socket is created. After the parse, the cs7
+ * instances with transport nodes must be exactly the one the view's 'a-worker-pool' section declares for this
+ * worker. That section is allowed only in snapshot mode; a legacy config file with it is refused as before.
+ *
  * \param[in] fd the worker's end of the AF_UNIX SOCK_SEQPACKET link to the main process.
  * \param[in] worker_idx this worker's index in the pool.
- * \param[in] cfg_file the worker's config file.
+ * \param[in] cfg_file the worker's config file (legacy), or NULL in snapshot mode.
+ * \param[in] snapshot_fd the snapshot's descriptor (snapshot mode), or -1 with cfg_file.
  * \returns never; the process exits with one of the AWORKER_EXIT_* codes.
  */
-void aworker_run(int fd, unsigned int worker_idx, const char *cfg_file) __attribute__((noreturn));
+void aworker_run(void *ctx, int fd, unsigned int worker_idx, const char *cfg_file, int snapshot_fd)
+	__attribute__((noreturn));

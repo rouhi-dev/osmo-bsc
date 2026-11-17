@@ -8,9 +8,13 @@ noinst_HEADERS = \
 	assignment_fsm.h \
 	aworker.h \
 	aworker_cfg_scan.h \
+	aworker_cfg_view.h \
 	aworker_ipc.h \
 	aworker_ipc_link.h \
+	aworker_log.h \
 	aworker_pool.h \
+	aworker_pool_internal.h \
+	aworker_snapshot.h \
 	bsc_rll.h \
 	bsc_sccp_backend.h \
 	bsc_stats.h \

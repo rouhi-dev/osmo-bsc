@@ -82,4 +82,44 @@ P19: a startup timeout never outlives its process
 P20: startup-timeout is 60 s by default; a configured value replaces it
   default: a process started at 5 s is still starting at 64.999 s, timed out at 65 s
   'startup-timeout 30': still starting at 34.999 s, timed out at 35 s
+P21: workers of the inline form start from their sealed memfd snapshots
+  each worker's command line is --aworker-fd, --aworker-index and --aworker-snapshot-fd (no --aworker-config)
+  with >300 descriptors open in the main process, each worker held exactly stdio, its IPC socket and memfd:bsc-aworker-<N>
+  each read exactly its own worker view and closed the descriptor before going on
+  the main process holds the two snapshots, close-on-exec
+  stopping the pool closes them; no process left
+P22: a worker cannot reach another worker's snapshot, nor change any snapshot
+  worker 0 held and read only memfd:bsc-aworker-0 (cs7 instance 0), worker 1 only memfd:bsc-aworker-1 (cs7 instance 1)
+  through /proc/<main pid>/fd each worker can open both snapshots (same user) and read them, but writing and truncating fail with EPERM (sealed)
+P23: the main configuration file edited, replaced or deleted: a restarted worker reads the original
+  edited in place: the restarted worker 1 read its view as of the start
+  replaced (rename over it): the same
+  deleted: the same
+  every restart used the one snapshot made at startup (same descriptor, still two)
+P24: restarts read the whole snapshot, whatever its shared file offset
+  with the offset at the end, two restarts each read the complete view; the offset is unchanged
+P25: a worker reset after FAILED starts from the snapshot made at startup
+  a worker that cannot use its snapshot is FAILED (config), naming the snapshot
+  reset: it read its view as of the start, not the edited file, and the log says so
+P26: a worker of the inline form claiming another worker's cs7 instance is FAILED (ownership)
+  worker 1 reported cs7 instance 0: FAILED (ownership); worker 0 READY
+P27: the main process' snapshot descriptors: restart, stop, fork failure, exec failure
+  two snapshots while running; a restart neither adds nor replaces one
+  stop: none left
+  fork failure (RLIMIT_NPROC 0): the start fails, no process, no snapshot left
+  exec failure: both workers FAILED (config), the two snapshots kept for a reset
+  stop: none left, no process left
+P28: no sealed memfd and no usable fallback directory: the start is refused before any fork
+  $RUNTIME_DIRECTORY a symbolic link, /dev/shm not a directory, /tmp missing (all redirected): refused, no fork, no snapshot, nothing left in any directory
+P29: the fallback snapshot: delivered, re-checked before every start, refused once changed
+  each worker got its unlinked, read-only fallback file (WARNING logged); no directory left behind
+  unchanged: a restart is allowed and reads it again
+  changed through /proc/<pid>/fd after fchmod: the restart is refused before fork, worker 1 FAILED (config); worker 0 READY
+  a reset is refused the same way
+P30: a pool configuration that differs from the file read at startup is refused before any fork
+  worker 1 on another cs7 instance: refused
+  another number of workers: refused
+  no fork, no pool, no snapshot
+  the same configuration as the file: started
+  the file read at startup uses the file form, the running configuration the inline form: refused
 PASSED

@@ -57,6 +57,6 @@ T12: expected cs7 ownership with the inline form
   an msc on an instance no worker owns is refused, naming 'worker <N> cs7-instance <X>'
   two workers on one instance are refused
   a worker with both forms is refused
-  starting workers from the inline form is refused (no pool, nothing started)
+  an inline pool without the configuration file it was read from is refused before any fork (no pool, nothing started)
 talloc blocks at the end: unchanged
 PASSED

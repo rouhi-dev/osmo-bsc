@@ -1186,14 +1186,16 @@ static void test_t12_inline_ownership(void)
 	TALLOC_FREE(cfg->cfg_file[0]);
 	printf("  a worker with both forms is refused\n");
 
-	/* Workers are not started from the inline form yet: the start is refused before anything is forked. */
+	/* Workers of the inline form start from the main configuration file as read once at startup. Without it --
+	 * the pool configured directly, as here -- the start is refused before anything is forked. */
 	t10_capture_begin();
 	CHECK(aworker_pool_start(ctx) == -EINVAL);
 	log = t10_capture_end();
 	CHECK(aworker_pool_num_workers() == 0);
-	CHECK(strstr(log, "worker 0 uses the inline form ('worker 0 cs7-instance 0'), from which this osmo-bsc"
-			  " cannot start workers yet") != NULL);
-	printf("  starting workers from the inline form is refused (no pool, nothing started)\n");
+	CHECK(strstr(log, "worker 0 uses the inline form ('worker 0 cs7-instance 0'), but no configuration file using"
+			  " that form was read at startup: there is nothing to start its workers from") != NULL);
+	printf("  an inline pool without the configuration file it was read from is refused before any fork (no"
+	       " pool, nothing started)\n");
 
 	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++)
 		cfg->has_cs7_instance[i] = false;

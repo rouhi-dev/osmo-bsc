@@ -30,13 +30,21 @@
  *
  * Two link-time seams (see Makefile.am, -Wl,--wrap): waitpid() can be told that one process cannot be collected
  * (to test a process stuck in the kernel), and prctl(PR_SET_PDEATHSIG) can be delayed (to open the window between
- * fork() and prctl() in which the main process may die). */
+ * fork() and prctl() in which the main process may die).
+ *
+ * P21-P30 start the pool from an inline main configuration file (S2-2 step 7): the worker gets its configuration
+ * snapshot (--aworker-snapshot-fd), which the fake worker takes with the real aworker_snapshot_read() and reports
+ * on. Its own test directives (what the config file holds for P1-P20) then come from a side file, inline<N>.fw in
+ * the test directory ($AWORKER_PROC_TEST_DIR). More seams, for these tests only: memfd_create() can be made to fail
+ * (forcing the snapshot fallback), open() of /dev/shm and /tmp is redirected into the test directory while that
+ * fallback is tested (the real ones are never touched), and fexecve() can be made to fail (exec failure). */
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,9 +66,17 @@
 #include <osmocom/core/utils.h>
 #include <osmocom/sigtran/osmo_ss7.h>
 
+#include <osmocom/sigtran/sccp_sap.h>
+#include <osmocom/vty/command.h>
+#include <osmocom/vty/logging.h>
+#include <osmocom/vty/vty.h>
+
+#include <osmocom/bsc/aworker_cfg_view.h>
 #include <osmocom/bsc/aworker_ipc.h>
 #include <osmocom/bsc/aworker_ipc_link.h>
 #include <osmocom/bsc/aworker_pool.h>
+#include <osmocom/bsc/aworker_pool_internal.h>
+#include <osmocom/bsc/aworker_snapshot.h>
 #include <osmocom/bsc/debug.h>
 
 void *tall_bsc_ctx;
@@ -188,6 +204,7 @@ static struct {
 	bool exit_config;		/*!< behave like a worker that cannot use its config file */
 	bool no_cs7;			/*!< never send CS7_INFO: the worker never becomes READY */
 	bool cs7_on_usr2;		/*!< send CS7_INFO only once SIGUSR2 arrives: READY when the test says so */
+	bool tamper;			/*!< snapshot mode: try to change every snapshot of the main process */
 	volatile sig_atomic_t usr2;
 	struct osmo_timer_list exit_timer;
 	bool got_goodbye;
@@ -290,6 +307,137 @@ static void fw_timer_cb(void *data)
 	osmo_timer_schedule(&fw.timer, 0, 10000);
 }
 
+/* The name of an errno value the tamper report expects (other values by number). */
+static const char *errname(int e)
+{
+	static char buf[16];
+
+	switch (e) {
+	case EPERM: return "EPERM";
+	case EACCES: return "EACCES";
+	case EBADF: return "EBADF";
+	case EINVAL: return "EINVAL";
+	case ENOENT: return "ENOENT";
+	}
+	snprintf(buf, sizeof(buf), "errno%d", e);
+	return buf;
+}
+
+/* Snapshot mode: the target of fd, "" if none. */
+static void fd_target(int fd, char *out, size_t len)
+{
+	char p[64];
+	ssize_t l;
+
+	snprintf(p, sizeof(p), "/proc/self/fd/%d", fd);
+	l = readlink(p, out, len - 1);
+	out[l > 0 ? l : 0] = '\0';
+}
+
+static void fds_str(char *out, size_t len, const int *fds, int n)
+{
+	int i, l = 0;
+
+	out[0] = '\0';
+	for (i = 0; i < n && l < (int)len - 16; i++)
+		l += snprintf(out + l, len - l, "%s%d", i ? "," : "", fds[i]);
+}
+
+/* Snapshot mode: report what was inherited (fds[], listed before anything was opened), take the snapshot with the
+ * real aworker_snapshot_read(), report again, store what was read, and take this worker's cs7 instance from it (a
+ * directive cs7=N in the side file overrides it). Report lines go to <dir>/sreport<N>, the snapshot to
+ * <dir>/snapshot<N>. \returns 0, or -1 if the snapshot was refused (also reported). */
+static int fw_take_snapshot(int argc, char **argv, int ipc_fd, int snap_fd, const int *fds, int n)
+{
+	const char *dir = getenv("AWORKER_PROC_TEST_DIR");
+	char rep[8192], buf[1024], tgt[PATH_MAX], why[256], path[PATH_MAX];
+	struct aworker_cfg_model *m;
+	int after[64], na, i, l = 0, rc;
+	void *sctx = talloc_named_const(NULL, 0, "fw_snapshot");
+	char *text;
+	size_t len;
+
+	if (!dir)
+		return -1;
+	l += snprintf(rep + l, sizeof(rep) - l, "argv=");
+	for (i = 1; i < argc; i++)
+		l += snprintf(rep + l, sizeof(rep) - l, "%s%s", i > 1 ? " " : "", argv[i]);
+	fds_str(buf, sizeof(buf), fds, n);
+	l += snprintf(rep + l, sizeof(rep) - l, "\nfds=%s\nipc=%d\nsnap_fd=%d\n", buf, ipc_fd, snap_fd);
+	fd_target(snap_fd, tgt, sizeof(tgt));
+	l += snprintf(rep + l, sizeof(rep) - l, "snap_target=%s\nother_targets=", tgt);
+	for (i = 0; i < n; i++) {
+		if (fds[i] <= 2 || fds[i] == ipc_fd || fds[i] == snap_fd)
+			continue;
+		fd_target(fds[i], tgt, sizeof(tgt));
+		l += snprintf(rep + l, sizeof(rep) - l, "%d:%s;", fds[i], tgt);
+	}
+	rc = aworker_snapshot_read(sctx, snap_fd, ipc_fd, &text, &len, why, sizeof(why));
+	na = list_fds(after, ARRAY_SIZE(after));
+	fds_str(buf, sizeof(buf), after, na);
+	if (rc < 0)
+		l += snprintf(rep + l, sizeof(rep) - l, "\nread=refused: %s\nafter=%s\n", why, buf);
+	else
+		l += snprintf(rep + l, sizeof(rep) - l, "\nread=ok %zu\nafter=%s\n", len, buf);
+	snprintf(path, sizeof(path), "%s/sreport%u", dir, fw.idx);
+	write_file(path, rep);
+	if (rc < 0)
+		return -1;
+
+	snprintf(path, sizeof(path), "%s/snapshot%u", dir, fw.idx);
+	write_file(path, text);
+	if (aworker_cfg_model_build_buf(sctx, "snapshot", text, len, &m) == 0 && fw.idx < AWORKER_CFG_VIEW_MAX_WORKERS
+	    && m->decl[fw.idx].inl)
+		fw.cs7 = (int)m->decl[fw.idx].cs7_id;
+	talloc_free(sctx);
+	return 0;
+}
+
+/* Snapshot mode, directive tamper=1: try to change each snapshot the main process holds, through /proc/<ppid>/fd
+ * (open read-write, write, truncate), and to read it. Reported to <dir>/tamper<N> as
+ * "<target>:open=..,write=..,truncate=..,read=..;" per snapshot. */
+static void fw_tamper(void)
+{
+	char dpath[64], p[64 + sizeof(((struct dirent *)0)->d_name)], tgt[PATH_MAX], rep[4096], path[PATH_MAX];
+	struct dirent *de;
+	DIR *d;
+	int l = 0;
+
+	snprintf(dpath, sizeof(dpath), "/proc/%d/fd", (int)getppid());
+	d = opendir(dpath);
+	if (!d)
+		return;
+	rep[0] = '\0';
+	while ((de = readdir(d))) {
+		ssize_t tl;
+		int fd;
+		char c;
+
+		snprintf(p, sizeof(p), "%s/%s", dpath, de->d_name);
+		tl = readlink(p, tgt, sizeof(tgt) - 1);
+		if (tl <= 0)
+			continue;
+		tgt[tl] = '\0';
+		if (strncmp(tgt, "/memfd:bsc-aworker-", 19))
+			continue;
+		l += snprintf(rep + l, sizeof(rep) - l, "%s:", tgt + 1);
+		fd = open(p, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			l += snprintf(rep + l, sizeof(rep) - l, "open=%s;", errname(errno));
+			continue;
+		}
+		l += snprintf(rep + l, sizeof(rep) - l, "open=ok,write=%s,", pwrite(fd, "X", 1, 0) < 0
+			      ? errname(errno) : "ok");
+		l += snprintf(rep + l, sizeof(rep) - l, "truncate=%s,", ftruncate(fd, 0) < 0 ? errname(errno)
+			      : "ok");
+		l += snprintf(rep + l, sizeof(rep) - l, "read=%s;", pread(fd, &c, 1, 0) == 1 ? "ok" : "failed");
+		close(fd);
+	}
+	closedir(d);
+	snprintf(path, sizeof(path), "%s/tamper%u", getenv("AWORKER_PROC_TEST_DIR"), fw.idx);
+	write_file(path, rep);
+}
+
 static int fake_worker_main(int argc, char **argv)
 {
 	struct aworker_ipc_link_cfg cfg = {
@@ -298,8 +446,8 @@ static int fake_worker_main(int argc, char **argv)
 		.log_cat = DAWORKER,
 	};
 	const char *cfg_file = NULL;
-	int fd = -1, fds[64], n, i, len;
-	char line[256], exe[PATH_MAX], text[2048];
+	int fd = -1, snap_fd = -1, fds[64], n, i, len;
+	char line[256], exe[PATH_MAX], text[2048], fw_file[PATH_MAX];
 	FILE *f;
 
 	for (i = 1; i + 1 < argc; i++) {
@@ -309,14 +457,25 @@ static int fake_worker_main(int argc, char **argv)
 			fw.idx = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--aworker-config"))
 			cfg_file = argv[++i];
+		else if (!strcmp(argv[i], "--aworker-snapshot-fd"))
+			snap_fd = atoi(argv[++i]);
 	}
-	if (fd < 0 || !cfg_file)
+	if (fd < 0 || !cfg_file == (snap_fd < 0))
 		return 2;
 
 	/* First of all, before this process opens anything: which descriptors did it inherit? */
 	n = list_fds(fds, ARRAY_SIZE(fds));
 	len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
 	exe[len > 0 ? len : 0] = '\0';
+
+	if (snap_fd >= 0) {
+		/* Snapshot mode: take the snapshot as a real worker does, report on it; the test directives come from
+		 * the side file. */
+		if (fw_take_snapshot(argc, argv, fd, snap_fd, fds, n) < 0)
+			return AWORKER_EXIT_CONFIG;
+		snprintf(fw_file, sizeof(fw_file), "%s/inline%u.fw", getenv("AWORKER_PROC_TEST_DIR"), fw.idx);
+		cfg_file = fw_file;
+	}
 
 	f = fopen(cfg_file, "r");
 	if (!f)
@@ -343,8 +502,12 @@ static int fake_worker_main(int argc, char **argv)
 			fw.no_cs7 = true;
 		else if (!strcmp(line, "cs7_on_usr2=1"))
 			fw.cs7_on_usr2 = true;
+		else if (!strcmp(line, "tamper=1"))
+			fw.tamper = true;
 	}
 	fclose(f);
+	if (fw.tamper)
+		fw_tamper();
 	if (fw.exit_config)
 		return AWORKER_EXIT_CONFIG;
 
@@ -2239,6 +2402,833 @@ static void test_p20_startup_timeout_default(char **argv)
 }
 
 /***********************************************************************
+ * P21-P30: the inline form -- workers started from configuration snapshots (S2-2 step 7)
+ ***********************************************************************/
+
+/* Seams for these tests only (see the top of this file). Off unless a test switches them on. */
+static bool g_memfd_fails;		/*!< memfd_create() fails with ENOSYS: the snapshot takes the fallback */
+static unsigned int g_memfd_calls;
+static char g_redir_shm[PATH_MAX];	/*!< if set: what open("/dev/shm") opens instead */
+static char g_redir_tmp[PATH_MAX];	/*!< if set: what open("/tmp") opens instead */
+static bool g_fexecve_fails;		/*!< fexecve() fails with EACCES (inherited by the forked child) */
+
+int __real_memfd_create(const char *name, unsigned int flags);
+int __wrap_memfd_create(const char *name, unsigned int flags);
+int __wrap_memfd_create(const char *name, unsigned int flags)
+{
+	g_memfd_calls++;
+	if (g_memfd_fails) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return __real_memfd_create(name, flags);
+}
+
+static const char *redirect(const char *path)
+{
+	if (g_redir_shm[0] && !strcmp(path, "/dev/shm"))
+		return g_redir_shm;
+	if (g_redir_tmp[0] && !strcmp(path, "/tmp"))
+		return g_redir_tmp;
+	return path;
+}
+
+int __real_open(const char *path, int flags, ...);
+int __wrap_open(const char *path, int flags, ...);
+int __wrap_open(const char *path, int flags, ...)
+{
+	mode_t mode = 0;
+	va_list ap;
+
+	if (flags & O_CREAT) {	/* (O_TMPFILE is only ever used with openat(), not wrapped) */
+		va_start(ap, flags);
+		mode = (mode_t)va_arg(ap, int);
+		va_end(ap);
+	}
+	return __real_open(redirect(path), flags, mode);
+}
+
+/* With _FORTIFY_SOURCE, an open() whose flags are not a constant is compiled as __open_2(). */
+int __real___open_2(const char *path, int flags);
+int __wrap___open_2(const char *path, int flags);
+int __wrap___open_2(const char *path, int flags)
+{
+	return __real___open_2(redirect(path), flags);
+}
+
+int __real_fexecve(int fd, char *const argv[], char *const envp[]);
+int __wrap_fexecve(int fd, char *const argv[], char *const envp[]);
+int __wrap_fexecve(int fd, char *const argv[], char *const envp[])
+{
+	if (g_fexecve_fails) {
+		errno = EACCES;
+		return -1;
+	}
+	return __real_fexecve(fd, argv, envp);
+}
+
+/* The main configuration file of these tests: two workers of the inline form. {PC} is replaced by a point code
+ * (changing it changes the file, but not which worker owns what). */
+static const char *const main_cfg_tmpl =
+	"cs7 instance 0\n"
+	" point-code 0.23.{PC}\n"
+	" asp asp-w0 2905 0 m3ua\n"
+	"  remote-ip 127.0.0.1\n"
+	"  local-ip 127.0.0.1\n"
+	"  role asp\n"
+	"  transport-role client\n"
+	"cs7 instance 1\n"
+	" point-code 0.24.{PC}\n"
+	" asp asp-w1 2905 0 m3ua\n"
+	"  remote-ip 127.0.0.1\n"
+	"  local-ip 127.0.0.1\n"
+	"  role asp\n"
+	"  transport-role client\n"
+	"a-worker-pool\n"
+	" workers 2\n"
+	" worker 0 cs7-instance 0\n"
+	" worker 1 cs7-instance 1\n";
+
+static char g_main_cfg[PATH_MAX];
+static char *g_view[2];		/*!< the worker views of the file as the pool was started from it */
+
+static char *main_cfg_text(unsigned int pc)
+{
+	char num[16], *out = talloc_strdup(ctx, ""), *at;
+	const char *s = main_cfg_tmpl;
+
+	snprintf(num, sizeof(num), "%u", pc);
+	while ((at = strstr(s, "{PC}"))) {
+		out = talloc_strndup_append_buffer(out, s, at - s);
+		out = talloc_strdup_append_buffer(out, num);
+		s = at + 4;
+	}
+	return talloc_strdup_append_buffer(out, s);
+}
+
+/* Write the main configuration file (point code pc) in place, as an editor that truncates and rewrites would. */
+static void main_cfg_rewrite(unsigned int pc)
+{
+	char *t = main_cfg_text(pc);
+	FILE *f = fopen(g_main_cfg, "w");
+
+	OSMO_ASSERT(f && fputs(t, f) >= 0 && fclose(f) == 0);
+	talloc_free(t);
+}
+
+static bool g_vty_ready;
+
+static void inline_vty_init(void)
+{
+	static struct vty_app_info info = { .name = "aworker_proc_test", .go_parent_cb = osmo_ss7_vty_go_parent };
+
+	if (g_vty_ready)
+		return;
+	info.tall_ctx = ctx;
+	vty_init(&info);
+	logging_vty_add_cmds();
+	OSMO_ASSERT(osmo_ss7_init() == 0);
+	osmo_ss7_vty_init_asp(ctx);
+	osmo_sccp_vty_init();
+	aworker_pool_vty_init(ctx);
+	g_vty_ready = true;
+}
+
+/* The fake worker's directives for worker i in snapshot mode (its side file). */
+static void inline_fw(unsigned int i, const char *extra)
+{
+	char path[PATH_MAX], text[2048];
+
+	snprintf(path, sizeof(path), "%s/inline%u.fw", g_dir, i);
+	snprintf(text, sizeof(text), "report=%s/report%u\nheartbeat=%s/heartbeat%u\n%s", g_dir, i, g_dir, i,
+		 extra ? extra : "");
+	write_file(path, text);
+}
+
+/* Configure the pool as osmo-bsc does: the main file is read once and classified (prescan), the BSC parses its view
+ * (which configures 'a-worker-pool'). Then the test's restart settings. \returns 0 if both succeeded. */
+static int inline_configure(void)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	struct aworker_cfg_model *m;
+	char *t;
+	unsigned int i;
+	int rc;
+
+	inline_vty_init();
+	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
+		TALLOC_FREE(cfg->cfg_file[i]);
+		cfg->has_cs7_instance[i] = false;
+	}
+	cfg->num_workers = 0;
+	snprintf(g_main_cfg, sizeof(g_main_cfg), "%s/osmo-bsc.cfg", g_dir);
+	main_cfg_rewrite(3);
+	inline_fw(0, NULL);
+	inline_fw(1, NULL);
+
+	t = main_cfg_text(3);
+	OSMO_ASSERT(aworker_cfg_model_build_buf(ctx, "expected", t, strlen(t), &m) == 0);
+	for (i = 0; i < 2; i++) {
+		TALLOC_FREE(g_view[i]);
+		g_view[i] = aworker_cfg_model_view(ctx, m, AWORKER_CFG_VIEW_WORKER, i, NULL);
+		OSMO_ASSERT(g_view[i]);
+	}
+	talloc_free(m);
+	talloc_free(t);
+
+	rc = aworker_pool_prescan_config(g_main_cfg);
+	if (rc == 0)
+		rc = aworker_pool_read_config(g_main_cfg);
+	cfg->restart_delay = 1;
+	cfg->restart_delay_max = 1;
+	cfg->startup_timeout = 10;
+	cfg->max_restarts = 10;
+	cfg->restart_window = 300;
+	cfg->on_failure = AWORKER_FAILURE_RESTART;
+	return rc;
+}
+
+/* The main process' descriptors of snapshots (sealed memfd or fallback file). */
+static unsigned int parent_snapshot_fds(void)
+{
+	int fds[4096], n, i;
+	unsigned int count = 0;
+	char tgt[PATH_MAX];
+
+	n = list_fds(fds, ARRAY_SIZE(fds));
+	for (i = 0; i < n; i++) {
+		fd_target(fds[i], tgt, sizeof(tgt));
+		if (!strncmp(tgt, "/memfd:bsc-aworker-", 19) || strstr(tgt, "/bsc-aworker-snap."))
+			count++;
+	}
+	return count;
+}
+
+/* Value of key in worker i's snapshot report (talloc'ed, "" if none). */
+static char *sreport(unsigned int i, const char *key)
+{
+	char path[PATH_MAX], line[8192];
+	size_t kl = strlen(key);
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/sreport%u", g_dir, i);
+	f = fopen(path, "r");
+	if (!f)
+		return talloc_strdup(ctx, "");
+	while (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\n")] = '\0';
+		if (!strncmp(line, key, kl) && line[kl] == '=') {
+			fclose(f);
+			return talloc_strdup(ctx, line + kl + 1);
+		}
+	}
+	fclose(f);
+	return talloc_strdup(ctx, "");
+}
+
+static bool sreport_is(unsigned int i, const char *key, const char *expect)
+{
+	char *v = sreport(i, key);
+	bool ok = !strcmp(v, expect);
+
+	if (!ok)
+		printf("  (worker %u %s: '%s', expected '%s')\n", i, key, v, expect);
+	talloc_free(v);
+	return ok;
+}
+
+/* Contents of a file in the test directory (talloc'ed, NULL if missing). */
+static char *dir_file(const char *name)
+{
+	char path[PATH_MAX], *out;
+	long len;
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/%s", g_dir, name);
+	f = fopen(path, "r");
+	if (!f)
+		return NULL;
+	fseek(f, 0, SEEK_END);
+	len = ftell(f);
+	rewind(f);
+	out = talloc_size(ctx, len + 1);
+	OSMO_ASSERT(out && fread(out, 1, len, f) == (size_t)len);
+	out[len] = '\0';
+	fclose(f);
+	return out;
+}
+
+/* Worker i's last snapshot, as read by it, is exactly the view the pool started from. */
+static bool snapshot_is_view(unsigned int i)
+{
+	char name[32], *got;
+	bool ok;
+
+	snprintf(name, sizeof(name), "snapshot%u", i);
+	got = dir_file(name);
+	ok = got && !strcmp(got, g_view[i]);
+	if (!ok)
+		printf("  (worker %u read a snapshot different from its view at start)\n", i);
+	talloc_free(got);
+	return ok;
+}
+
+/* Forget what worker i reported, so that the next report is from its next process. */
+static void forget_reports(unsigned int i)
+{
+	static const char *const names[] = { "sreport", "snapshot", "report", "tamper" };
+	char path[PATH_MAX];
+	unsigned int k;
+
+	for (k = 0; k < ARRAY_SIZE(names); k++) {
+		snprintf(path, sizeof(path), "%s/%s%u", g_dir, names[k], i);
+		unlink(path);
+	}
+}
+
+/* Everything worker i reported says: it got exactly stdio, its IPC socket and its own snapshot (a memfd named after
+ * it, or with fallback the fallback's file), read it completely, closed it, and read exactly its view. */
+static bool worker_got_own_snapshot(unsigned int i, bool fallback)
+{
+	char *ipc = sreport(i, "ipc"), *snap = sreport(i, "snap_fd"), *tgt = sreport(i, "snap_target");
+	char expect[256], *e;
+	bool ok = true;
+
+	snprintf(expect, sizeof(expect), "--aworker-fd %s --aworker-index %u --aworker-snapshot-fd %s", ipc, i, snap);
+	ok &= sreport_is(i, "argv", expect);
+	snprintf(expect, sizeof(expect), atoi(ipc) < atoi(snap) ? "0,1,2,%s,%s" : "0,1,2,%2$s,%1$s", ipc, snap);
+	ok &= sreport_is(i, "fds", expect);
+	ok &= sreport_is(i, "other_targets", "");
+	if (fallback) {
+		ok &= strstr(tgt, "/bsc-aworker-snap.") && strstr(tgt, " (deleted)");
+	} else {
+		snprintf(expect, sizeof(expect), "/memfd:bsc-aworker-%u (deleted)", i);
+		ok &= !strcmp(tgt, expect);
+	}
+	if (!ok)
+		printf("  (worker %u snap_target '%s')\n", i, tgt);
+	e = talloc_asprintf(ctx, "ok %zu", strlen(g_view[i]));
+	ok &= sreport_is(i, "read", e);
+	snprintf(expect, sizeof(expect), "0,1,2,%s", ipc);
+	ok &= sreport_is(i, "after", expect);
+	ok &= snapshot_is_view(i);
+	talloc_free(e);
+	talloc_free(ipc);
+	talloc_free(snap);
+	talloc_free(tgt);
+	return ok;
+}
+
+/* SIGKILL worker i's process. Never kill(0 or -1, ...), which would hit this whole process group (or every process
+ * of the user): a worker without a process is a test failure. \returns whether there was a process. */
+static bool kill_worker(unsigned int i)
+{
+	pid_t pid = winfo(i).pid;
+
+	if (pid <= 0) {
+		printf("  (worker %u has no process to kill: state %u)\n", i, winfo(i).state);
+		return false;
+	}
+	return kill(pid, SIGKILL) == 0;
+}
+
+/* SIGKILL worker i and wait until its next process is READY (or the worker is FAILED). \returns the new pid, 0 if it
+ * did not become READY. */
+static pid_t kill_and_restart(unsigned int i)
+{
+	pid_t old = winfo(i).pid;
+	unsigned long end = now_ms() + 15000;
+
+	forget_reports(i);
+	if (!kill_worker(i))
+		return 0;
+	while (now_ms() < end) {
+		struct aworker_pool_worker_info w = winfo(i);
+		if (w.state == AWORKER_ST_READY && w.pid > 0 && w.pid != old)
+			return w.pid;
+		if (w.state == AWORKER_ST_FAILED)
+			return 0;
+		osmo_select_main_ctx(0);
+	}
+	return 0;
+}
+
+static bool w_failed(void *data)
+{
+	return winfo(*(unsigned int *)data).state == AWORKER_ST_FAILED;
+}
+
+/* The pool's log while it runs, from a file log target (as in aworker_pool_test). */
+static struct log_target *g_cap;
+static char g_capbuf[65536];
+
+static void capture_begin(void)
+{
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "%s/capture.log", g_dir);
+	unlink(path);
+	g_cap = log_target_create_file(path);
+	OSMO_ASSERT(g_cap);
+	log_set_all_filter(g_cap, 1);
+	log_set_category_filter(g_cap, DAWORKER, 1, LOGL_DEBUG);
+	log_set_print_filename2(g_cap, LOG_FILENAME_NONE);
+	log_add_target(g_cap);
+}
+
+static const char *capture_end(void)
+{
+	char *t;
+
+	log_target_destroy(g_cap);
+	g_cap = NULL;
+	t = dir_file("capture.log");
+	osmo_strlcpy(g_capbuf, t ? t : "", sizeof(g_capbuf));
+	talloc_free(t);
+	return g_capbuf;
+}
+
+static void inline_stop(void)
+{
+	aworker_pool_stop();
+}
+
+/* P21: the inline form starts each worker with its own sealed memfd, and with nothing else of the main process. */
+static void test_p21_snapshot_delivered(char **argv)
+{
+	unsigned int i, forks;
+	int status;
+
+	printf("P21: workers of the inline form start from their sealed memfd snapshots\n");
+	open_extra_fds();
+	CHECK(inline_configure() == 0);
+	CHECK(parent_snapshot_fds() == 0);
+	aworker_pool_set_exec(argv[0], 1, argv);
+	forks = g_forks;
+	CHECK(aworker_pool_start(ctx) == 0);
+	CHECK(run_until(all_ready, NULL, 10000));
+	CHECK(g_forks == forks + 2);
+	for (i = 0; i < 2; i++) {
+		int sfd = aworker_pool_snapshot_fd(i);
+		CHECK(worker_got_own_snapshot(i, false));
+		CHECK(sfd > 2 && (fcntl(sfd, F_GETFD) & FD_CLOEXEC));
+	}
+	printf("  each worker's command line is --aworker-fd, --aworker-index and --aworker-snapshot-fd (no"
+	       " --aworker-config)\n");
+	printf("  with >300 descriptors open in the main process, each worker held exactly stdio, its IPC socket and"
+	       " memfd:bsc-aworker-<N>\n");
+	printf("  each read exactly its own worker view and closed the descriptor before going on\n");
+	CHECK(parent_snapshot_fds() == 2);
+	printf("  the main process holds the two snapshots, close-on-exec\n");
+	inline_stop();
+	CHECK(parent_snapshot_fds() == 0);
+	CHECK(__real_waitpid(-1, &status, WNOHANG) < 0 && errno == ECHILD);
+	printf("  stopping the pool closes them; no process left\n");
+	close_extra_fds();
+}
+
+/* P22: worker i holds no snapshot of worker j, and cannot change any snapshot of the main process. */
+static void test_p22_isolation(char **argv)
+{
+	char *t0, *t1, *s0, *s1;
+	bool ok;
+
+	printf("P22: a worker cannot reach another worker's snapshot, nor change any snapshot\n");
+	CHECK(inline_configure() == 0);
+	inline_fw(0, "tamper=1\n");
+	inline_fw(1, "tamper=1\n");
+	aworker_pool_set_exec(argv[0], 1, argv);
+	CHECK(aworker_pool_start(ctx) == 0);
+	CHECK(run_until(all_ready, NULL, 10000));
+	CHECK(worker_got_own_snapshot(0, false) && worker_got_own_snapshot(1, false));
+	s0 = dir_file("snapshot0");
+	s1 = dir_file("snapshot1");
+	CHECK(s0 && s1 && strcmp(s0, s1) && strstr(s0, "cs7 instance 0") && !strstr(s0, "cs7 instance 1")
+	      && strstr(s1, "cs7 instance 1") && !strstr(s1, "cs7 instance 0"));
+	printf("  worker 0 held and read only memfd:bsc-aworker-0 (cs7 instance 0), worker 1 only"
+	       " memfd:bsc-aworker-1 (cs7 instance 1)\n");
+	t0 = dir_file("tamper0");
+	t1 = dir_file("tamper1");
+	ok = t0 && t1;
+	ok = ok && !strcmp(t0, t1);
+	ok = ok && strstr(t0, "memfd:bsc-aworker-0 (deleted):open=ok,write=EPERM,truncate=EPERM,read=ok;")
+		&& strstr(t0, "memfd:bsc-aworker-1 (deleted):open=ok,write=EPERM,truncate=EPERM,read=ok;");
+	if (!ok)
+		printf("  (tamper reports: '%s' / '%s')\n", t0 ? t0 : "(none)", t1 ? t1 : "(none)");
+	CHECK(ok);
+	printf("  through /proc/<main pid>/fd each worker can open both snapshots (same user) and read them, but"
+	       " writing and truncating fail with EPERM (sealed)\n");
+	talloc_free(t0);
+	talloc_free(t1);
+	talloc_free(s0);
+	talloc_free(s1);
+	inline_stop();
+}
+
+/* P23: a restarted worker gets the snapshot made at startup, whatever happened to the file since. */
+static void test_p23_file_changed(char **argv)
+{
+	char path[PATH_MAX + 8], *t;
+	FILE *f;
+	int sfd;
+
+	printf("P23: the main configuration file edited, replaced or deleted: a restarted worker reads the original\n");
+	CHECK(inline_configure() == 0);
+	aworker_pool_set_exec(argv[0], 1, argv);
+	CHECK(aworker_pool_start(ctx) == 0);
+	CHECK(run_until(all_ready, NULL, 10000));
+	sfd = aworker_pool_snapshot_fd(1);
+
+	main_cfg_rewrite(7);
+	CHECK(kill_and_restart(1) > 0);
+	CHECK(worker_got_own_snapshot(1, false));
+	printf("  edited in place: the restarted worker 1 read its view as of the start\n");
+
+	snprintf(path, sizeof(path), "%s.new", g_main_cfg);
+	t = main_cfg_text(8);
+	f = fopen(path, "w");
+	OSMO_ASSERT(f && fputs(t, f) >= 0 && fclose(f) == 0);
+	talloc_free(t);
+	OSMO_ASSERT(rename(path, g_main_cfg) == 0);
+	CHECK(kill_and_restart(1) > 0);
+	CHECK(worker_got_own_snapshot(1, false));
+	printf("  replaced (rename over it): the same\n");
+
+	OSMO_ASSERT(unlink(g_main_cfg) == 0);
+	CHECK(kill_and_restart(1) > 0);
+	CHECK(worker_got_own_snapshot(1, false));
+	printf("  deleted: the same\n");
+	CHECK(aworker_pool_snapshot_fd(1) == sfd && parent_snapshot_fds() == 2);
+	printf("  every restart used the one snapshot made at startup (same descriptor, still two)\n");
+	inline_stop();
+}
+
+/* P24: the snapshot is read with pread() from offset 0, whatever the shared file offset. */
+static void test_p24_offset(char **argv)
+{
+	off_t end;
+	int sfd;
+
+	printf("P24: restarts read the whole snapshot, whatever its shared file offset\n");
+	CHECK(inline_configure() == 0);
+	aworker_pool_set_exec(argv[0], 1, argv);
+	CHECK(aworker_pool_start(ctx) == 0);
+	CHECK(run_until(all_ready, NULL, 10000));
+	sfd = aworker_pool_snapshot_fd(0);
+	/* The worker inherits the open file description, offset included: put it at the end. */
+	end = lseek(sfd, 0, SEEK_END);
+	CHECK(end == (off_t)strlen(g_view[0]));
+	CHECK(kill_and_restart(0) > 0);
+	CHECK(worker_got_own_snapshot(0, false));
+	CHECK(kill_and_restart(0) > 0);
+	CHECK(worker_got_own_snapshot(0, false));
+	CHECK(lseek(sfd, 0, SEEK_CUR) == end);
+	printf("  with the offset at the end, two restarts each read the complete view; the offset is unchanged\n");
+	inline_stop();
+}
+
+/* P25: D-7 -- a reset worker starts from the snapshot made at startup, and the log says so. */
+static void test_p25_reset(char **argv)
+{
+	struct aworker_pool_worker_info w;
+	unsigned int one = 1;
+	const char *log;
+
+	printf("P25: a worker reset after FAILED starts from the snapshot made at startup\n");
+	CHECK(inline_configure() == 0);
+	aworker_pool_set_exec(argv[0], 1, argv);
+	CHECK(aworker_pool_start(ctx) == 0);
+	CHECK(run_until(all_ready, NULL, 10000));
+	main_cfg_rewrite(9);
+	inline_fw(1, "exit_config=1\n");
+	CHECK(kill_worker(1));
+	CHECK(run_until(w_failed, &one, 15000));
+	w = winfo(1);
+	CHECK(w.fail_reason == AWORKER_FAIL_CONFIG);
+	CHECK(strstr(w.fail_detail, "it cannot use its configuration snapshot (its own log says why)") != NULL);
+	CHECK(w.cfg_file == NULL);
+	printf("  a worker that cannot use its snapshot is FAILED (config), naming the snapshot\n");
+	inline_fw(1, NULL);
+	forget_reports(1);
+	capture_begin();
+	CHECK(aworker_pool_reset_worker(1) == 0);
+	CHECK(run_until(all_ready, NULL, 10000));
+	log = capture_end();
+	CHECK(worker_got_own_snapshot(1, false));
+	CHECK(strstr(log, "it starts from its configuration snapshot made when osmo-bsc started: a change of") != NULL);
+	CHECK(strstr(log, "osmo-bsc.cfg' since then takes effect only when osmo-bsc is restarted") != NULL);
+	printf("  reset: it read its view as of the start, not the edited file, and the log says so\n");
+	inline_stop();
+}
+
+/* P26: the runtime ownership check (CS7_INFO) still applies to workers of the inline form. */
+static void test_p26_ownership(char **argv)
+{
+	unsigned int one = 1;
+	pid_t pid0;
+
+	printf("P26: a worker of the inline form claiming another worker's cs7 instance is FAILED (ownership)\n");
+	CHECK(inline_configure() == 0);
+	inline_fw(1, "cs7=0\n");
+	aworker_pool_set_exec(argv[0], 1, argv);
+	CHECK(aworker_pool_start(ctx) == 0);
+	CHECK(run_until(w_failed, &one, 10000));
+	CHECK(winfo(1).fail_reason == AWORKER_FAIL_OWNERSHIP);
+	pid0 = winfo(0).pid;
+	CHECK(winfo(0).state == AWORKER_ST_READY && pid0 > 0);
+	printf("  worker 1 reported cs7 instance 0: FAILED (ownership); worker 0 READY\n");
+	inline_stop();
+}
+
+/* P27: the main process' snapshot descriptors after a restart, a stop, a fork failure and an exec failure. */
+static void test_p27_fd_cleanup(char **argv)
+{
+	struct rlimit old, zero;
+	unsigned int forks, zero_i = 0, one = 1;
+	int sfd0, sfd1, status;
+
+	printf("P27: the main process' snapshot descriptors: restart, stop, fork failure, exec failure\n");
+	CHECK(inline_configure() == 0);
+	aworker_pool_set_exec(argv[0], 1, argv);
+	CHECK(parent_snapshot_fds() == 0);
+	CHECK(aworker_pool_start(ctx) == 0);
+	CHECK(run_until(all_ready, NULL, 10000));
+	sfd0 = aworker_pool_snapshot_fd(0);
+	sfd1 = aworker_pool_snapshot_fd(1);
+	CHECK(parent_snapshot_fds() == 2);
+	CHECK(kill_and_restart(0) > 0);
+	CHECK(parent_snapshot_fds() == 2 && aworker_pool_snapshot_fd(0) == sfd0 && aworker_pool_snapshot_fd(1) == sfd1);
+	printf("  two snapshots while running; a restart neither adds nor replaces one\n");
+	inline_stop();
+	CHECK(parent_snapshot_fds() == 0);
+	printf("  stop: none left\n");
+
+	/* fork() failure: RLIMIT_NPROC 0 (only for a user without CAP_SYS_RESOURCE / CAP_SYS_ADMIN, U-6). */
+	if (geteuid() == 0) {
+		printf("  fork failure (RLIMIT_NPROC): NOT EXECUTED (running as root)\n");
+	} else {
+		OSMO_ASSERT(getrlimit(RLIMIT_NPROC, &old) == 0);
+		zero = old;
+		zero.rlim_cur = 0;
+		OSMO_ASSERT(setrlimit(RLIMIT_NPROC, &zero) == 0);
+		forks = g_forks;
+		CHECK(aworker_pool_start(ctx) < 0);
+		OSMO_ASSERT(setrlimit(RLIMIT_NPROC, &old) == 0);
+		CHECK(g_forks == forks + 1);
+		CHECK(aworker_pool_num_workers() == 0);
+		CHECK(parent_snapshot_fds() == 0);
+		CHECK(__real_waitpid(-1, &status, WNOHANG) < 0 && errno == ECHILD);
+		printf("  fork failure (RLIMIT_NPROC 0): the start fails, no process, no snapshot left\n");
+	}
+
+	/* exec failure: each child exits like a worker that cannot use its configuration. */
+	g_fexecve_fails = true;
+	CHECK(aworker_pool_start(ctx) == 0);
+	g_fexecve_fails = false;
+	CHECK(run_until(w_failed, &zero_i, 10000) && run_until(w_failed, &one, 10000));
+	CHECK(winfo(0).fail_reason == AWORKER_FAIL_CONFIG && winfo(1).fail_reason == AWORKER_FAIL_CONFIG);
+	CHECK(parent_snapshot_fds() == 2);
+	printf("  exec failure: both workers FAILED (config), the two snapshots kept for a reset\n");
+	inline_stop();
+	CHECK(parent_snapshot_fds() == 0);
+	CHECK(__real_waitpid(-1, &status, WNOHANG) < 0 && errno == ECHILD);
+	printf("  stop: none left, no process left\n");
+}
+
+/* Directories for the fallback tests, inside the test directory; the real /dev/shm and /tmp are never used. */
+static char g_rt[PATH_MAX];
+
+static void fallback_on(const char *runtime_dir, const char *shm, const char *tmp)
+{
+	g_memfd_fails = true;
+	osmo_strlcpy(g_redir_shm, shm, sizeof(g_redir_shm));
+	osmo_strlcpy(g_redir_tmp, tmp, sizeof(g_redir_tmp));
+	OSMO_ASSERT(setenv("RUNTIME_DIRECTORY", runtime_dir, 1) == 0);
+}
+
+static void fallback_off(void)
+{
+	g_memfd_fails = false;
+	g_redir_shm[0] = '\0';
+	g_redir_tmp[0] = '\0';
+	OSMO_ASSERT(unsetenv("RUNTIME_DIRECTORY") == 0);
+}
+
+static unsigned int dir_entries(const char *path)
+{
+	struct dirent *de;
+	unsigned int n = 0;
+	DIR *d = opendir(path);
+
+	if (!d)
+		return 0;
+	while ((de = readdir(d)))
+		n += strcmp(de->d_name, ".") && strcmp(de->d_name, "..");
+	closedir(d);
+	return n;
+}
+
+/* P28: no sealed memfd and no usable fallback directory: the pool does not start, nothing is forked. */
+static void test_p28_no_fallback(char **argv)
+{
+	char link[PATH_MAX], file[PATH_MAX], missing[PATH_MAX];
+	unsigned int forks, calls;
+	const char *log;
+	FILE *f;
+
+	printf("P28: no sealed memfd and no usable fallback directory: the start is refused before any fork\n");
+	CHECK(inline_configure() == 0);
+	snprintf(g_rt, sizeof(g_rt), "%s/rt", g_dir);
+	OSMO_ASSERT(mkdir(g_rt, 0700) == 0);
+	snprintf(link, sizeof(link), "%s/rt-link", g_dir);
+	OSMO_ASSERT(symlink(g_rt, link) == 0);
+	snprintf(file, sizeof(file), "%s/not-a-dir", g_dir);
+	f = fopen(file, "w");
+	OSMO_ASSERT(f && fclose(f) == 0);
+	snprintf(missing, sizeof(missing), "%s/missing", g_dir);
+	fallback_on(link, file, missing);
+	aworker_pool_set_exec(argv[0], 1, argv);
+	forks = g_forks;
+	calls = g_memfd_calls;
+	capture_begin();
+	CHECK(aworker_pool_start(ctx) < 0);
+	log = capture_end();
+	fallback_off();
+	CHECK(g_memfd_calls > calls);
+	CHECK(g_forks == forks && aworker_pool_num_workers() == 0 && parent_snapshot_fds() == 0);
+	CHECK(strstr(log, "no fallback directory could be used: no snapshot") != NULL);
+	CHECK(strstr(log, "aworker 0: cannot make its configuration snapshot from '") != NULL);
+	CHECK(dir_entries(g_rt) == 0);
+	printf("  $RUNTIME_DIRECTORY a symbolic link, /dev/shm not a directory, /tmp missing (all redirected): refused,"
+	       " no fork, no snapshot, nothing left in any directory\n");
+}
+
+/* P29: the fallback works, and a fallback snapshot changed by a process of the same user is never used. */
+static void test_p29_fallback_tamper(char **argv)
+{
+	char p[64], none[PATH_MAX];
+	unsigned int forks, one = 1;
+	const char *log;
+	int sfd, ro, rw;
+
+	printf("P29: the fallback snapshot: delivered, re-checked before every start, refused once changed\n");
+	CHECK(inline_configure() == 0);
+	snprintf(none, sizeof(none), "%s/missing", g_dir);
+	fallback_on(g_rt, none, none);
+	aworker_pool_set_exec(argv[0], 1, argv);
+	capture_begin();
+	CHECK(aworker_pool_start(ctx) == 0);
+	log = capture_end();
+	CHECK(strstr(log, "WARNING: worker 0: no sealed memfd for the configuration snapshot") != NULL);
+	CHECK(strstr(log, "WARNING: worker 1: no sealed memfd for the configuration snapshot") != NULL);
+	CHECK(run_until(all_ready, NULL, 10000));
+	CHECK(worker_got_own_snapshot(0, true) && worker_got_own_snapshot(1, true));
+	CHECK(dir_entries(g_rt) == 0);
+	printf("  each worker got its unlinked, read-only fallback file (WARNING logged); no directory left behind\n");
+	CHECK(kill_and_restart(1) > 0);
+	CHECK(worker_got_own_snapshot(1, true));
+	printf("  unchanged: a restart is allowed and reads it again\n");
+
+	/* Same user, through /proc: make it writable and change it. */
+	sfd = aworker_pool_snapshot_fd(1);
+	snprintf(p, sizeof(p), "/proc/self/fd/%d", sfd);
+	ro = open(p, O_RDONLY | O_CLOEXEC);
+	OSMO_ASSERT(ro >= 0 && fchmod(ro, 0600) == 0);
+	rw = open(p, O_RDWR | O_CLOEXEC);
+	OSMO_ASSERT(rw >= 0 && pwrite(rw, "!", 1, 0) == 1);
+	close(rw);
+	close(ro);
+	forks = g_forks;
+	CHECK(kill_worker(1));
+	CHECK(run_until(w_failed, &one, 15000));
+	CHECK(g_forks == forks);
+	CHECK(winfo(1).fail_reason == AWORKER_FAIL_CONFIG);
+	CHECK(strstr(winfo(1).fail_detail, "its configuration snapshot is no longer the one made at startup") != NULL);
+	CHECK(winfo(0).state == AWORKER_ST_READY);
+	printf("  changed through /proc/<pid>/fd after fchmod: the restart is refused before fork, worker 1 FAILED"
+	       " (config); worker 0 READY\n");
+	CHECK(aworker_pool_reset_worker(1) == 0);
+	CHECK(g_forks == forks && winfo(1).state == AWORKER_ST_FAILED);
+	printf("  a reset is refused the same way\n");
+	inline_stop();
+	fallback_off();
+	CHECK(parent_snapshot_fds() == 0);
+}
+
+/* P30: the running pool configuration must declare exactly the workers of the file read at startup. */
+static void test_p30_model_vs_cfg(char **argv)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	unsigned int forks;
+	const char *log;
+
+	printf("P30: a pool configuration that differs from the file read at startup is refused before any fork\n");
+	CHECK(inline_configure() == 0);
+	aworker_pool_set_exec(argv[0], 1, argv);
+	forks = g_forks;
+
+	cfg->cs7_instance[1] = 2;
+	capture_begin();
+	CHECK(aworker_pool_start(ctx) == -EINVAL);
+	log = capture_end();
+	CHECK(strstr(log, "worker 1 is configured differently from '") != NULL);
+	CHECK(strstr(log, "(there: cs7-instance 1)") != NULL);
+	cfg->cs7_instance[1] = 1;
+	printf("  worker 1 on another cs7 instance: refused\n");
+
+	cfg->num_workers = 1;
+	capture_begin();
+	CHECK(aworker_pool_start(ctx) == -EINVAL);
+	log = capture_end();
+	CHECK(strstr(log, "1 worker(s) configured, but '") != NULL);
+	cfg->num_workers = 2;
+	printf("  another number of workers: refused\n");
+	CHECK(g_forks == forks && aworker_pool_num_workers() == 0 && parent_snapshot_fds() == 0);
+	printf("  no fork, no pool, no snapshot\n");
+
+	CHECK(aworker_pool_start(ctx) == 0);
+	CHECK(run_until(all_ready, NULL, 10000));
+	printf("  the same configuration as the file: started\n");
+	inline_stop();
+
+	/* The file read at startup configures a pool of the file form; the running configuration is of the inline
+	 * form: there is no file of that form to start from. */
+	{
+		char path[PATH_MAX], text[PATH_MAX * 2 + 128];
+		unsigned int i;
+		FILE *f;
+
+		snprintf(path, sizeof(path), "%s/osmo-bsc-fileform.cfg", g_dir);
+		snprintf(text, sizeof(text), "a-worker-pool\n workers 2\n worker 0 config-file %s/w0.cfg\n"
+			 " worker 1 config-file %s/w1.cfg\n", g_dir, g_dir);
+		f = fopen(path, "w");
+		OSMO_ASSERT(f && fputs(text, f) >= 0 && fclose(f) == 0);
+		for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
+			TALLOC_FREE(cfg->cfg_file[i]);
+			cfg->has_cs7_instance[i] = false;
+		}
+		CHECK(aworker_pool_prescan_config(path) == 0 && aworker_pool_read_config(path) == 0);
+		CHECK(cfg->num_workers == 2 && cfg->cfg_file[0] && cfg->cfg_file[1]);
+		for (i = 0; i < 2; i++) {
+			TALLOC_FREE(cfg->cfg_file[i]);
+			cfg->has_cs7_instance[i] = true;
+			cfg->cs7_instance[i] = i;
+		}
+		forks = g_forks;
+		capture_begin();
+		CHECK(aworker_pool_start(ctx) == -EINVAL);
+		log = capture_end();
+		CHECK(strstr(log, "worker 0 uses the inline form ('worker 0 cs7-instance 0'), but no configuration file"
+			  " using that form was read at startup") != NULL);
+		CHECK(g_forks == forks && aworker_pool_num_workers() == 0 && parent_snapshot_fds() == 0);
+		for (i = 0; i < 2; i++)
+			cfg->has_cs7_instance[i] = false;
+		cfg->num_workers = 0;
+		printf("  the file read at startup uses the file form, the running configuration the inline form: refused\n");
+	}
+}
+
+/***********************************************************************
  * main
  ***********************************************************************/
 
@@ -2258,6 +3248,8 @@ int main(int argc, char **argv)
 
 	snprintf(g_dir, sizeof(g_dir), "%s/aworker_proc.XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
 	OSMO_ASSERT(mkdtemp(g_dir));
+	/* Where a fake worker in snapshot mode finds its directives (P21-P30). */
+	OSMO_ASSERT(setenv("AWORKER_PROC_TEST_DIR", g_dir, 1) == 0);
 	/* Orphans (P2, P3) are re-parented to us, so that we can see how they end. */
 	OSMO_ASSERT(prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0);
 	bsc_init();
@@ -2283,6 +3275,16 @@ int main(int argc, char **argv)
 	test_p18_ready_before_deadline(argv);
 	test_p19_old_timeout_not_replacement(argv);
 	test_p20_startup_timeout_default(argv);
+	test_p21_snapshot_delivered(argv);
+	test_p22_isolation(argv);
+	test_p23_file_changed(argv);
+	test_p24_offset(argv);
+	test_p25_reset(argv);
+	test_p26_ownership(argv);
+	test_p27_fd_cleanup(argv);
+	test_p28_no_fallback(argv);
+	test_p29_fallback_tamper(argv);
+	test_p30_model_vs_cfg(argv);
 
 	if (!failures) {
 		char cmd[PATH_MAX + 16];

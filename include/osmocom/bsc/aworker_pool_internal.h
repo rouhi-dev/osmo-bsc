@@ -33,6 +33,7 @@
 #include <osmocom/bsc/aworker_ipc_link.h>
 #include <osmocom/bsc/aworker_log.h>
 #include <osmocom/bsc/aworker_pool.h>
+#include <osmocom/bsc/aworker_snapshot.h>
 
 struct vty;
 struct aworker_pool;
@@ -113,6 +114,11 @@ struct aworker_pool {
 	struct ownership own;			/*!< expected ownership, built at start */
 	bool no_fork;				/*!< started with aworker_pool_start_with_fds() */
 	bool stopping;
+	/*! Inline form: each worker's configuration snapshot (aworker_snapshot.h), made from the main configuration file
+	 * as read once at startup, before the first worker is forked. Every start of worker i -- the first, each
+	 * restart, each reset -- gets snap[i] and nothing else; it is checked before each of them. Closed when the
+	 * pool is stopped or its start fails. NULL for the file form. */
+	struct aworker_snapshot *snap[AWORKER_POOL_MAX_WORKERS];
 };
 
 #define LOGW(w, lvl, fmt, args...) \
@@ -148,6 +154,10 @@ static inline const struct aworker_ipc_cs7_entry *cs7_entry(const struct aworker
 
 /*! The running pool, or NULL. */
 struct aworker_pool *aworker_pool_get(void);
+
+/*! Test only: the main process' descriptor of worker idx's configuration snapshot, -1 if it has none (file form, no
+ * pool). */
+int aworker_pool_snapshot_fd(unsigned int idx);
 
 /*! What the life cycle tells the SCCP user side, at the points where it did so when both were one file. Set once by
  * the user side (aworker_pool_set_user_hooks()); until then there are no users, and the life cycle behaves as the

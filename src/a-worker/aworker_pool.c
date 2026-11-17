@@ -675,9 +675,12 @@ static void worker_apply_policy(struct aworker *w, bool config_error)
 	if (pool->stopping)
 		return;
 
-	if (fail == AWORKER_FAIL_CONFIG)
+	if (fail == AWORKER_FAIL_CONFIG && !pool->snap[w->idx])
 		snprintf(detail, sizeof(detail), "exited with status %u: it cannot use its config file '%s' (its own"
 			 " log says why)", AWORKER_EXIT_CONFIG, pool->cfg.cfg_file[w->idx]);
+	else if (fail == AWORKER_FAIL_CONFIG)
+		snprintf(detail, sizeof(detail), "exited with status %u: it cannot use its configuration snapshot (its"
+			 " own log says why)", AWORKER_EXIT_CONFIG);
 	else if (fail != AWORKER_FAIL_NONE)
 		osmo_strlcpy(detail, w->fail_detail, sizeof(detail));
 
@@ -825,7 +828,7 @@ static void restart_timer_cb(void *data)
 		return;
 	}
 	LOGW(w, LOGL_NOTICE, "restarting worker (start #%u)\n", w->starts + 1);
-	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING)
+	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING && w->state != AWORKER_ST_FAILED)
 		worker_retry_start(w);
 }
 
@@ -1262,13 +1265,19 @@ static void child_close_fds(const int *keep, unsigned int n_keep)
 	}
 }
 
-/* Run in the child after fork(); never returns. \param parent pid of the main process, taken before fork(). */
-static void child_exec_worker(unsigned int idx, const char *cfg_file, int fd, pid_t parent)
+/* Run in the child after fork(); never returns. \param parent pid of the main process, taken before fork().
+ * Exactly one of cfg_file (file form) and snap_fd >= 0 (inline form: this worker's snapshot, above 2) is given.
+ *
+ * Descriptors: the child keeps stdio, the IPC socket, its own snapshot (inline form) and g_exec_fd, and closes every
+ * other one -- the other workers' snapshots and anything else of the main process (child_close_fds()). Only the IPC
+ * socket and the snapshot are made inheritable; g_exec_fd stays close-on-exec, so after exec() the worker holds
+ * exactly stdio, the IPC socket and (inline form) its own snapshot, which it closes once it has read it. */
+static void child_exec_worker(unsigned int idx, const char *cfg_file, int snap_fd, int fd, pid_t parent)
 {
 	char **argv;
-	char fdstr[16], idxstr[16];
-	unsigned int n = 0, i;
-	int keep[2], n_keep = 0;
+	char fdstr[16], idxstr[16], snapstr[16];
+	unsigned int n = 0, i, j;
+	int keep[3], n_keep = 0;
 	int flags;
 
 	/* Die with the main process, whatever happens to it -- including SIGKILL, which leaves no chance to
@@ -1294,17 +1303,31 @@ static void child_exec_worker(unsigned int idx, const char *cfg_file, int fd, pi
 	flags = fcntl(fd, F_GETFD);
 	if (flags >= 0)
 		fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+	if (snap_fd >= 0) {
+		flags = fcntl(snap_fd, F_GETFD);
+		if (flags < 0 || fcntl(snap_fd, F_SETFD, flags & ~FD_CLOEXEC) < 0)
+			_exit(AWORKER_EXIT_CONFIG);
+	}
 
-	/* Keep the IPC socket, and the executable we exec from (it is O_CLOEXEC, so the worker does not inherit it). */
-	if (g_exec_fd >= 0 && g_exec_fd < fd)
-		keep[n_keep++] = g_exec_fd;
+	/* Keep the IPC socket, this worker's snapshot, and the executable we exec from (it is O_CLOEXEC, so the worker
+	 * does not inherit it). child_close_fds() wants them in ascending order. */
 	keep[n_keep++] = fd;
-	if (g_exec_fd >= 0 && g_exec_fd > fd)
+	if (snap_fd >= 0)
+		keep[n_keep++] = snap_fd;
+	if (g_exec_fd >= 0)
 		keep[n_keep++] = g_exec_fd;
+	for (i = 1; i < (unsigned int)n_keep; i++) {
+		for (j = i; j > 0 && keep[j - 1] > keep[j]; j--) {
+			int t = keep[j];
+			keep[j] = keep[j - 1];
+			keep[j - 1] = t;
+		}
+	}
 	child_close_fds(keep, n_keep);
 
 	snprintf(fdstr, sizeof(fdstr), "%d", fd);
 	snprintf(idxstr, sizeof(idxstr), "%u", idx);
+	snprintf(snapstr, sizeof(snapstr), "%d", snap_fd);
 
 	argv = calloc(g_exec_log_argc + 8, sizeof(*argv));
 	if (!argv)
@@ -1316,8 +1339,14 @@ static void child_exec_worker(unsigned int idx, const char *cfg_file, int fd, pi
 	argv[n++] = fdstr;
 	argv[n++] = (char *)"--aworker-index";
 	argv[n++] = idxstr;
-	argv[n++] = (char *)"--aworker-config";
-	argv[n++] = (char *)cfg_file;
+	if (cfg_file) {
+		/* The file form: exactly the command line it always had (N3). */
+		argv[n++] = (char *)"--aworker-config";
+		argv[n++] = (char *)cfg_file;
+	} else {
+		argv[n++] = (char *)"--aworker-snapshot-fd";
+		argv[n++] = snapstr;
+	}
 	argv[n] = NULL;
 
 	/* Same command line and environment as execv() would use, but from the binary image we were started from. */
@@ -1335,13 +1364,14 @@ static int worker_spawn(struct aworker *w)
 {
 	struct aworker_pool *pool = w->pool;
 	const char *cfg_file = pool->cfg.cfg_file[w->idx];
+	struct aworker_snapshot *snap = pool->snap[w->idx];
 	pid_t parent = getpid();
 	int sp[2];
 	pid_t pid;
 	int rc;
 
 	OSMO_ASSERT(!pool->no_fork);
-	OSMO_ASSERT(cfg_file);
+	OSMO_ASSERT(!cfg_file != !snap);
 	OSMO_ASSERT(g_exec_path);
 
 	/* Never two generations of one worker: the previous process must have been collected. */
@@ -1349,6 +1379,19 @@ static int worker_spawn(struct aworker *w)
 		LOGW(w, LOGL_ERROR, "refusing to start a new process: the previous one is not collected yet\n");
 		return -EBUSY;
 	}
+	/* Inline form: the snapshot must still be exactly what was made at startup (seals, size, contents; for the
+	 * fallback's file also unlinked, mode 0400, ours, read-only). If it is not, no start can fix that. */
+	if (snap) {
+		rc = aworker_snapshot_verify(snap);
+		if (rc < 0) {
+			char detail[sizeof(w->fail_detail)];
+			snprintf(detail, sizeof(detail), "its configuration snapshot is no longer the one made at startup"
+				 " (%s); not starting it from that. Restart osmo-bsc", strerror(-rc));
+			worker_fail(w, AWORKER_FAIL_CONFIG, detail);
+			return rc;
+		}
+	}
+
 	/* A new process has to earn its stability from READY on. */
 	w->ready_seen = false;
 	w->stable_at_loss = false;
@@ -1370,7 +1413,7 @@ static int worker_spawn(struct aworker *w)
 
 	if (pid == 0) {
 		close(sp[0]);
-		child_exec_worker(w->idx, cfg_file, sp[1], parent);
+		child_exec_worker(w->idx, cfg_file, snap ? snap->fd : -1, sp[1], parent);
 		/* not reached */
 	}
 
@@ -1386,8 +1429,13 @@ static int worker_spawn(struct aworker *w)
 		worker_begin_termination(w);
 		return rc;
 	}
-	LOGW(w, LOGL_NOTICE, "started '%s'%s with config file '%s'\n", g_exec_path,
-	     g_exec_fd >= 0 ? " (from the descriptor opened at startup)" : "", cfg_file);
+	if (cfg_file)
+		LOGW(w, LOGL_NOTICE, "started '%s'%s with config file '%s'\n", g_exec_path,
+		     g_exec_fd >= 0 ? " (from the descriptor opened at startup)" : "", cfg_file);
+	else
+		LOGW(w, LOGL_NOTICE, "started '%s'%s with its configuration snapshot (%s, %zu octets)\n", g_exec_path,
+		     g_exec_fd >= 0 ? " (from the descriptor opened at startup)" : "",
+		     snap->fallback ? "fallback file" : "sealed memfd", snap->len);
 	return 0;
 }
 
@@ -1468,26 +1516,115 @@ int aworker_pool_expected_owner(uint32_t cs7_id)
 	return g_pool->own.owner[cs7_id];
 }
 
+/* Free a pool that is not (or no longer) g_pool, closing its snapshots. */
+static void pool_free(struct aworker_pool *pool)
+{
+	unsigned int i;
+
+	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
+		aworker_snapshot_close(pool->snap[i]);
+		pool->snap[i] = NULL;
+	}
+	talloc_free(pool);
+}
+
+/* Inline form: the workers are started from the main configuration file as it was read once at startup
+ * (aworker_pool_prescan_config() / aworker_pool_read_config()), and from nothing else. \returns 0 if the running pool
+ * configuration (g_cfg, as parsed from the BSC's view) declares exactly the workers that file declares, -EINVAL (and
+ * why, logged) if there is no such file or they differ. */
+static int inline_source_check(void)
+{
+	const struct aworker_cfg_model *m = g_main.model;
+	unsigned int i;
+
+	if (!g_main.pool || !m || !aworker_cfg_model_is_inline(m)) {
+		for (i = 0; i < g_cfg.num_workers && !g_cfg.has_cs7_instance[i]; i++)
+			;
+		LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': worker %u uses the inline form ('worker %u"
+		     " cs7-instance %u'), but no configuration file using that form was read at startup: there is"
+		     " nothing to start its workers from\n", i, i, g_cfg.cs7_instance[i]);
+		return -EINVAL;
+	}
+	if (m->num_workers != g_cfg.num_workers) {
+		LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': %u worker(s) configured, but '%s' as read at startup"
+		     " declares 'workers %u'; refusing to start workers from a configuration that differs from it\n",
+		     g_cfg.num_workers, g_main.path, m->num_workers);
+		return -EINVAL;
+	}
+	for (i = 0; i < g_cfg.num_workers; i++) {
+		const struct aworker_cfg_decl *d = &m->decl[i];
+
+		if (g_cfg.cfg_file[i] || !g_cfg.has_cs7_instance[i] || !d->inl || d->file
+		    || d->cs7_id != g_cfg.cs7_instance[i]) {
+			LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': worker %u is configured differently from"
+			     " '%s' as read at startup (there: %s%u); refusing to start workers from a configuration that"
+			     " differs from it\n", i, g_main.path, d->inl ? "cs7-instance " : "no cs7-instance, ",
+			     d->inl ? d->cs7_id : 0);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/* Inline form: make every worker's snapshot, all of them before the first worker is forked. \returns 0 or a negative
+ * errno (logged); on failure the snapshots made so far are left for pool_free(). */
+static int snapshots_make(struct aworker_pool *pool)
+{
+	unsigned int i;
+	size_t len;
+	char *view;
+	int rc;
+
+	for (i = 0; i < pool->num; i++) {
+		struct aworker_snapshot *s;
+
+		view = aworker_cfg_model_view(pool, g_main.model, AWORKER_CFG_VIEW_WORKER, i, &len);
+		if (!view)
+			return -ENOMEM;
+		rc = aworker_snapshot_create(pool, i, view, len, &pool->snap[i]);
+		talloc_free(view);
+		if (rc < 0) {
+			LOGP(aworker_log_cat, LOGL_FATAL, "aworker %u: cannot make its configuration snapshot from '%s':"
+			     " %s\n", i, g_main.path, strerror(-rc));
+			return rc;
+		}
+		s = pool->snap[i];
+		/* Never on a standard stream's number (osmo-bsc started with one closed): a worker refuses that. */
+		s->fd = fd_above_stdio(s->fd, true);
+		if (s->fd < 0) {
+			rc = -errno;
+			LOGP(aworker_log_cat, LOGL_FATAL, "aworker %u: cannot move its configuration snapshot above the"
+			     " standard streams: %s\n", i, strerror(-rc));
+			return rc;
+		}
+		LOGP(aworker_log_cat, LOGL_INFO, "aworker %u: configuration snapshot made from '%s': %zu octets, %s\n",
+		     i, g_main.path, s->len, s->fallback ? "fallback file (see the WARNING)" : "sealed memfd");
+	}
+	return 0;
+}
+
+int aworker_pool_snapshot_fd(unsigned int idx)
+{
+	if (!g_pool || idx >= AWORKER_POOL_MAX_WORKERS || !g_pool->snap[idx])
+		return -1;
+	return g_pool->snap[idx]->fd;
+}
+
 int aworker_pool_start(void *ctx)
 {
 	struct aworker_pool *pool;
 	unsigned int i;
+	bool inl;
 	int rc;
 
 	OSMO_ASSERT(!g_pool);
 	if (!aworker_pool_enabled())
 		return 0;
 
+	inl = pool_is_inline(&g_cfg);
 	for (i = 0; i < g_cfg.num_workers; i++) {
-		if (!g_cfg.cfg_file[i] && g_cfg.has_cs7_instance[i]) {
-			/* Parsed and checked, but a worker cannot be started from the inline form yet: its worker
-			 * reads a config file of its own. */
-			LOGP(aworker_log_cat, LOGL_FATAL,
-			     "'a-worker-pool': worker %u uses the inline form ('worker %u cs7-instance %u'), from which"
-			     " this osmo-bsc cannot start workers yet. Use 'worker %u config-file FILE'.\n", i, i,
-			     g_cfg.cs7_instance[i], i);
-			return -EINVAL;
-		}
+		if (!g_cfg.cfg_file[i] && g_cfg.has_cs7_instance[i])
+			continue;	/* inline form: checked against the file below */
 		if (!g_cfg.cfg_file[i]) {
 			LOGP(aworker_log_cat, LOGL_FATAL,
 			     "'a-worker-pool': 'workers %u' is configured but worker %u has no config file."
@@ -1495,13 +1632,22 @@ int aworker_pool_start(void *ctx)
 			return -EINVAL;
 		}
 	}
+	if (inl && inline_source_check() < 0)
+		return -EINVAL;
 
 	pool = pool_alloc(ctx, g_cfg.num_workers);
 	if (!pool)
 		return -ENOMEM;
 	if (ownership_build(&pool->cfg, &pool->own) < 0) {
-		talloc_free(pool);
+		pool_free(pool);
 		return -EINVAL;
+	}
+	if (inl) {
+		rc = snapshots_make(pool);
+		if (rc < 0) {
+			pool_free(pool);
+			return rc;
+		}
 	}
 	ownership_log(pool);
 	g_pool = pool;
@@ -1727,7 +1873,7 @@ void aworker_pool_stop(void)
 		g_user_hooks->pool_stopped(pool);
 
 	g_pool = NULL;
-	talloc_free(pool);
+	pool_free(pool);
 }
 
 bool aworker_pool_shutdown_was_fatal(void)
@@ -1783,6 +1929,9 @@ int aworker_pool_reset_worker(unsigned int idx)
 
 	LOGW(w, LOGL_NOTICE, "reset by the operator (was FAILED: %s: %s); starting it again\n",
 	     aworker_fail_reason_name(w->fail_reason), w->fail_detail);
+	if (g_pool->snap[idx])
+		LOGW(w, LOGL_NOTICE, "it starts from its configuration snapshot made when osmo-bsc started: a change of"
+		     " '%s' since then takes effect only when osmo-bsc is restarted\n", g_main.path);
 	w->fail_reason = AWORKER_FAIL_NONE;
 	w->fail_detail[0] = '\0';
 	w->failed_at = 0;
@@ -1793,7 +1942,7 @@ int aworker_pool_reset_worker(unsigned int idx)
 	w->state = AWORKER_ST_STOPPED;
 	if (g_pool->no_fork)
 		return 0;	/* no process of our own to start */
-	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING)
+	if (worker_spawn(w) < 0 && w->state != AWORKER_ST_TERMINATING && w->state != AWORKER_ST_FAILED)
 		worker_retry_start(w);
 	return 0;
 }

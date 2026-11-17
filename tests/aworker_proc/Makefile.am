@@ -37,6 +37,10 @@ aworker_proc_test_LDFLAGS = \
 	-Wl,--wrap=waitpid \
 	-Wl,--wrap=prctl \
 	-Wl,--wrap=fork \
+	-Wl,--wrap=memfd_create \
+	-Wl,--wrap=open \
+	-Wl,--wrap=__open_2 \
+	-Wl,--wrap=fexecve \
 	$(NULL)
 
 aworker_proc_test_LDADD = \

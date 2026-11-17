@@ -3,6 +3,18 @@
 Status: **approved** (with the clarifications in §11); implementation in progress. Architecture: `PHASE2_ARCHITECTURE.md` (approved with the decisions
 below). Baseline: `a-worker-pool` at `e54578f2c` (Phase 1).
 
+> **Revision (after 2a-5, HEAD `fa01448ea`): implementation is paused.** The target architecture now includes a
+> standalone Supervisor executable `bsc-aworker` (`src/a-worker/`) so that workers survive a BSC crash. The
+> single configuration source is `osmo-bsc.cfg`. See `PHASE2_SUPERVISOR.md` (revision 3, current target, for final review). The migration
+> plan is §13 below. 2a-6 onwards resumes only under the conditions in §13.6. §1–§12 remain valid for what they
+> describe; where they say "the main process" owns workers, supervisor mode replaces that with the Supervisor.
+> S1 is closed and accepted (uncommitted on `fa01448ea`). The S2-0 review (§14) records the approved decisions, the
+> implementation subphases S2-1 … S2-8 and their mapping to the phases of §13.
+>
+> **Status (2026-11-17, HEAD `b4d890241`):** S1 and S2-1 are closed and accepted; S2-2 steps 1–8 are implemented,
+> verified and committed (§12, §14.5); this document revision is S2-2 step 9; step 10 (full verification) is pending.
+> S2-3 … S2-8 have not started. The executable name is `bsc-aworker` (decision B3).
+
 ## 0. Approved decisions this plan implements
 
 | # | Decision | Where |
@@ -525,3 +537,479 @@ default is now 60 s; an explicit `startup-timeout` still replaces it. The manual
 * Real osmo-bsc:
   * Without the command, `show a-worker-pool` says 60 s and `show running-config` writes no line.
   * With `startup-timeout 30`, both show 30.
+
+### S1, S2-0, S2-1 and S2-2
+
+* **S1** (source separation into `src/a-worker/libaworker.la`, no behaviour change): closed and accepted. As built:
+  SUP §14 ("As implemented").
+* **S2-0 review:** the subphase structure and decisions of §14.1–§14.2.
+* **S2-1** (view builder `aworker_cfg_view.c`, inline form `worker <0-15> cs7-instance <0-15>`, D-S1 rules, BSC
+  view parsing) and its **Option C follow-up** (every configuration write refused in inline mode, VTY through
+  `config_is_consistent` and CTRL through `verify_net_write_config_file()`; new test `tests/aworker_cfg_write`): closed
+  and accepted. The planned worker-owned `route-table` filter was dropped: `route-table` is no osmo-bsc command (SG
+  role only, SUP §4.1). Limitations carried into S2-2 and resolved there: the C8 hook needed a real-binary test (R-2),
+  `show startup-config` in inline mode (D-8), and the missing official transcript runner (D-10).
+* **S2-2** (single read, worker snapshots, legacy mode): steps 1–8 implemented and verified; record and results in
+  §14.5.
+* **Commits:** `15c749359` "aworker: implement shared config and worker snapshots" (S1, S2-1 and S2-2 steps 1–6),
+  `5f4483f0c` "aworker: integrate snapshots with pool workers" (step 7), `b4d890241` "aworker: record the config path
+  in inline mode (D-8)" (step 8). The first one combines several subphases, against the "one change per commit" rule of
+  §13.1, by the project owner's decision: they share files and dependencies, and a split commit would not build.
+  Pushed to `origin` on 2026-11-17 (`e54578f2c..b4d890241`, together with the 2a-1 … 2a-5 commits).
+
+## 13. Revised plan: standalone Supervisor (S1 closed; S2 in progress, see §12 and §14)
+
+Architecture, decisions and risks: `PHASE2_SUPERVISOR.md` revision 3, referred to below as SUP. Starting point: HEAD
+`fa01448ea`.
+
+### 13.1 Rules for every phase
+
+* The §1 ground rules apply unchanged:
+  * one reviewable change per commit;
+  * no new warnings;
+  * normal and ASan/UBSan `make check` green;
+  * every new test shown to fail under a mutation of its fix;
+  * documentation in separate commits;
+  * no push, no history rewrite.
+* **P1–P20 and T1–T11 keep their sources, meaning and `.ok` output**, unless a commit deliberately changes a
+  documented behaviour and says so. P2/P3 are never inverted.
+* **Legacy in-process mode stays the default.** After every phase it passes its suites and the external E2E harness
+  (46 checks).
+* No systemd, service, cgroup or deployment work (SUP §15).
+* A phase starts only after explicit authorization, and after the decisions it depends on (§13.6) are approved.
+
+### 13.2 Phases and dependencies
+
+| Phase | Content | Depends on |
+|---|---|---|
+| **S0** | Architecture and decisions: SUP rev. 3, this §13, decision table SUP §16. Documentation only. | — |
+| **S1** | **Mechanical source separation, no behaviour change** (SUP §14): `src/a-worker/libaworker.la` (IPC, link, scanner, VTY definitions, worker role, lifecycle part of `aworker_pool.c`, shared log category table); user glue stays in `libbsc.la`, connected through the callback seam; decoupling from `tall_bsc_ctx`, `DAWORKER` and `gsm_data.h`; build integration (`src/Makefile.am`, `configure.ac`). No `bsc-aworker` yet; no new behaviour. | S0 approved |
+| **S2** | **Shared configuration:** view builder (SUP §4.2); inline form `worker I cs7-instance X` and conflict rules (D-S1); BSC view parsing in inline pools; snapshot builder (memfd, D-S2); legacy mode can use the inline form (N2). *Amended by §14:* the canonical document and its comparison move to S4 (subphase S2-5), and the `on-worker-failure shutdown` refusal moves to S3 (S2-3). | S1 |
+| **S3** | **Standalone `bsc-aworker`:** `aworker_main.c`; Supervisor view and logging (D-S10); lifecycle from `libaworker.la`; worker role by self-re-exec (same-binary guarantee) parsing its snapshot; pool start, restart, FAILED, reset, startup timeout and pool shutdown, as today but without any BSC; no runtime management VTY server (D-S6). *Amended by §14:* the operator control channel moves to S4 (S2-5), together with the socket security policy (N5); in S3 the Supervisor is controlled by signals only. No sessions yet. | S2 |
+| **S4** | **Session IPC and fd passing:** IPC v2 (major/minor, nonce, incarnation, session_id, message classes); SCM_RIGHTS per SUP §8.3; session state machine and session ECHO (SUP §9); ATTACH/DETACH (worker side minimal: close the data link and unbind, without the release sequence); WORKER_UP/DOWN/STATE; operator FENCE_SESSION with pidfd. | S3 |
+| **S5** | **Detached worker:** protocol test peer (§13.4) first, then the release sequence, counters, confirmation window and reattach (SUP §10). The `detach-release-timeout` default is decided here (D-S9). | S4 |
+| **S6** | **BSC integration** (opt-in `mode supervisor`): session client; canonical document in SESSION_OPEN; exit on reject; data links into the existing user, bind and TX code; WORKER_DOWN/UP handling; SESSION_CLOSE on planned stop (no GOODBYE); reconnect with backoff after Supervisor loss; reset and status forwarding. The BSC never spawns or signals workers in this mode. | S5 |
+| **S7** | **Full E2E fault-tolerance acceptance** (§13.5), using the external real-stack harness, extended | S6 |
+
+S1 → S2 → S3 → S4 → S5 → S6 → S7, strictly sequential, including the subphases S2-1 → … → S2-8 (§14). The S5 protocol
+test peer is built inside S5 (S2-6), not in parallel with earlier phases.
+
+### 13.3 Test gates
+
+| Phase | Gate (all must hold) |
+|---|---|
+| S1 | P1–P20, T1–T11 and all other suites: output byte-identical to `fa01448ea`. Legacy E2E 46/46. `git diff -M` shows only moves, the callback seam and the parameterisation; reviewed per function against SUP §14.3. `osmo-bsc --help`, `show running-config` and the log output of an E2E run are unchanged (same categories, same prefixes). No change to `.ok` files. |
+| S2 | Golden-file view tests (SUP §4.3), including every refusal case. The BSC view of an inline configuration parses to the same objects as the equivalent legacy main file. Each worker view parses to the same objects as the equivalent legacy worker file. Canonical document: identical across whitespace and comment changes; different on any value change; explicit defaults in P; BSC-only keys excluded. D-S1 conflict rules (both forms on one worker, mixed pool, file form in supervisor mode, transport command outside worker-owned instances) each refused with a message naming the line. Mutation per rule. |
+| S3 | P1–P20 semantics re-run against the real `bsc-aworker` where the test drives a parent (spawn, isolation, PDEATHSIG on **Supervisor** death (P2/P3), same image (P4), restart policy, FAILED, reset, startup timeout, pool shutdown with GOODBYE and exit 0). Workers parse only their snapshot (shown by modifying `osmo-bsc.cfg` after Supervisor start: restarts unaffected; the CS7_INFO check still active, by mutation). No listening TCP socket (no runtime VTY server, D-S6). Logging per D-S10, including the shared-file line-atomicity test. *(The operator CLI test moves to S4/S2-5, §14.3.)* |
+| S4 | fd passing unit tests: arrives intact; `MSG_CTRUNC`, missing, extra or unexpected descriptors close the link and leak nothing (descriptor counts as in Phase 1 P1); descriptor kept until send completion. Session tests: accept; reject for busy, version and config-mismatch; UNRESPONSIVE never admits a second BSC; CLOSING runs exactly once for every race in SUP §9.1 (mutation: duplicate teardown detected); fencing with confirmed exit admits; unconfirmed or no pidfd refuses; worker ECHO loss affects only that worker; session ECHO loss never touches workers. |
+| S5 | §13.4 in full; DETACHED/ATTACH cycles without descriptor or memory growth (ASan, descriptor counts) |
+| S6 | Attach → bind → RESET; BSC SIGKILL → Supervisor and worker PIDs and incarnations unchanged; reattach rebinds and RESET/RESET ACK completes; worker restart under a live session produces DOWN/UP and only that cs7 is affected; planned BSC stop sends no GOODBYE; BSC exits on reject; legacy mode unchanged |
+| S7 | §13.5, three consecutive full runs |
+
+### 13.4 Detached-mode protocol tests (S5) and the timeout decision (D-S9)
+
+**Test peer:** a test-side libosmo-sigtran M3UA server (or STP-side ASP) plus an SCCP endpoint on SSN 254. It can:
+* open connections towards the worker and accept connections from it;
+* answer or withhold CC, RLC and RLSD;
+* send CR, UDT and SST;
+* record every received message with a timestamp.
+
+Wire observation is at the peer, so it does not depend on the worker's own reporting.
+
+For each case the test records separately:
+1. API acceptance (return value);
+2. wire transmission (seen at the peer);
+3. peer response (sent by the peer);
+4. local removal (`osmo_sccp_conn_id_exists()`);
+5. the reported counter.
+
+| Case | Setup | Expected / to be measured |
+|---|---|---|
+| A1 ACTIVE, peer answers RLC | N connections ACTIVE | RLSD per connection at the peer **before** any unbind-caused UDTS/CREF; local removal on RLC; `confirmed = N`; measure the RLSD → removal latency distribution |
+| A2 ACTIVE, peer withholds RLC | same, peer silent | RLSD once; T(rel) retransmission observed only if the window exceeds T(rel); unbind at window end; no RLSD after the unbind; `unconfirmed = N` |
+| A3 ACTIVE, peer answers late | RLC delayed past the window | counted `unconfirmed`; the late RLC hits an unknown reference (Table B.2: discard) [V `sccp_scoc_rx_unass_local_ref()`] |
+| P1 CONN_PEND_OUT | the worker's CR outstanding (peer withholds CC) | no RLSD at detach (source finding); `pending_conn_conf`; then the peer sends CC after the unbind: record what the worker sends (expected ERR or nothing; to be observed) |
+| P2 CONN_PEND_IN | the peer's CR delivered, no answer yet | CREF sent; `refused_incoming` |
+| W1 WAIT_CONN_CONF reached before detach | as P1 with an earlier disconnect | as P1 |
+| D1 DISCONN_PEND before detach | a release already in progress | no second RLSD from the detach; counted per its outcome |
+| T1 Transport down | ASP inactive or SCTP down at detach | `not_issued_transport_down` (detection method validated); no crash; detach completes |
+| T2 AS-PENDING | AS pending at detach (if reproducible) | observe whether RLSDs are queued, sent later or dropped (closes the untraced-leg risk) |
+| R1 Retransmission timers | window longer than T(rel) | RLSD repeats at T(rel)/T(repeat_rel) as in `scoc_fsm_disconn_pend()`, and stop at the unbind |
+| E1 Window expiry | each case with window 0 and with a longer window | unbind exactly at expiry; counters consistent |
+| U1 After the unbind | — | UDT → UDTS "unequipped user"; CR → CREF "unequipped user"; SST → no answer; no SSP |
+| U2 During the window | — | CR → CREF (refused by the worker); SST → SSA (the documented trade-off; measured duration) |
+| RA Reattach | after each case | USER_BIND succeeds; traffic resumes; no state from the old session |
+
+**Decision rule for D-S9:**
+* The default is chosen from the A1 latency distribution, measured at the peer, under representative load and RTT,
+  and from the U2 false-availability window.
+* The values are recorded in this log with the measurements.
+* Until approved, supervisor mode requires an explicit value.
+
+Vendor MSCs: the UDTS/CREF sequence (U1) must be shown per vendor before compatibility is claimed (D6).
+
+### 13.5 S7 acceptance: full scenario, three consecutive runs
+
+| # | Step | Measurable acceptance |
+|---|---|---|
+| 1 | Start the Supervisor and workers | Supervisor PID recorded; every worker READY within startup-timeout; one process per worker, all children of the Supervisor |
+| 2 | Start the BSC and attach | SESSION_ACCEPT logged with session_id; WORKER_UP for every worker; BSC `show a-worker-pool` lists all workers attached |
+| 3 | Workers ready, ASP ACTIVE | STP `show cs7 instance … asp` shows every worker ASP ACTIVE; RESET/RESET ACK per MSC |
+| 4 | Real signalling | location update and MO+MT SMS succeed (counters increase, as in the current harness) |
+| 5 | SIGKILL the BSC | the BSC process is gone and collected |
+| 6 | Supervisor unchanged | same PID; session CLOSING → CLOSED logged exactly once |
+| 7 | Workers unchanged | same PIDs and incarnations; every worker DETACHED (counters logged) |
+| 8 | Transport unchanged | no ASP down/up, AS failover or SCTP restart in the STP log for the whole interval; same SCTP associations (local/remote ports) seen on the worker side before and after |
+| 9 | Detached MSC behaviour | after the first UDT towards the BSC, the osmo-msc log shows N-NOTICE "unequipped user" and the ran_peer goes to WAIT_RX_RESET; no transport change |
+| 10 | Restart the BSC with the same file | SESSION_ACCEPT, new session_id |
+| 11 | Same worker incarnations | WORKER_UP carries the incarnations of step 7; worker PIDs unchanged |
+| 12 | RESET recovery | RESET/RESET ACK per MSC; osmo-msc ran_peer READY |
+| 13 | MO and MT SMS | both succeed after recovery |
+| 14 | Single worker failure | SIGKILL one worker: only that worker is restarted (new incarnation, backoff per policy), WORKER_DOWN/UP seen by the BSC; other workers keep their PIDs and ASPs; traffic over the others continues |
+| 15 | SIGKILL the Supervisor | every worker exits (PDEATHSIG) within the grace bound; no orphan, no zombie; their ASPs go down at the STP; the BSC logs the session and worker loss and starts reconnecting |
+| 16 | Restart the Supervisor | a fresh pool (new nonce, new incarnations); the BSC reattaches; RESET; SMS works |
+
+Also in every run:
+* a planned BSC restart (SIGTERM) behaves like steps 5–13 without GOODBYE to workers;
+* a planned pool shutdown through the Supervisor ends every worker with exit 0 after GOODBYE (2a-1 semantics);
+* the subscriber connections and SCCP connections active at the moment of the BSC crash are lost (documented
+  exclusion).
+
+### 13.6 Decisions per phase, and resuming Phase 2
+
+* **Before S1:** S0 approved (SUP §14 layout and seam). Nothing else.
+* *Superseded by §14.4*, which gives the decision deadlines per subphase. Summary: D-S1, D-S2 and N2 are approved
+  (before S2-1/S2-2); D-S10 before S2-3; the canonical document scope (CD-1), D-S12 and N5 before S2-5; D-S9 before
+  S2-6 sign-off.
+* **Not needed for the MVP:** D-S7.
+* **2a-6 onwards resumes only after S7 has passed.** Ownership then follows SUP §14.4 and §9.2:
+  * 2a-6 ECHO in Supervisor ↔ worker;
+  * 2a-7 in both;
+  * 2a-8 status split;
+  * 2b: readiness reported by workers, protocol-timeout restarts by the Supervisor, RESET-ACK gating by the BSC;
+  * 2c in the BSC;
+  * 2d decided by the BSC and executed by the Supervisor.
+
+  Any earlier resumption needs explicit approval.
+
+## 14. S2-0 review: implementation subphases S2-1 … S2-8 (approved structure; S2-1 done, S2-2 in progress)
+
+### 14.1 Naming
+
+§13 stays the authoritative phase numbering: S2 Shared configuration, S3 Standalone executable, S4 Session IPC and fd
+passing, S5 Detached worker, S6 BSC integration, S7 E2E. **S2-1 … S2-8 are implementation subphase identifiers
+only.** Their mapping:
+
+| Subphase | Plan phase | Content (short) |
+|---|---|---|
+| S2-1 | S2 (part 1) | view builder, inline syntax, conflict rules, BSC view parsing |
+| S2-2 | S2 (part 2) | snapshots (memfd + fallback); inline form in legacy mode |
+| S2-3 | S3 | standalone `bsc-aworker`, worker role, header split, no sessions |
+| S2-4 | S4 (part 1) | IPC v2, message classes, SCM_RIGHTS primitives |
+| S2-5 | S4 (part 2) | control/data link split, sessions, operator channel, fencing, canonical document |
+| S2-6 | S5 | detached-worker release (protocol test peer first) |
+| S2-7 | S6 | BSC session client (opt-in supervisor mode) |
+| S2-8 | S7 | full E2E acceptance |
+
+**Order: strictly sequential, S2-1 → S2-2 → S2-3 → S2-4 → S2-5 → S2-6 → S2-7 → S2-8.** No subphase starts before
+the previous one is accepted and before the next one is explicitly authorized. S2-4 does not run in parallel with
+S2-1.
+
+### 14.2 Decisions recorded at the S2-0 review
+
+| ID | Decision | Status |
+|---|---|---|
+| D-S1 | Inline and legacy configuration rules: **one configuration form per worker; mixing forms within a pool is an error; supervisor mode accepts the inline form only; legacy mode supports both forms** | APPROVED |
+| N2 | The inline form is supported in **legacy mode** as a stepping stone (S2-2), before process ownership moves | APPROVED |
+| D-S2 | Worker configuration snapshots as **sealed memfd**, with a **tested unlinked-file fallback** | APPROVED |
+| N3 | The **existing legacy worker argv contract** (`--aworker-fd N --aworker-index N --aworker-config FILE`, parsed by `osmo_bsc_main.c` and by the P-test fake worker) stays **unchanged**. The standalone executable may use its own role/argv contract | APPROVED |
+| N4 | **Split** the lifecycle public header from the BSC-specific (SCCP user) public header **during S2-3**. No mechanical move of other S1 functionality (`aworker_pool_check_main_cs7()`, `show`/`reset` VTY commands stay where S1 put them) | APPROVED |
+| D-S5 | Prefer **deterministic canonical-document comparison** over hash-only comparison, **subject to defining its exact contents** (CD-1, §14.4) | APPROVED (contents open) |
+| D-S6 | **No runtime management VTY server** in the Supervisor. **Configuration VTY command registration remains** where it is needed to parse the configuration | APPROVED |
+| D-S8 | `on-worker-failure shutdown` is a global configuration error in supervisor mode; legacy unchanged | APPROVED (unchanged) |
+| D-S11 | The standalone Supervisor architecture supersedes the earlier statements | APPROVED (unchanged) |
+
+Decisions after the S2-2 implementation start, at the S2-3 design review (2026-11-17):
+
+| ID | Decision | Status |
+|---|---|---|
+| B1 | Reopen S2-2 and complete its remaining approved steps (snapshot delivery) before S2-3; S2-3 must not absorb S2-2 work | APPROVED; done through step 8 |
+| B2 | D-S10 logging: workers per D-2 (no log file, stderr inherited from the parent); Supervisor keeps its targets incl. files; BSC unchanged; shared file tested for default and `blocking-io` (ext4, kernel 7.0.0-43); **`wq` unverified**; durable regression test required; legacy log output unchanged | APPROVED with limitations (SUP §7) |
+| B3 | Executable name **`bsc-aworker`** everywhere (Automake, sources, docs, tests, examples, re-exec); never `osmo-bsc-aworker`. Runtime names `bsc-aworker-<i>` (memfd), `bsc-aworker-snap.<random>` (fallback) | APPROVED (final) |
+| B4 | Worker-role arguments: keep `--aworker-fd` and `--aworker-snapshot-fd`; internal, strictly validated, conflicting combinations refused; legacy `--aworker-config FILE` unchanged; FD ownership and close-on-exec rules | APPROVED |
+| B5 | Identity prefixes (`aworker-supervisor`, `aworker <idx> inc <n>`) for the new executable only; legacy output unchanged | APPROVED |
+
+The S2-2 decisions (D-1 … D-13, SR, FD, U-1 … U-6 and the final decisions of 2026-11-17) are in §14.5.
+
+**Not approved, still open:** D-S9, D-S12, N5, and the canonical document contents (CD-1). D-S3 and D-S4 remain as
+before (§14.4). D-S10 is resolved by B2.
+
+### 14.3 Subphases
+
+Common to all subphases: the §13.1 rules (one change per commit, no new warnings, normal and ASan/UBSan suites, mutation
+testing for new behaviour, P1–P20/T1–T11 meaning and output unchanged, legacy mode the default, legacy E2E 46/46
+after every subphase). Each subphase is additive or opt-in until S2-7, so legacy mode keeps working without it. Until
+S2-2 step 8 nothing was pushed; since 2026-11-17 the branch is on `origin` (§12), so a rollback is a revert commit,
+not "do not merge".
+
+#### S2-1: view builder, inline syntax, BSC view
+
+* **Objective:** `osmo-bsc.cfg` can declare `worker <0-15> cs7-instance <0-15>` and contain the worker-owned cs7
+  instances including their `asp`/`as`/`listen` nodes. A shared view builder produces the BSC, Supervisor and worker
+  views (SUP §4.2), and the BSC parses its view. No process ownership change; no spawning change.
+* **Files and functions:**
+  * `src/a-worker/aworker_cfg_scan.c` and a new `src/a-worker/aworker_cfg_view.c` (+ `include/osmocom/bsc/aworker_cfg_view.h`):
+    view building with the parser's rules (`fgets()` into `VTY_BUFSIZ`, `cmd_make_strvec2()`, prefix indentation
+    as in `indent_cmp()`, removed lines replaced by empty lines);
+  * `src/a-worker/aworker_vty.c`: the new command and its writer;
+  * `src/a-worker/aworker_pool.c`: `ownership_build()`, `aworker_pool_prescan_config()`,
+    `aworker_pool_check_ownership()` for the inline form and the D-S1 rules;
+  * `src/osmo-bsc/osmo_bsc_main.c` `bsc_read_config()`: parse the BSC view with `vty_read_config_filep()`.
+* **Parser separation (clarification B):** the view builder only selects lines; the **real** libosmovty and
+  libosmo-sigtran parsers interpret them.
+* **Tests to add:**
+  * `tests/aworker_cfg_view/` golden-file tests for the views, covering every case of SUP §4.3;
+  * **parse validation against the real parser** (clarification B):
+    * every generated BSC view is parsed with `vty_read_config_filep()` and the real node set
+      (`osmo_ss7_vty_init_asp()`, `osmo_sccp_vty_init()`, `aworker_pool_vty_init()`). The resulting objects are
+      checked: the cs7 instances exist with the expected point code and SCCP address book, and **no ASP or AS
+      object exists** in the parsing process;
+    * every generated worker view is parsed the same way, in a separate child process per view, because parsing an
+      `asp` node starts it; the test configurations point the ASPs at an unused loopback port. The resulting ASP,
+      AS and point-code objects are compared with the expected ones and with those produced by parsing the
+      equivalent legacy worker file;
+  * conflict-rule tests for D-S1: both forms on one worker, mixed pool, file form in supervisor mode, transport
+    commands outside worker-owned instances, `exit`/`end` lines, duplicate instance, inconsistent indentation. Each
+    is refused with the offending line;
+  * T10 extensions for the inline form; a VTY transcript test for the new command.
+* **Existing tests:** all unchanged and passing; legacy E2E (file form) 46/46.
+* **Acceptance:** all of the above; mutation per conflict rule and for the subtree rule. The BSC view of an inline
+  configuration yields the same BSC objects as the equivalent legacy main file.
+* **Failure cases:** view-builder/parser divergence (detected by the parse-validation tests; any divergence blocks
+  acceptance).
+* **As implemented (closed and accepted):** the BSC view is parsed in `aworker_pool_read_config()` (`aworker_pool.c`),
+  called from `osmo_bsc_main.c`, not in `bsc_read_config()` itself. Option C follow-up and the dropped `route-table`
+  filter: §12. The deprecation notice for the file form (SUP §4.5) is not implemented yet.
+
+#### S2-2: snapshots, inline form in legacy mode
+
+* **Objective:** in legacy mode, an inline pool gives each worker its view as a sealed memfd (fallback: unlinked file
+  in a private directory). The worker parses the snapshot and never the file. The file form keeps re-reading its files
+  exactly as today.
+* **Files and functions:** `aworker_pool.c` `child_exec_worker()` / `worker_spawn()` (inherit the snapshot descriptor;
+  for the inline form only, add a new option for the descriptor, while the existing `--aworker-config FILE` contract
+  stays unchanged, N3); `aworker.c` `aworker_run()` / `cs7_collect()` (scan and parse from the descriptor);
+  `osmo_bsc_main.c` option parsing; a new snapshot builder in `src/a-worker/`.
+* **Tests to add:** process tests numbered from P21 (the fake worker gains the snapshot option; P1–P20 untouched):
+  a worker reads only its snapshot; editing `osmo-bsc.cfg` after start does not change a restarted worker; the
+  CS7_INFO ownership check is still active (mutation); memfd path and fallback path both tested (fallback forced).
+  E2E variant with an inline configuration.
+* **Existing tests:** P1–P20 (file form, unchanged argv), T1–T11, legacy E2E (file form).
+* **Acceptance:** both legacy forms pass E2E; no file access by an inline-form worker (verified, e.g. by moving the
+  file away after start).
+* **Status:** steps 1–8 of the approved sequence implemented and verified; step 9 is this documentation; step 10
+  pending. Decisions, tests, results and limitations: §14.5.
+
+#### S2-3: standalone `bsc-aworker` (no sessions)
+
+* **Objective:** the real executable. It reads `osmo-bsc.cfg` (Supervisor view), registers the configuration
+  commands it needs for parsing and **starts no runtime VTY server** (D-S6). It spawns workers by re-executing its own
+  image in a worker role (own argv contract, N3), reaps them and applies the unchanged lifecycle policy. SIGTERM
+  stops the pool cleanly with GOODBYE. No BSC attaches yet; workers stay with SSN 254 unbound. Controlled by signals
+  only.
+* **Files and functions:**
+  * `src/a-worker/Makefile.am`: `bin_PROGRAMS = bsc-aworker`;
+  * new `src/a-worker/aworker_main.c`: options, logging with the shared categories (D-S10), `vty_init()` with a
+    `go_parent_cb` delegating to `osmo_ss7_vty_go_parent()`, `osmo_ss7_init()`, `osmo_ss7_vty_init_asp()`,
+    `osmo_sccp_vty_init()`, `aworker_pool_vty_init()`, and **no** `telnet_init*()` call; event loop; signals;
+  * `aworker_pool.c`: `aworker_pool_set_exec()` with a worker-role argv for the new binary; `worker_apply_policy()`
+    plus a configuration check that refuses `shutdown` in supervisor mode (D-S8);
+  * **header split (N4):** `aworker_pool.h` becomes a lifecycle header plus a BSC-specific user header, so the new
+    binary no longer includes `bsc_sccp_backend.h`.
+* **Tests to add:** a process-test suite launching the real `bsc-aworker`:
+  * Supervisor SIGKILL terminates all workers (P2/P3 semantics with the Supervisor as parent);
+  * workers run the Supervisor's own image (P4 semantics);
+  * backoff, restart limit, FAILED, startup timeout, pool stop with GOODBYE (exit 0);
+  * **no listening TCP socket** opened by the Supervisor (clarification B: checked from `/proc/<pid>/net` / socket
+    inodes);
+  * the executable's undefined symbols are only Osmocom libraries and libc (`nm`);
+  * `osmo-bsc --vty-ref-xml` and `--help` unchanged.
+* **Existing tests:** P1–P20 and T1–T11 against the library, unchanged.
+* **Acceptance:** all of the above; logging per D-S10 (decision B2) including a durable concurrent shared-file
+  regression test; no claim for `wq` mode unless tested.
+* **Decided at the S2-3 design review (B1–B5, §14.2):** the name `bsc-aworker` (`bin_PROGRAMS = bsc-aworker`); the
+  worker role reuses the S2-2 contract `--aworker-fd`, `--aworker-index`, `--aworker-snapshot-fd` with strict
+  validation (index 0–15 as digits), hidden from `bsc-aworker`'s public help; identity prefixes only in the new
+  executable. S2-3 starts only after S2-2 is accepted (step 10) and S2-3 is authorized.
+
+#### S2-4: IPC v2 and fd-passing primitives
+
+* **Objective:** major/minor version, boot nonce, incarnation and session_id in HELLO; message classes per channel
+  (control, data, session); SCM_RIGHTS on the existing link.
+* **Files:** `aworker_ipc.c/.h`, `aworker_ipc_link.c/.h`. Legacy use is transparent.
+* **FD ownership rules (clarification A), implemented and tested here:**
+  * at most one descriptor per message; receive buffer `CMSG_SPACE(sizeof(int))` via `osmo_iofd_set_cmsg_size()`;
+  * **sender:** keeps its descriptor until `sendmsg_cb` reports completion, then closes it; if the link is freed with
+    the record still queued, closes it then (`osmo_iofd_sendmsg_msgb()` copies only the descriptor number at enqueue
+    time [V]);
+  * **receiver:** `MSG_CTRUNC` → close every received descriptor, then the link; wrong descriptor count or a
+    descriptor on a message type that takes none → close all received descriptors, then the link; `FD_CLOEXEC`
+    set immediately (no `MSG_CMSG_CLOEXEC` in the pinned osmo_io [V]); every received descriptor has exactly one
+    owner or is closed on every failure path;
+  * partially received transfers (a record without its descriptor, or the reverse) are protocol errors handled as
+    above.
+* **Tests to add:** `aworker_ipc` unit tests: descriptor arrives intact and refers to the same open file; each failure
+  case leaks nothing (descriptor counts of the process before/after, as Phase 1 P1 does); a descriptor queued on a
+  link that is freed is closed; version and class rules.
+* **Existing tests:** P1–P20, T1–T11 unchanged (exact-version test updated only for the documented version field
+  change, stated in the commit).
+
+#### S2-5: sessions, control/data split, operator channel, fencing, canonical document
+
+* **Objective:** the worker's single link becomes a control link (Supervisor, worker lifetime; loss = worker exit)
+  and a data link per BSC session (loss = detach). Supervisor session socket, session state machine (CLOSING entered
+  exactly once, SUP §9.1), ATTACH/DETACH (minimal detach: close the data link, unbind SSN 254), WORKER_UP/DOWN/STATE,
+  session ECHO, operator control channel (D-S6, N5), fencing via pidfd, canonical document comparison (CD-1, D-S5).
+* **Files:** `aworker.c` (two links), `aworker_pool.c` (control link), new `src/a-worker/aworker_session.c`, operator
+  client mode in `aworker_main.c`.
+* **Endpoint ownership (clarification A), to be implemented exactly:**
+
+| Endpoint | Created by | Held by | Closed by / when |
+|---|---|---|---|
+| Control socketpair, Supervisor end | Supervisor at spawn | Supervisor (link) | Supervisor on worker loss or pool stop |
+| Control socketpair, worker end | Supervisor at spawn | worker only (the Supervisor's copy is closed in the parent right after `fork()`, as today) | worker exit |
+| Data socketpair, worker end | Supervisor per attach | **worker only** after ATTACH is sent | Supervisor's copy closed in `sendmsg_cb`; worker on DETACH / session end |
+| Data socketpair, BSC end | Supervisor per attach | **BSC only** after WORKER_UP is sent | Supervisor's copy closed in `sendmsg_cb`; BSC on session end or death (kernel) |
+| Session socket (BSC side) | BSC `connect()` | BSC | BSC exit or death |
+| Session socket (Supervisor side) | `accept()` | Supervisor | CLOSING entry action |
+
+  * **EOF propagation:** the worker sees EOF on its data endpoint after a BSC death **only if no other process holds a
+    duplicate of the BSC end.** Therefore: the Supervisor must have closed its copy of the BSC end (send completed)
+    before the session is ACTIVE for that worker; no data endpoint may be inherited by any other child (workers are
+    spawned with `child_close_fds()` keeping only their own descriptors [V]; data socketpairs are created
+    `SOCK_CLOEXEC`); the BSC must not fork with the endpoint open. The Supervisor additionally sends DETACH on session
+    EOF, so the worker detaches even if an EOF were masked by a stray duplicate, but the EOF itself is required and
+    tested.
+* **Tests to add:**
+  * session tests with a scripted BSC client process: accept; reject for busy, version and config mismatch;
+    UNRESPONSIVE never admits a second BSC; every race in SUP §9.1; exactly-once CLOSING (mutation: duplicate
+    teardown detected); stale session_id or incarnation rejected; fencing with confirmed exit admits, unconfirmed or
+    unavailable pidfd refuses; worker ECHO loss affects only that worker;
+  * **real process-level EOF test (clarification A):** the scripted BSC client is SIGKILLed; each worker observes EOF
+    on its data endpoint within a bound (logged and reported in STATE), independently of the Supervisor's DETACH
+    (a test hook delays DETACH to separate the two causes); afterwards no process other than the worker holds a
+    descriptor to the worker's data endpoint (checked via `/proc/*/fd` socket inodes);
+  * descriptor accounting in the Supervisor across 100 attach/detach cycles (no growth);
+  * operator channel: unauthorized client rejected (per N5), operator cannot change configuration.
+* **Acceptance:** all of the above; CD-1, D-S12 and N5 resolved before this subphase starts.
+
+#### S2-6: detached-worker release
+
+* **Objective, tests, acceptance:** §13.4 in full (protocol test peer first; API acceptance, wire transmission, peer
+  response and local removal recorded separately). D-S9 decided from the measurements before sign-off; no default is
+  invented before that.
+
+#### S2-7: BSC session client (opt-in supervisor mode)
+
+* **Objective:** `osmo-bsc` with `mode supervisor` never spawns, signals or restarts workers; connects to the
+  Supervisor (retry with backoff); sends SESSION_OPEN with its canonical document; exits on reject; runs
+  `aworker_users.c` over data links; SESSION_CLOSE on planned stop (no GOODBYE); RESET via `a_worker_available()`.
+* **Files:** `src/osmo-bsc/aworker_users.c` (data-link source), new `src/osmo-bsc/aworker_client.c`, `osmo_bsc_main.c`
+  (mode switch; no `aworker_pool_start()` in supervisor mode).
+* **Tests to add:** T-semantics over the session path; real-BSC process test: BSC SIGKILL → worker data-endpoint EOF
+  observed (clarification A, with the real `osmo-bsc`), Supervisor and worker PIDs and incarnations unchanged;
+  reattach rebinds and RESET is sent; legacy mode unchanged.
+* **Transport survival evidence (clarification D),** recorded before the kill and after the reattach, and compared:
+
+| Item | How it is recorded |
+|---|---|
+| worker PID | Supervisor STATUS, `/proc` |
+| worker incarnation | Supervisor STATUS, WORKER_UP |
+| SCTP association identity and state | local/remote addresses and ports and association state of the worker's SCTP socket (socket inode in `/proc/<pid>/fd`, kernel SCTP association table), unchanged inode and endpoints |
+| M3UA ASP/AS state | STP VTY (`show cs7 instance … asp`, `… as`) and worker log: ACTIVE throughout, no state change logged |
+| CS7/SCCP readiness | worker STATE (READY, CS7_INFO unchanged); SSN 254 rebound after reattach |
+| worker restarts | Supervisor `starts` counter and restart record unchanged; no spawn logged |
+
+  A surviving Supervisor PID alone is not accepted as evidence.
+
+#### S2-8: E2E acceptance
+
+* §13.5 (16 steps, three consecutive runs) with the clarification D evidence table recorded at steps 5–11, using the
+  external harness extended for both binaries.
+
+### 14.4 Open decisions and deadlines
+
+| ID | Question | Current position | Must be resolved before | Required content / evidence |
+|---|---|---|---|---|
+| **CD-1** | Exact contents of the canonical configuration document (D-S5 contents; D-S3/D-S4 detail) | proposal SUP §4.6 (H/P/C); C is syntactic, not effective (see SUP §4.6 note) | **S2-5** | explicit values; effective defaults (explicit in P; how defaults of cs7 commands are represented in C); normalized ordering and representation; per-worker cs7 and transport configuration; pool and Supervisor settings; treatment of semantically identical but differently formatted or spelled configurations. Raw-file comparison is **not** acceptable. |
+| **D-S12** | Session ECHO keys and values | keys proposed, values open | **S2-5** (keys and initial values); values confirmed by S2-8 measurements | interval and miss threshold; state transitions per SUP §9.2 |
+| **N5** | Session/operator socket security | open | **S2-5** | socket directory and file ownership and mode; peer authorization (`SO_PEERCRED` uid/gid policy, session vs operator role); stale socket handling (only after acquiring the lock, never while another Supervisor holds it); lock semantics (`flock` exclusive non-blocking on a lock file for the Supervisor's lifetime; path); rejection of unauthorized local clients before any processing; abstract-namespace sockets excluded or justified. umask alone is **not** a sufficient policy. |
+| D-S10 | Logging | **resolved by B2** (SUP §7), with limitations | — (remaining work in **S2-3**) | durable concurrent shared-file regression test; `wq` mode unverified, no claim made |
+| D-S3 | Config mismatch → BSC exits | approved direction, detail proposed | S2-7 (behaviour); CD-1 first | — |
+| D-S9 | Detach release timeout | **unresolved** | S2-6 sign-off | §13.4 measurements |
+| D-S7 | Supervisor TCP port | deferred | only if a TCP interface is ever added | — |
+
+### 14.5 S2-2 implementation record (steps 1–8; step 9 = this revision; step 10 pending)
+
+**Approved decisions** (second S2-2 review, implementation authorization, and the final decisions of 2026-11-17):
+
+| ID | Decision | As implemented / verified |
+|---|---|---|
+| D-1 | Snapshots built by the legacy osmo-bsc pool parent; code reusable by the S2-3 Supervisor | `aworker_snapshot.c` and `aworker_cfg_view.c` in `libaworker.la`, no BSC-only symbols (`nm` check, step 4) |
+| D-2 | Worker views omit the `log file` section (with its scoped directives, and `no log file`); other logging kept; workers log to stderr | view rule + refusal of any worker view with `log file` (step 2); real binary: no worker descriptor of the BSC's log file, worker lines on stderr only (R-4) |
+| D-3 | Worker reads with `pread()` from offset 0 | S-9, P24 (offset at the end, two restarts read everything) |
+| D-4 | Fallback only without a sealed memfd; never called equivalent; `$RUNTIME_DIRECTORY` (first, absolute), `/dev/shm`, `/tmp`; directory accepted if owned by the effective user (any mode) or root-owned and sticky (final decision 1); all operations through the directory fd; leftovers reported, never deleted; same-user limit documented | S-3 … S-6, P28 (no usable directory: no fork), P29 (changed fallback refused before every start) |
+| D-5 | 1 MiB per snapshot (1,048,576 accepted, one more refused, empty refused) | S-7 |
+| D-6 | `--aworker-snapshot-fd N`: N > 2, ≠ `--aworker-fd`, needs `--aworker-fd`, not with `--aworker-config`; strict index 0–15 in this mode only (final decision 5); violations exit 2; N3 unchanged | R-1 (unit test against the real binary and `real_s22.py`) |
+| D-7 | A reset reuses the startup snapshot; a configuration change needs an osmo-bsc restart; logged | P25 |
+| D-8 | `show startup-config` in inline mode | was `fopen(NULL)` ("Can't open configuration file [(null)]"); fixed by recording the path after the BSC view parsed (`b4d890241`); R-3: shows the file read, also after a refused `write file PATH`; R-3b: file form and no pool unchanged |
+| D-9 | Real-binary C8 | R-2: every VTY write form and CTRL `write-config-file` refused, file unchanged, nothing written |
+| D-10 | No download; document the missing official transcript runner | scratch runner `vtyrun.py` (see limitations) |
+| D-11 | Inline variant of the external E2E | `run_e2e.py --inline`: 49/49 |
+| D-12 | Verify `MFD_NOEXEC_SEAL` and sealing here; unsupported flags handled without weaker seals | S-1, S-2 (EINVAL retry keeps all four seals), S-10: kernel 7.0.0-43, `vm.memfd_noexec` 0, `MFD_NOEXEC_SEAL` accepted, seals 0x2f |
+| D-13 | Worker view checked as text before any parse | step 3 and the worker in step 6: refusals exit 66 with no parse, ASP or socket (child test; strace on the real binary, R-7) |
+| SR / U-1, U-2 | Pool configurations read once (≤ 16 MiB); model, BSC parse, BSC view and all snapshots from that buffer; the path never reopened; metadata and second-pass comparison; best effort, not atomic | V-5, V-6 (step 1); R-6 (inotify: no open of the file during restarts) |
+| FD | Child keeps stdio, its IPC socket, its own snapshot (and the close-on-exec exec fd until exec); worker closes the snapshot right after the read; worker i cannot reach j; cleanup after fork failure, exec failure, exit, restart | P21, P22 (write/truncate through `/proc` → EPERM), P27, S-8, R-5 |
+| U-3 | `show startup-config` an acceptance gate, normal and ASan | D-8 above |
+| U-4 | Supervisor logging policy in S2-3 | settled by B2 (§14.2) |
+| U-5 | Mutation runner runs real-binary checks through a deterministic external command | `mutate.py` `"commands"` (harness backed up first); existing behaviour unchanged (byte-identical output on an old spec) |
+| U-6 | `RLIMIT_NPROC` test only as non-root, else NOT EXECUTED | executed as uid 1000 (P27) |
+| Names | `memfd:bsc-aworker-<i>`, `bsc-aworker-snap.<random>`, executable `bsc-aworker` (final decision 1, B3) | in code and tests; the T9 fixture string `/etc/osmocom/osmo-bsc-aworker0.cfg` deliberately unchanged (final decision 6) |
+
+**Steps** (the approved order; each step was reported and accepted before the next one was authorized):
+
+| Step | Content | Main tests | Mutations (caught / run) |
+|---|---|---|---|
+| 1 | single-read source (`aworker_cfg_read_stable()`, `aworker_cfg_model_build_buf()`) | V-5, V-6, D4/D5 cases | 16/16 (SR5 detected only by the call-sequence assertion; kept by decision) |
+| 2 | D-2 worker logging rule | Part E (E1–E4) | 16/16 after the approved removal of the redundant L15 exclusion |
+| 3 | D-13 worker-view check | Part F | 23/23 (V23 caught by the golden output only) |
+| 4 | sealed memfd snapshots | S-1, S-2, S-7 … S-10 | 30/31 (N10: an ignored `F_ADD_SEALS` failure is caught by the `F_GET_SEALS` check) |
+| 5 | secure fallback | S-3 … S-6 | 41/43 (F8/F9 redundant pair, accepted; F45 removing both is caught; F29 excluded) |
+| 6 | worker snapshot mode, `--aworker-snapshot-fd` | `tests/aworker_worker` (real `aworker_run()` in a child; R-1 against the real binary) | 22/22 |
+| 7 | pool parent integration and fd isolation | P21 … P30, T12 update | 22/22 |
+| 8 | real-binary checks, inline E2E, scratch runner, U-5, D-8 fix | `real_s22.py` R-1 … R-7 + R-3b; `run_e2e.py --inline`; `vtyrun.py` | 8/8 real-binary (C8 ×3, D-8, D-2, R-5, R-7 ×2) |
+
+**Results at the end of step 8** (fresh normal and ASan/UBSan builds): `make check` 19/19 in both; every A-worker test
+run directly matches its `.ok`; no sanitizer report from any process (tests, forked fake workers, real osmo-bsc and
+its workers); `real_s22.py` 72/72 normal, 73/73 ASan; E2E legacy 46/46, inline 49/49; `vtyrun.py` 5/5 transcripts
+(`aworker_pool.vty` and four upstream ones) in both builds. Evidence: `~/dev/osmo-bsc-a-worker-recheck/step*/`.
+
+**Known limitations and open points:**
+* The fallback is weaker than a sealed memfd (same-user processes; root) — by design, logged as a WARNING.
+* The single read detects changes during the read on a best-effort basis; it is not an atomic filesystem snapshot.
+* D-10: the official `osmo_verify_transcript_vty.py` is not installed; `aworker_pool.vty` has been run only with the
+  scratch runner `vtyrun.py`, which is not equivalent (documented in its header: subset of the matching rules, VTY on
+  127.0.41.1 instead of 127.0.0.1, no update mode).
+* The external harness (`real_s22.py`, `vtyrun.py`, `run_e2e.py`, `mutate.py` in `~/dev/osmo-bsc-a-worker-pool-e2e/`)
+  is not in the repository.
+* `real_s22.py` runs without STP or MSC (associations never come up); end-to-end signalling of the inline form is
+  covered by the inline E2E (one host, two workers).
+* `show startup-config` shows the file as it is on disk now; after an edit it can differ from the running snapshots.
+* `show a-worker-pool` prints "config file (none)" for inline workers.
+* The file-form deprecation notice (SUP §4.5) is not implemented.
+* Moving a snapshot descriptor above fd 2 (osmo-bsc started with a standard stream closed) is not exercised by a test.
+* P1–P20 contain pre-existing unguarded `kill(winfo(..).pid, …)` calls; with a worker that has no process (pid 0)
+  they would signal the test's process group. Only reachable under mutants; the new P21–P30 guard it.
+* D-S10 (B2): `wq` mode unverified; the durable shared-file regression test belongs to S2-3.
+* Step 10 (full normal and ASan/UBSan verification, mutation run, legacy E2E, git and artifact report) is pending; its
+  report also records the incidents of the S2-2 work (kept in the step evidence).

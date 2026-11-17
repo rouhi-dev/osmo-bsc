@@ -3,6 +3,25 @@
 Status: **proposal for review**. Nothing in this document is implemented. Phase 1 is committed as `e54578f2c` on
 `a-worker-pool` (unpushed).
 
+> **Revision note: current target architecture (after 2a-5, HEAD `fa01448ea`).** The **current target** for BSC
+> crash survival is `PHASE2_SUPERVISOR.md` (revision 3):
+> * a standalone Supervisor executable `bsc-aworker` (`src/a-worker/`) owns the worker lifecycle;
+> * `osmo-bsc` is a separate client process;
+> * `osmo-bsc.cfg` is the single persistent configuration source;
+> * no systemd or DevOps work is in the A-worker team's scope.
+>
+> This was decided as approved direction D-S11. This document is kept as the historical investigation, and it
+> describes the in-process pool (osmo-bsc as the workers' parent). That pool is implemented (Phase 1, 2a-1…2a-5)
+> and remains the default "legacy mode" until the Supervisor architecture passes its acceptance (S7). Where this
+> document says the BSC owns, spawns or supervises workers, that holds for legacy mode only; in supervisor mode the
+> Supervisor does. §17 is superseded as noted there. The models, recovery questions, scheduling, connection-loss
+> analysis and the 2b–2e designs remain valid.
+>
+> **Status (2026-11-17, HEAD `b4d890241`):** S1, S2-1 and S2-2 steps 1–8 are implemented: the inline form and worker
+> configuration snapshots work in legacy mode, with osmo-bsc still the workers' parent. The Supervisor executable
+> `bsc-aworker` and supervisor mode are not implemented yet (S2-3 onwards). Record: `PHASE2_IMPLEMENTATION_PLAN.md`
+> §12 and §14.5.
+
 Baseline inspected:
 
 | Component | Version / commit | Where |
@@ -483,6 +502,13 @@ Connection-oriented traffic is already instance-specific (conn_id registry per c
 
 A worker is a child of the BSC by construction (socketpair, PDEATHSIG). An external supervisor that started or
 killed workers would create competing ownership, so it must not.
+
+> **Superseded for supervisor mode (approved direction D-S11, `PHASE2_SUPERVISOR.md` §16).** The workers'
+> single owner becomes the standalone Supervisor `bsc-aworker`. There is still exactly one owner, so ownership
+> does not compete. In supervisor mode the BSC never spawns, signals or restarts workers, and it reaches them only
+> through the session protocol. Operating-system service management (systemd, deployment) remains outside the A-worker
+> team's scope; it only has to start the two binaries independently (`PHASE2_SUPERVISOR.md` §15). The table above
+> still describes legacy mode.
 
 ---
 

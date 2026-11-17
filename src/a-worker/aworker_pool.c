@@ -294,12 +294,17 @@ int aworker_pool_read_config(const char *config_file)
 	osmo_talloc_replace_string(NULL, &g_view_file, config_file);
 	rc = parse_text(view, len);
 	talloc_free(view);
-	if (rc == 0)
+	/* Recorded as the VTY's config file, as in the file form and without a pool: 'show startup-config' shows the
+	 * file (decision D-8), and no command of libosmovty ever sees a NULL config file. Writing it stays refused
+	 * (aworker_pool_config_write_refusal()); the workers never open it -- they have their snapshots. */
+	if (rc == 0) {
+		host_config_set(config_file);
 		LOGP(aworker_log_cat, LOGL_NOTICE, "'%s' uses the inline A-worker form: parsed without the asp / as /"
 		     " listen nodes of the worker-owned cs7 instances, which belong to the workers."
 		     " Writing the configuration (VTY 'write file [PATH]', 'write', 'write memory', 'copy"
 		     " running-config startup-config'; CTRL 'write-config-file') is refused, as it would write it"
 		     " without those nodes.\n", config_file);
+	}
 	return rc;
 }
 

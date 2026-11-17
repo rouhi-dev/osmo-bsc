@@ -594,7 +594,9 @@ static void parse_in_child(const char *text, size_t len, char *out, size_t outle
 		if (write(pp[1], buf, strlen(buf)) < 0) {}
 		if (via_read_config) {
 			snprintf(buf, sizeof(buf), "    VTY config file: %s\n",
-				 host_config_file() ? "set (write file saves to it)" : "none (write file refuses)");
+				 !host_config_file() ? "none (write file refuses)"
+				 : aworker_pool_config_write_refusal() ? "set (writing it is refused: inline form)"
+				 : "set (write file saves to it)");
 			if (write(pp[1], buf, strlen(buf)) < 0) {}
 		}
 		facts(buf, sizeof(buf));

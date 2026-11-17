@@ -1,5 +1,5 @@
 inline form: every write refused
-  parsed as the BSC view; VTY config file: none; refusal: yes
+  parsed as the BSC view; VTY config file: the file read; refusal: yes
   VTY 'write file <other path>': refused, saying why
   VTY 'write file <osmo-bsc.cfg>': refused, saying why
   VTY 'write file': refused, saying why

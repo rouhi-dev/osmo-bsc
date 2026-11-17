@@ -212,6 +212,9 @@ static const char *cfg_inline =
 	" workers 1\n"
 	" worker 0 cs7-instance 0\n";
 
+/* case_inline(): the main configuration file it reads. */
+static const char *g_inline_orig;
+
 static void expect_vty_refused(const char *cmdstr, const char *label)
 {
 	char out[2048];
@@ -223,7 +226,8 @@ static void expect_vty_refused(const char *cmdstr, const char *label)
 	       says_why ? ", saying why" : ", WITHOUT the reason");
 	CHECK(rc == CMD_WARNING);
 	CHECK(says_why);
-	CHECK(host_config_file() == NULL);
+	/* The config file recorded at startup (D-8) stays the one read: a refused 'write file PATH' does not move it. */
+	CHECK(host_config_file() && !strcmp(host_config_file(), g_inline_orig));
 }
 
 static void case_inline(void)
@@ -234,12 +238,13 @@ static void case_inline(void)
 	char cmdstr[600];
 
 	osmo_strlcpy(orig, put("osmo-bsc.cfg", cfg_inline), sizeof(orig));	/* put() returns a reused buffer */
+	g_inline_orig = orig;
 
 	slurp(orig, before, sizeof(before));
 	CHECK(aworker_pool_read_config(orig) == 0);
-	printf("  parsed as the BSC view; VTY config file: %s; refusal: %s\n", host_config_file() ? "set" : "none",
-	       aworker_pool_config_write_refusal() ? "yes" : "no");
-	CHECK(host_config_file() == NULL);
+	printf("  parsed as the BSC view; VTY config file: %s; refusal: %s\n", host_config_file() ? (!strcmp(
+	       host_config_file(), orig) ? "the file read" : "OTHER") : "none", aworker_pool_config_write_refusal() ? "yes" : "no");
+	CHECK(host_config_file() && !strcmp(host_config_file(), orig));
 	CHECK(aworker_pool_config_write_refusal() != NULL);
 
 	/* Every VTY form; PATH both elsewhere and the original file itself. */
@@ -260,7 +265,7 @@ static void case_inline(void)
 	CHECK(strstr(out, " worker 0 cs7-instance 0\n") != NULL);
 	CHECK(strstr(out, "asp-a0") == NULL);
 
-	/* CTRL: 'overwrite' (no config file is recorded: this must not reach the writer) and a PATH. */
+	/* CTRL: 'overwrite' (the recorded config file: this must not reach the writer) and a PATH. */
 	ch = ctrl_setup();
 	CHECK(ctrl_cmd(ch, "SET 1 write-config-file overwrite", reply, sizeof(reply)) == CTRL_TYPE_ERROR);
 	printf("  CTRL 'SET write-config-file overwrite': %s\n",
@@ -276,7 +281,7 @@ static void case_inline(void)
 	printf("  CTRL 'SET write-config-file <osmo-bsc.cfg>': %s\n",
 	       strstr(reply, "Writing the configuration is refused") ? "refused, saying why" : reply);
 	CHECK(strstr(reply, "Writing the configuration is refused") != NULL);
-	CHECK(host_config_file() == NULL);
+	CHECK(host_config_file() && !strcmp(host_config_file(), orig));
 
 	/* Nothing was written anywhere. */
 	slurp(orig, after, sizeof(after));

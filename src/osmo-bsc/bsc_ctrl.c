@@ -107,8 +107,8 @@ CTRL_CMD_DEFINE_WO(net_apply_config_file, "apply-config-file");
 
 static int verify_net_write_config_file(struct ctrl_cmd *cmd, const char *value, void *_data)
 {
-	/* Inline A-worker form: the running configuration lacks the workers' nodes (and no config file is recorded,
-	 * so 'overwrite' would have no file to write). */
+	/* Inline A-worker form: the running configuration lacks the workers' nodes, so writing it -- 'overwrite' over
+	 * the config file it was read from, or to any PATH -- is refused before anything is written. */
 	const char *refusal = aworker_pool_config_write_refusal();
 
 	if (refusal) {

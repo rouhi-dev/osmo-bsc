@@ -259,7 +259,7 @@ Part C: osmo-bsc entry points
   prescan no pool, asp in the main file: 0
   read inline file:
     parse: ok
-    VTY config file: none (write file refuses)
+    VTY config file: set (writing it is refused: inline form)
     cs7 instance 0: point-code 0.23.3
     cs7 instance 1: point-code 0.23.4
     sccp-address msc0: cs7 instance 0, point-code 0.23.1
@@ -302,11 +302,11 @@ Part D: the source configuration is read once
     replaced by a FIFO between the check and the open (does not block): -EINVAL (not a regular file)
   D2: one open and one buffer for a pool configuration; no pool: as before
     inline pool:
-      prescan 0, read 0; opened 1 time(s); cs7 instance 0 point-code 0.23.3; VTY config file none
+      prescan 0, read 0; opened 1 time(s); cs7 instance 0 point-code 0.23.3; VTY config file set
     inline pool, file rewritten after the prescan (the buffer is parsed):
-      prescan 0, read 0; opened 2 time(s) (one of them the test rewriting it); cs7 instance 0 point-code 0.23.3; VTY config file none
+      prescan 0, read 0; opened 2 time(s) (one of them the test rewriting it); cs7 instance 0 point-code 0.23.3; VTY config file set
     inline pool, read without a prescan:
-      prescan 0, read 0; opened 1 time(s); cs7 instance 0 point-code 0.23.3; VTY config file none
+      prescan 0, read 0; opened 1 time(s); cs7 instance 0 point-code 0.23.3; VTY config file set
     file-form pool:
       prescan 0, read 0; opened 1 time(s); cs7 instance 0 point-code 0.23.3; VTY config file set
     file-form pool, file rewritten after the prescan (the buffer is parsed):

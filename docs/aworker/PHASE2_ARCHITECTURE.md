@@ -19,8 +19,9 @@ Status: **proposal for review**. Nothing in this document is implemented. Phase 
 >
 > **Status (2026-11-18, after S2-3):** S1, S2-1 and S2-2 are accepted: the inline form and worker configuration
 > snapshots work in legacy mode, with osmo-bsc the workers' parent. S2-3 adds the standalone Supervisor `bsc-aworker`,
-> which runs the pool on its own, without osmo-bsc; no BSC attaches to it yet (sessions: S2-4 onwards). Record:
-> `PHASE2_IMPLEMENTATION_PLAN.md` §12, §14.5 and §14.6.
+> which runs the pool on its own, without osmo-bsc; no BSC attaches to it yet. S2-4 adds IPC protocol 2.0 (versions,
+> identity, message classes, descriptor passing); sessions that use it are S2-5 onwards. Record:
+> `PHASE2_IMPLEMENTATION_PLAN.md` §12 and §14.5–§14.7.
 
 Baseline inspected:
 

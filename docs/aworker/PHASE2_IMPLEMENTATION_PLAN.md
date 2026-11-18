@@ -12,8 +12,8 @@ below). Baseline: `a-worker-pool` at `e54578f2c` (Phase 1).
 > implementation subphases S2-1 … S2-8 and their mapping to the phases of §13.
 >
 > **Status (2026-11-18):** S1, S2-1 and S2-2 are closed and accepted (S2-2 record: §14.5). S2-3, the standalone
-> Supervisor `bsc-aworker`, is implemented and verified (§14.6); S2-4 … S2-8 have not started. The executable name is
-> `bsc-aworker` (decision B3).
+> Supervisor `bsc-aworker`, is implemented and verified (§14.6), and so is S2-4, IPC protocol 2.0 with descriptor
+> passing (§14.7); S2-5 … S2-8 have not started. The executable name is `bsc-aworker` (decision B3).
 
 ## 0. Approved decisions this plan implements
 
@@ -552,12 +552,14 @@ default is now 60 s; an explicit `startup-timeout` still replaces it. The manual
 * **S2-2** (single read, worker snapshots, legacy mode): steps 1–8 implemented and verified, step 9 documentation
   (`b48979738`), step 10 final verification passed (`9412b2f15`); accepted. Record and results in §14.5.
 * **S2-3** (standalone `bsc-aworker`): stages 1–5 implemented, verified and committed one by one; record in §14.6.
+* **S2-4** (IPC 2.0 and descriptor passing): stages 1–4 implemented, verified and committed one by one; record in
+  §14.7.
 * **Commits:** `15c749359` "aworker: implement shared config and worker snapshots" (S1, S2-1 and S2-2 steps 1–6),
   `5f4483f0c` "aworker: integrate snapshots with pool workers" (step 7), `b4d890241` "aworker: record the config path
   in inline mode (D-8)" (step 8). The first one combines several subphases, against the "one change per commit" rule of
   §13.1, by the project owner's decision: they share files and dependencies, and a split commit would not build.
   Pushed to `origin` on 2026-11-17 (`e54578f2c..b4d890241`, together with the 2a-1 … 2a-5 commits). The later commits
-  (S2-2 steps 9–10, S2-3) are local, not pushed.
+  (S2-2 steps 9–10, S2-3, S2-4) are local, not pushed.
 
 ## 13. Revised plan: standalone Supervisor (S1 closed; S2 in progress, see §12 and §14)
 
@@ -867,6 +869,7 @@ not "do not merge".
   link that is freed is closed; version and class rules.
 * **Existing tests:** P1–P20, T1–T11 unchanged (exact-version test updated only for the documented version field
   change, stated in the commit).
+* **Status:** implemented and verified; record, tests and limitations: §14.7.
 
 #### S2-5: sessions, control/data split, operator channel, fencing, canonical document
 
@@ -1086,3 +1089,38 @@ osmo-bsc `--help`, `--vty-ref-xml` and its real-binary checks (`real_s22.py`) un
 * osmo-bsc's `logging filter imsi` is accepted by `bsc-aworker` without effect.
 * `wq` log mode untested (B2); packaging, systemd units and installation layout are out of scope (SUP §15).
 * The file-form deprecation notice (SUP §4.5) is still not implemented (legacy mode, not S2-3).
+
+### 14.7 S2-4 implementation record (IPC protocol 2.0, descriptor passing)
+
+**Scope as implemented:** the S2-4 objective (§14.3): protocol versions, identity, message classes and SCM_RIGHTS on
+the existing link, in `aworker_ipc.c/.h` and `aworker_ipc_link.c/.h`, plus the minimal use that makes them checked
+today (the pool asserts boot nonce and incarnation; a `bsc-aworker` worker its incarnation). Not in S2-4: sessions,
+the control/data link split per session, WORKER_UP and SESSION_* messages, the session socket, and anything that sends
+ATTACH or DETACH (S2-5).
+
+| Stage | Content | Commit | Mutations (caught / run) |
+|---|---|---|---|
+| 1 | protocol 2.0: header version = major (2); HELLO 2.0 extension (minor, boot nonce, incarnation, session_id); minor rule; the link refuses contradicting identities; the pool and `bsc-aworker` workers assert theirs. Documented test change: version 2 valid, HELLO 20 octets longer | `d162723bc` | 11/11 (one after adding the incarnation-mismatch case to `aworker_worker`) |
+| 2 | message classes LINK / CONTROL / DATA / SESSION; per-link class set (default CONTROL + DATA, legacy unchanged); wrong class refused on send, closes on receipt | `20db5779d` | 6/6 |
+| 3 | SCM_RIGHTS: ATTACH (one descriptor) and DETACH; `aworker_ipc_link_send_fd()`, `_take_fd()`, `cfg->fd_passing`; the sender and receiver ownership rules of clarification A | `b1e8e877e` | 15/15 (one after adding the full-queue case) |
+| 4 | documentation (this record, SUP §8 as-implemented notes) | (this revision) | — |
+
+**Tests** (`tests/aworker_ipc`): V1–V6 (identity round trip, minor rules, reserved fields, the link's comparison), K1–K4
+(every type in exactly one class; wrong class on send and on receipt; default link; ECHO on a restricted link),
+F1–F6 (a descriptor arrives as the same open file, close-on-exec; the sender's copy closed after the send; an untaken
+one closed after `rx_cb`; refused sends; queued then freed, queued then closed, queue full, closed link; on receipt:
+no descriptor, a descriptor on a type that takes none, two, three (`MSG_CTRUNC`), none expected by the link
+(`MSG_CTRUNC`), a malformed record, a bad sequence number, before HELLO -- every case checked against the process'
+descriptor count; the ATTACH/DETACH codec). `tests/aworker_worker`: a worker asserting another incarnation than its
+main process is refused by both. Unchanged: P1–P30, T1–T12, `aworker_supervisor` tests and `real_s22.py`.
+
+**Known limitations:**
+* The legacy and inline E2E (`run_e2e.py`) were **not executed** for S2-4: an Osmocom lab running on the same host
+  (a separate tmux session, started 2026-11-18) holds the Abis and MSC ports the E2E topology needs, and is not
+  stopped by these tests. Real osmo-bsc workers were exercised through `real_s22.py` (unchanged result).
+* ATTACH and DETACH are defined but not sent or handled by the pool or the worker until S2-5; a worker receiving one
+  today ignores it (the link closes an untaken descriptor).
+* The boot nonce is random per pool start of either program; osmo-bsc's workers assert no identity (legacy).
+* Foreign control messages other than SCM_RIGHTS are handled (link closed, descriptors closed) but not exercised by a
+  test: an AF_UNIX peer cannot send another type without the receiver enabling it.
+

@@ -8,11 +8,13 @@ says so). The phased plan is `PHASE2_IMPLEMENTATION_PLAN.md` §13 and §14.
 (inline form, view builder, BSC view, refusal of every configuration write in inline mode), S2-2 (single-read
 configuration, worker snapshots in **legacy mode**; accepted) and **S2-3: the `bsc-aworker` executable**, a Supervisor
 that reads `osmo-bsc.cfg`, runs the pool by itself (snapshots, workers re-executing its image, restart policy, GOODBYE
-on SIGTERM) and is controlled by signals only. **Not implemented:** sessions, fd passing, the operator channel, the
-detached worker, the BSC session client and supervisor mode in osmo-bsc (S2-4 … S2-8): **no BSC attaches to
-`bsc-aworker` yet**, and its workers leave SSN 254 unbound. Where this document describes more than that, it
-describes the target, not existing code. What exists is marked **as implemented** below; plan §12, §14.5 and §14.6
-have the record and the verification results.
+on SIGTERM) and is controlled by signals only. **S2-4: IPC protocol 2.0** -- versions and identity in HELLO, message
+classes per channel, descriptor passing (SCM_RIGHTS) with ATTACH/DETACH defined (§8, as implemented). **Not
+implemented:** sessions and the control/data split that use it, the operator channel, the detached worker, the BSC
+session client and supervisor mode in osmo-bsc (S2-5 … S2-8): **no BSC attaches to `bsc-aworker` yet**, nothing sends
+ATTACH or DETACH yet, and its workers leave SSN 254 unbound. Where this document describes more than that, it
+describes the target, not existing code. What exists is marked **as implemented** below; plan §12 and §14.5–§14.7 have
+the record and the verification results.
 
 **Do not run `bsc-aworker` and osmo-bsc with the same inline pool at the same time (until S2-7).** osmo-bsc does not
 attach to the Supervisor yet: with an inline pool it starts its own workers (legacy mode), so both programs would
@@ -646,6 +648,12 @@ Proposal (as reviewed before B2; superseded where B2 differs):
 Each existing message type is assigned to exactly one class. A record of a class not allowed on a channel closes
 that channel (fail closed, like `aworker_ipc_dec()`'s role rules [V]).
 
+**As implemented (S2-4):** `aworker_ipc_msg_class()`: LINK (HELLO, ECHO_REQ, ECHO_RSP; carried by every link),
+CONTROL (GOODBYE, CS7_INFO, ATTACH, DETACH), DATA (USER_BIND, USER_UNBIND, USER_BIND_RESULT, TX_*, SCU_UP, TX_FAILED),
+SESSION (no message yet). A link carries LINK plus `cfg->classes`, by default CONTROL and DATA: the worker link of
+osmo-bsc's pool and of `bsc-aworker` carries both, as before (the control/data split per session is S2-5). A received
+record of another class closes the link (`class`); sending one is refused (-EINVAL).
+
 ### 8.2 Identifiers and versions
 
 * **Protocol version:** major/minor in HELLO and SESSION_OPEN. Major must match; minor additions must be optional.
@@ -653,6 +661,16 @@ that channel (fail closed, like `aworker_ipc_dec()`'s role rules [V]).
 * **Boot nonce:** 64 bit random per Supervisor start.
 * **Incarnation:** boot nonce + per-spawn counter.
 * **Session ID:** boot nonce + per-session counter, never reused within one boot.
+
+**As implemented (S2-4, protocol 2.0):** the header's version octet is the **major** version (2; exact match). HELLO
+appends, after its 1.x fields, `minor u8 | reserved u8 | reserved u16 | boot_nonce u64 | incarnation u32 |
+session_id u32`; a HELLO of a higher minor may append more, which is ignored, while trailing octets from the own or a
+lower minor are refused. The boot nonce and the per-spawn / per-session counters are separate fields: an incarnation
+or session is identified by (boot_nonce, counter). 0 means "not asserted"; a link refuses a peer HELLO only when both
+sides assert a field and the values differ (`incompatible`). The pool (osmo-bsc's and `bsc-aworker`'s) asserts a
+random boot nonce per pool and each worker start's incarnation; a `bsc-aworker` worker asserts the incarnation its
+Supervisor passed (`--aworker-incarnation`), so a mismatch is refused by both ends; osmo-bsc's workers assert nothing.
+The session_id field exists; sessions that fill it are S2-5. The SESSION_OPEN version fields are S2-5.
 
 ### 8.3 fd passing on the existing link [V findings, A design]
 
@@ -694,6 +712,21 @@ Design:
     link EOF.
   * Descriptors still queued on a closed link are closed by their owner as above.
   * Fencing revokes the session first (§9); the killed BSC's descriptors are closed by the kernel.
+
+**As implemented (S2-4; `aworker_ipc_link.c`):**
+* ATTACH (main → worker, CONTROL: session_id u32, incarnation u32, both non-zero) takes exactly one descriptor;
+  DETACH (session_id) and every other type none (`aworker_ipc_msg_fds()`). Nothing sends them before S2-5.
+* Sender: `aworker_ipc_link_send_fd()` takes the descriptor over in every case and keeps it until the record's
+  send-completion callback, then closes it; a record that cannot be queued, or that is discarded because the link
+  closes or is freed first, has its descriptor closed then. Sending a type with the wrong descriptor count is refused.
+* Receiver (`cfg->fd_passing`; control buffer `CMSG_SPACE(sizeof(int))`): every received descriptor is made
+  close-on-exec at once; `MSG_CTRUNC`, a control message other than SCM_RIGHTS, a count other than the type's, and
+  every other receive error of such a record close all received descriptors, then the link (`rx-fd`). On 64-bit
+  Linux that buffer has room for two descriptors through alignment: a second one is caught by the count check, a
+  third by `MSG_CTRUNC` -- both tested. The descriptor reaches `rx_cb` in `msg->fd`; `aworker_ipc_link_take_fd()`
+  takes it, otherwise the link closes it when `rx_cb` returns.
+* Validation against session and incarnation before use, the Supervisor's socketpair per attach and the EOF rules of
+  §8.3a are S2-5.
 
 ### 8.3a Endpoint ownership and EOF propagation
 

@@ -42,6 +42,7 @@
 #include <osmocom/bsc/bssmap_reset.h>
 #include <osmocom/bsc/bsc_sccp_backend.h>
 #include <osmocom/bsc/aworker_pool.h>
+#include <osmocom/bsc/aworker_sccp_user.h>
 #include <osmocom/mgcp_client/mgcp_common.h>
 #include <osmocom/netif/ipa.h>
 

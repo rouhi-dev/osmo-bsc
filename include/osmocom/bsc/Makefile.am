@@ -13,6 +13,7 @@ noinst_HEADERS = \
 	aworker_ipc_link.h \
 	aworker_log.h \
 	aworker_pool.h \
+	aworker_sccp_user.h \
 	aworker_pool_internal.h \
 	aworker_snapshot.h \
 	bsc_rll.h \

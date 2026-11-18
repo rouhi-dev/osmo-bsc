@@ -32,6 +32,7 @@
 #include <osmocom/bsc/aworker_ipc.h>
 #include <osmocom/bsc/aworker_ipc_link.h>
 #include <osmocom/bsc/aworker_pool.h>
+#include <osmocom/bsc/aworker_sccp_user.h>
 #include <osmocom/bsc/aworker_pool_internal.h>
 #include <osmocom/bsc/bsc_sccp_backend.h>
 #include <osmocom/bsc/debug.h>

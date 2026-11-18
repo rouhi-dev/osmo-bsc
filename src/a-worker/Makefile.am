@@ -24,6 +24,7 @@ noinst_LTLIBRARIES = libaworker.la
 
 libaworker_la_SOURCES = \
 	aworker.c \
+	aworker_canon.c \
 	aworker_cfg_scan.c \
 	aworker_cfg_view.c \
 	aworker_ipc.c \

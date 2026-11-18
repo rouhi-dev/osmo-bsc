@@ -25,4 +25,31 @@ file form: writes as before
   VTY 'write file <other path>': saved
   CTRL 'SET write-config-file <other path>': OK
   CTRL 'SET write-config-file overwrite': OK
+  written, the keys of S2-5 at their defaults:
+a-worker-pool
+ workers 1
+ worker 0 config-file /nonexistent/worker0.cfg
+file form with the S2-5 keys set: they are written back
+  file form with the S2-5 keys set: VTY config file: the file read; refusal: no
+  VTY 'write': saved
+  VTY 'write file <other path>': saved
+  CTRL 'SET write-config-file <other path>': OK
+  CTRL 'SET write-config-file overwrite': OK
+  written, the keys of S2-5 set:
+a-worker-pool
+ workers 1
+ worker 0 config-file /nonexistent/worker0.cfg
+ supervisor-socket /run/osmocom/bsc-aworker.sock
+ session-echo-interval 7
+ session-echo-misses 9
+only supervisor-socket: the section is written
+  no workers, only supervisor-socket: VTY config file: the file read; refusal: no
+  VTY 'write': saved
+  VTY 'write file <other path>': saved
+  CTRL 'SET write-config-file <other path>': OK
+  CTRL 'SET write-config-file overwrite': OK
+  written, only supervisor-socket set:
+a-worker-pool
+ workers 0
+ supervisor-socket /run/osmocom/bsc-aworker.sock
 PASSED

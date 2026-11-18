@@ -358,6 +358,8 @@ static void case_no_pool(void)
 			   " point-code 0.23.3\n"), "no pool");
 }
 
+static void pool_section(const char *name, const char *what);
+
 static void case_file_form(void)
 {
 	unlink(path_of("main.cfg.sav"));
@@ -371,6 +373,58 @@ static void case_file_form(void)
 			   "a-worker-pool\n"
 			   " workers 1\n"
 			   " worker 0 config-file /nonexistent/worker0.cfg\n"), "file form");
+	pool_section("elsewhere.cfg", "the keys of S2-5 at their defaults");
+}
+
+/* What 'write file' wrote of the 'a-worker-pool' section: S2-5's keys only when they are set (so files and
+ * 'show running-config' of existing configurations are unchanged). */
+static void pool_section(const char *name, const char *what)
+{
+	char buf[4096], *p;
+	size_t n;
+	FILE *f = fopen(path_of(name), "r");
+
+	OSMO_ASSERT(f);
+	n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[n] = '\0';
+	p = strstr(buf, "a-worker-pool\n");
+	CHECK(p != NULL);
+	if (!p)
+		return;
+	*(strstr(p, "\n!") ? strstr(p, "\n!") + 1 : p + strlen(p)) = '\0';
+	printf("  written, %s:\n%s", what, p);
+}
+
+static void case_session_keys(void)
+{
+	unlink(path_of("main.cfg.sav"));
+	unlink(path_of("elsewhere.cfg"));
+	unlink(path_of("ctrl-elsewhere.cfg"));
+	expect_written(put("main.cfg",
+			   "log stderr\n"
+			   " logging level set-all notice\n"
+			   "a-worker-pool\n"
+			   " workers 1\n"
+			   " worker 0 config-file /nonexistent/worker0.cfg\n"
+			   " supervisor-socket /run/osmocom/bsc-aworker.sock\n"
+			   " session-echo-interval 7\n"
+			   " session-echo-misses 9\n"), "file form with the S2-5 keys set");
+	pool_section("elsewhere.cfg", "the keys of S2-5 set");
+}
+
+/* No worker at all, only the session socket: still a setting of the section, so it is written. */
+static void case_socket_only(void)
+{
+	unlink(path_of("main.cfg.sav"));
+	unlink(path_of("elsewhere.cfg"));
+	unlink(path_of("ctrl-elsewhere.cfg"));
+	expect_written(put("main.cfg",
+			   "log stderr\n"
+			   " logging level set-all notice\n"
+			   "a-worker-pool\n"
+			   " supervisor-socket /run/osmocom/bsc-aworker.sock\n"), "no workers, only supervisor-socket");
+	pool_section("elsewhere.cfg", "only supervisor-socket set");
 }
 
 int main(int argc, char **argv)
@@ -398,6 +452,8 @@ int main(int argc, char **argv)
 	in_child("inline form, BSC view does not parse: refused all the same", case_inline_parse_error);
 	in_child("no pool: writes as before", case_no_pool);
 	in_child("file form: writes as before", case_file_form);
+	in_child("file form with the S2-5 keys set: they are written back", case_session_keys);
+	in_child("only supervisor-socket: the section is written", case_socket_only);
 
 	if (!failures) {
 		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_dir);

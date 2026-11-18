@@ -1,0 +1,59 @@
+N1: the reference document (Supervisor's reader)
+aworker-canonical-config 1
+P workers 2
+P worker 0 cs7-instance 0
+P worker 1 cs7-instance 1
+P supervisor-socket none
+P startup-timeout 60
+P restart-delay 5
+P restart-delay-max 60
+P stable-time 60
+P max-restarts 5 window 300
+P on-worker-failure restart
+P session-echo-interval 2
+P session-echo-misses 3
+C 0 0 cs7 instance 0
+C 0 1 point-code 0.23.3
+C 0 1 asp asp-w0 2905 0 m3ua
+C 0 2 remote-ip 127.0.0.1
+C 0 2 local-ip 127.0.0.1
+C 0 2 role asp
+C 0 2 transport-role client
+C 1 0 cs7 instance 1
+C 1 1 point-code 0.23.4
+C 1 1 sccp-address msc1
+C 1 2 routing-indicator PC
+C 1 2 point-code 0.23.1
+C 1 1 asp asp-w1 2905 0 m3ua
+C 1 2 remote-ip 127.0.0.2
+C 1 2 role asp
+C 1 2 transport-role client
+N2: the same configuration read by osmo-bsc's inline reader gives the same document
+  BSC view: identical
+N3: defaults are explicit: writing a default value changes nothing
+  all defaults written out: identical
+  all defaults written out (BSC): identical
+N4: representation, not text: comments, blank lines, extra and trailing spaces
+  cs7 subtree reformatted: identical
+  a-worker-pool line reformatted: identical
+N5: what is not part of the document: logging, and a cs7 instance no worker owns
+  log section changed: identical
+  cs7 instance 5 changed: identical
+N6: every difference that is part of the document is found, at its line
+  restart-delay 6: line 7, part P (a-worker-pool): ours 'P restart-delay 5', theirs 'P restart-delay 6'
+  session-echo-interval 5: line 12, part P (a-worker-pool): ours 'P session-echo-interval 2', theirs 'P session-echo-interval 5'
+  supervisor-socket set: line 5, part P (a-worker-pool): ours 'P supervisor-socket none', theirs 'P supervisor-socket /run/x.sock'
+  worker 1's remote-ip: line 27, part C (cs7 configuration of worker 1): ours 'C 1 2 remote-ip 127.0.0.2', theirs 'C 1 2 remote-ip 127.0.0.3'
+  worker 0's commands reordered: line 17, part C (cs7 configuration of worker 0): ours 'C 0 2 remote-ip 127.0.0.1', theirs 'C 0 2 local-ip 127.0.0.1'
+  the same point code spelled differently (a false mismatch, CD-1): line 22, part C (cs7 configuration of worker 1): ours 'C 1 1 point-code 0.23.4', theirs 'C 1 1 point-code 188'
+  workers swapped: line 3, part P (a-worker-pool): ours 'P worker 0 cs7-instance 0', theirs 'P worker 0 cs7-instance 1'
+  a command added to worker 0's asp: line 21, part C (cs7 configuration of worker 0): ours 'C 1 0 cs7 instance 1', theirs 'C 0 2 no shutdown'
+N7: aworker_canon_compare()
+  identical: 0
+  a line missing: 2, line 2, part H (representation version): ours 'b', theirs '<missing>'
+  no final newline: 2, line 2: the documents differ in their final newline
+  another representation version: 1, line 1, part H (representation version): ours 'aworker-canonical-config 1', theirs 'aworker-canonical-config 2'
+N8: no document for the file form
+  file form: none (worker 0 does not use the inline form ('worker 0 cs7-instance <N>'))
+  no pool: NONE no A-worker pool configuration was loaded from a file
+PASSED

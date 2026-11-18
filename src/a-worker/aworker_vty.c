@@ -239,6 +239,65 @@ DEFUN_ATTR(cfg_aworker_no_cs7_instance, cfg_aworker_no_cs7_instance_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUN_ATTR(cfg_aworker_supervisor_socket, cfg_aworker_supervisor_socket_cmd,
+	   "supervisor-socket PATH",
+	   "The Supervisor's (bsc-aworker's) session socket: an AF_UNIX path, absolute; its directory must exist, belong to"
+	   " the Supervisor's user and be writable by nobody else. Without it the Supervisor accepts no BSC session\n"
+	   "Absolute path of the socket\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	struct aworker_pool_cfg *cfg = aworker_pool_cfg();
+	const char *path = argv[0];
+
+	/* N5: a path in the file system only (no abstract namespace), and one that fits sun_path with its NUL. */
+	if (path[0] != '/') {
+		vty_out(vty, "%% supervisor-socket must be an absolute path%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+	if (strlen(path) >= AWORKER_SOCKET_PATH_MAX) {
+		vty_out(vty, "%% supervisor-socket is too long (at most %u characters)%s", AWORKER_SOCKET_PATH_MAX - 1,
+			VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+	osmo_talloc_replace_string(g_vty_ctx, &cfg->supervisor_socket, path);
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
+DEFUN_ATTR(cfg_aworker_no_supervisor_socket, cfg_aworker_no_supervisor_socket_cmd,
+	   "no supervisor-socket",
+	   NO_STR "No session socket: the Supervisor accepts no BSC session (the default)\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	TALLOC_FREE(aworker_pool_cfg()->supervisor_socket);
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
+DEFUN_ATTR(cfg_aworker_session_echo_interval, cfg_aworker_session_echo_interval_cmd,
+	   "session-echo-interval <1-3600>",
+	   "Seconds between the Supervisor's ECHO requests to an attached BSC (session health; never affects the"
+	   " workers)\n"
+	   "Seconds (default 2)\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	aworker_pool_cfg()->session_echo_interval = atoi(argv[0]);
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
+DEFUN_ATTR(cfg_aworker_session_echo_misses, cfg_aworker_session_echo_misses_cmd,
+	   "session-echo-misses <1-100>",
+	   "Consecutive unanswered session ECHO requests that are reported as the threshold (the session is UNRESPONSIVE"
+	   " from the first; nothing is done to the workers)\n"
+	   "Number (default 3)\n",
+	   CMD_ATTR_IMMEDIATE)
+{
+	aworker_pool_cfg()->session_echo_misses = atoi(argv[0]);
+	AWORKER_RESTART_NOTE(vty);
+	return CMD_SUCCESS;
+}
+
 int aworker_pool_vty_config_is_consistent(struct vty *vty)
 {
 	const char *refusal = aworker_pool_config_write_refusal();
@@ -260,7 +319,10 @@ static int config_write_aworker_pool(struct vty *vty)
 		   || cfg->stable_time != AWORKER_STABLE_TIME_DEFAULT
 		   || cfg->max_restarts != AWORKER_MAX_RESTARTS_DEFAULT
 		   || cfg->restart_window != AWORKER_RESTART_WINDOW_DEFAULT
-		   || cfg->on_failure != AWORKER_FAILURE_RESTART;
+		   || cfg->on_failure != AWORKER_FAILURE_RESTART
+		   || cfg->supervisor_socket
+		   || cfg->session_echo_interval != AWORKER_SESSION_ECHO_INTERVAL_DEFAULT
+		   || cfg->session_echo_misses != AWORKER_SESSION_ECHO_MISSES_DEFAULT;
 
 	for (i = 0; i < AWORKER_POOL_MAX_WORKERS; i++) {
 		if (cfg->cfg_file[i] || cfg->has_cs7_instance[i])
@@ -290,6 +352,12 @@ static int config_write_aworker_pool(struct vty *vty)
 	if (cfg->on_failure != AWORKER_FAILURE_RESTART)
 		vty_out(vty, " on-worker-failure %s%s",
 			get_value_string(aworker_failure_policy_names, cfg->on_failure), VTY_NEWLINE);
+	if (cfg->supervisor_socket)
+		vty_out(vty, " supervisor-socket %s%s", cfg->supervisor_socket, VTY_NEWLINE);
+	if (cfg->session_echo_interval != AWORKER_SESSION_ECHO_INTERVAL_DEFAULT)
+		vty_out(vty, " session-echo-interval %u%s", cfg->session_echo_interval, VTY_NEWLINE);
+	if (cfg->session_echo_misses != AWORKER_SESSION_ECHO_MISSES_DEFAULT)
+		vty_out(vty, " session-echo-misses %u%s", cfg->session_echo_misses, VTY_NEWLINE);
 	return CMD_SUCCESS;
 }
 
@@ -346,4 +414,8 @@ void aworker_pool_vty_init(void *ctx)
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_stable_time_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_max_restarts_cmd);
 	install_element(AWORKER_POOL_NODE, &cfg_aworker_on_failure_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_supervisor_socket_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_no_supervisor_socket_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_session_echo_interval_cmd);
+	install_element(AWORKER_POOL_NODE, &cfg_aworker_session_echo_misses_cmd);
 }

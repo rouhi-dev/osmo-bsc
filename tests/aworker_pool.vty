@@ -9,6 +9,11 @@ OsmoBSC(config-a-worker-pool)# list
   worker <0-15> cs7-instance <0-15>
   no worker <0-15> cs7-instance
 ...
+  supervisor-socket PATH
+  no supervisor-socket
+  session-echo-interval <1-3600>
+  session-echo-misses <1-100>
+...
 
 OsmoBSC(config-a-worker-pool)# worker 0 ?
   config-file   Configuration file the worker reads; it must contain the cs7 instance(s) of this worker, with their asp / as / route nodes, and nothing else
@@ -61,5 +66,36 @@ OsmoBSC(config-a-worker-pool)# no worker 0 config-file
 OsmoBSC(config-a-worker-pool)# no worker 1 cs7-instance
 % Changes to 'a-worker-pool' take effect after restarting osmo-bsc
 OsmoBSC(config-a-worker-pool)# workers 0
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# supervisor-socket run/bsc-aworker.sock
+% supervisor-socket must be an absolute path
+OsmoBSC(config-a-worker-pool)# supervisor-socket /xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+% supervisor-socket is too long (at most 107 characters)
+OsmoBSC(config-a-worker-pool)# supervisor-socket /xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# session-echo-interval 0
+% Unknown command.
+OsmoBSC(config-a-worker-pool)# session-echo-misses 101
+% Unknown command.
+OsmoBSC(config-a-worker-pool)# supervisor-socket /run/osmocom/bsc-aworker.sock
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# session-echo-interval 5
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# session-echo-misses 4
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# show running-config
+...
+a-worker-pool
+ workers 0
+ supervisor-socket /run/osmocom/bsc-aworker.sock
+ session-echo-interval 5
+ session-echo-misses 4
+...
+
+OsmoBSC(config-a-worker-pool)# no supervisor-socket
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# session-echo-interval 2
+% Changes to 'a-worker-pool' take effect after restarting osmo-bsc
+OsmoBSC(config-a-worker-pool)# session-echo-misses 3
 % Changes to 'a-worker-pool' take effect after restarting osmo-bsc
 OsmoBSC(config-a-worker-pool)# end

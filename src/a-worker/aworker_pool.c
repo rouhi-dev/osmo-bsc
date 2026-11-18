@@ -48,6 +48,7 @@
 
 #include <osmocom/bsc/aworker_ipc.h>
 #include <osmocom/bsc/aworker_ipc_link.h>
+#include <osmocom/bsc/aworker_canon.h>
 #include <osmocom/bsc/aworker_pool.h>
 #include <osmocom/bsc/aworker_pool_internal.h>
 #include <osmocom/bsc/aworker_cfg_scan.h>
@@ -72,6 +73,8 @@ static struct aworker_pool_cfg g_cfg = {
 	.max_restarts = AWORKER_MAX_RESTARTS_DEFAULT,
 	.restart_window = AWORKER_RESTART_WINDOW_DEFAULT,
 	.on_failure = AWORKER_FAILURE_RESTART,
+	.session_echo_interval = AWORKER_SESSION_ECHO_INTERVAL_DEFAULT,
+	.session_echo_misses = AWORKER_SESSION_ECHO_MISSES_DEFAULT,
 };
 
 static struct aworker_pool *g_pool;
@@ -313,6 +316,16 @@ int aworker_pool_read_config(const char *config_file)
 
 /* Supervisor mode: set by aworker_pool_supervisor_read_config(). */
 static bool g_supervisor;
+
+char *aworker_pool_canon_document(void *ctx, size_t *len, char *why, size_t why_len)
+{
+	if (!g_main.pool || !g_main.model) {
+		if (why_len)
+			snprintf(why, why_len, "no A-worker pool configuration was loaded from a file");
+		return NULL;
+	}
+	return aworker_canon_build(ctx, &g_cfg, g_main.model, len, why, why_len);
+}
 
 bool aworker_pool_supervisor_mode(void)
 {

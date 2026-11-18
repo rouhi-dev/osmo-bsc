@@ -78,6 +78,11 @@ struct aworker;
 #define AWORKER_STABLE_TIME_DEFAULT	60
 #define AWORKER_MAX_RESTARTS_DEFAULT	5
 #define AWORKER_RESTART_WINDOW_DEFAULT	300
+/* Session ECHO between BSC and Supervisor (D-S12, initial values decided for S2-5; to be confirmed by S2-8). */
+#define AWORKER_SESSION_ECHO_INTERVAL_DEFAULT	2
+/* sizeof(((struct sockaddr_un *)0)->sun_path) on Linux: a socket path must be shorter (its NUL included). */
+#define AWORKER_SOCKET_PATH_MAX	108
+#define AWORKER_SESSION_ECHO_MISSES_DEFAULT	3
 #define AWORKER_MAX_RESTARTS_LIMIT	32	/*!< largest 'max-restarts' */
 
 /* Taking a worker down never blocks the main process: SIGTERM, then waitpid(WNOHANG) from a timer, SIGKILL after
@@ -157,6 +162,11 @@ struct aworker_pool_cfg {
 	unsigned int max_restarts;	/*!< the max_restarts-th restart within restart_window makes the worker FAILED */
 	unsigned int restart_window;	/*!< seconds */
 	enum aworker_failure_policy on_failure;
+	/*! The Supervisor's session socket (absolute path; N5), or NULL: no socket, no sessions (bsc-aworker as in
+	 * S2-3). osmo-bsc parses it as part of the shared section; it does not use it yet (supervisor mode: S2-7). */
+	char *supervisor_socket;
+	unsigned int session_echo_interval;	/*!< seconds between session ECHO_REQs (D-S12) */
+	unsigned int session_echo_misses;	/*!< consecutive misses that count as the threshold (D-S12) */
 };
 
 /* Configuration and VTY */

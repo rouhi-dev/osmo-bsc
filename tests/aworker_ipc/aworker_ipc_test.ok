@@ -102,7 +102,7 @@ C5/C8/C9: malformed records
   SCU_UP N-PCSTATE.ind with data: unexpected-data
   SCU_UP N-STATE.ind user_in_service 2: bad-value
   SCU_UP N-DISCONNECT.ind originator 3: bad-value
-  HELLO role 3: bad-value
+  HELLO role 5: bad-value
   HELLO reserved 1: bad-reserved
   HELLO ident with control character: bad-string
   HELLO ident_len 65: bad-string
@@ -122,7 +122,7 @@ C5/C8/C9: malformed records
   GOODBYE reason 2: bad-value
   USER_BIND_RESULT 4: bad-value
 C6: mutation sweep
-  200000 mutated records: 38102 accepted (200 of them a HELLO of a higher minor version), 161898 rejected, 0 not canonical
+  200000 mutated records: 38165 accepted (201 of them a HELLO of a higher minor version), 161835 rejected, 0 not canonical
 C10: libosmo-sigtran per-operation data limits
   TX_UNITDATA: max 1139; 1139: 0, 1140: -EMSGSIZE
   TX_CONN_REQ: max 255; 255: 0, 256: -EMSGSIZE
@@ -264,6 +264,16 @@ K1-K4: message classes per channel
   K1 GOODBYE          control
   K1 ATTACH           control
   K1 DETACH           control
+  K1 STATE            control
+  K1 SESSION_OPEN     session
+  K1 SESSION_ACCEPT   session
+  K1 SESSION_REJECT   session
+  K1 SESSION_CLOSE    session
+  K1 WORKER_UP        session
+  K1 WORKER_DOWN      session
+  K1 WORKER_STATE     session
+  K1 OP_REQUEST       session
+  K1 OP_RESULT        session
   K1 CS7_INFO         control
   K1 USER_BIND        data
   K1 USER_UNBIND      data
@@ -275,7 +285,7 @@ K1-K4: message classes per channel
   K1 TX_DISCONN       data
   K1 SCU_UP           data
   K1 TX_FAILED        data
-  K1 17 known types, each in exactly one class; the 239 other values in none
+  K1 27 known types, each in exactly one class; the 229 other values in none
   K2 data-only link: sending GOODBYE (control) refused, nothing sent, the link stays up
   K2 data-only link receiving CS7_INFO (control): closed (class), not delivered
   K3 control-only link receiving USER_BIND (data): closed (class), not delivered
@@ -301,5 +311,42 @@ F1-F6: descriptors passed with SCM_RIGHTS (ATTACH)
   F5 ATTACH with user_ref 1: bad-user-ref
   F5 ATTACH/DETACH: session and incarnation 0 refused; worker-bound only; user_ref 0
   F6 ATTACH takes one descriptor, every other type none
+S1-S7: the session protocol (S2-5)
+  S1 STATE           class control  fds 0, decoded by main
+  S1 SESSION_OPEN    class session  fds 1, decoded by supervisor
+  S1 SESSION_ACCEPT  class session  fds 0, decoded by client
+  S1 SESSION_REJECT  class session  fds 0, decoded by client
+  S1 SESSION_CLOSE   class session  fds 0, decoded by main worker supervisor client
+  S1 WORKER_UP       class session  fds 1, decoded by client
+  S1 WORKER_DOWN     class session  fds 0, decoded by client
+  S1 WORKER_STATE    class session  fds 0, decoded by client
+  S1 OP_REQUEST      class session  fds 0, decoded by supervisor
+  S1 OP_RESULT       class session  fds 0, decoded by client
+  S1 every field as encoded; TEXT carries '\n'
+  S2 OP_RESULT with a TEXT of 3801 octets: bad-string
+  S2 encoders refuse zero identities, unknown reasons/ops/states, index 16, a control character in TEXT; a TEXT longer than 3800 is cut
+  S3 STATE session_id 0: bad-value
+  S3 STATE state attaching: bad-value
+  S3 STATE reserved: bad-reserved
+  S3 SESSION_OPEN version 0: bad-value
+  S3 SESSION_OPEN version 9 (refused by the Supervisor, not the codec): none
+  S3 SESSION_ACCEPT 17 workers: bad-value
+  S3 SESSION_REJECT TEXT with a tab: bad-string
+  S3 SESSION_REJECT TEXT longer than the record: truncated
+  S3 WORKER_UP index 16: bad-value
+  S3 WORKER_UP without cs7 instances: bad-value
+  S3 WORKER_DOWN reason 0: bad-value
+  S3 WORKER_STATE pool state 6: bad-value
+  S3 OP_REQUEST status with an argument: bad-value
+  S3 OP_RESULT rc > 0: bad-value
+  S3 SESSION_CLOSE with a user_ref: bad-user-ref
+  S4 HELLO roles 3 (supervisor) and 4 (client); role 5 refused by the encoder
+S5-S6: a session link (Supervisor <-> client)
+  S5 SESSION_OPEN carries its document's descriptor to the Supervisor
+  S5 no SESSION_OPEN without a descriptor; GOODBYE (control) refused on a session link; SESSION_CLOSE both ways; ECHO answered by the link
+  S6 client against a worker: incompatible / incompatible
+  S6 STATE travels on a control link; SESSION_CLOSE is refused there
+S7: mutation sweep of the session records
+  100000 mutated records: 9053 accepted, 90947 rejected, 0 not canonical
 talloc blocks at the end: unchanged
 PASSED

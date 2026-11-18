@@ -49,8 +49,9 @@
  *
  * DATA: u16 len (<= AWORKER_IPC_MAX_DATA) + len octets; DATA is always the last element and must end the record.
  *
- * Bodies (direction: B = both, M = main->worker, W = worker->main):
- *   HELLO          B  role u8 (1 main, 2 worker) | reserved u8 = 0 | worker_idx u16 | max_frame u16 | max_data u16 |
+ * Bodies (direction: B = both, M = main->worker, W = worker->main; on a session link S = client->Supervisor,
+ * C = Supervisor->client):
+ *   HELLO          B  role u8 (1 main, 2 worker, 3 Supervisor, 4 client) | reserved u8 = 0 | worker_idx u16 | max_frame u16 | max_data u16 |
  *                     pid u32 | ident_len u8 (<= 64) | ident (printable ASCII) |
  *                     (since 2.0) minor u8 | reserved u8 = 0 | reserved u16 = 0 | boot_nonce u64 | incarnation u32 |
  *                     session_id u32 | (minor > own minor only) further octets, ignored
@@ -64,6 +65,9 @@
  *   ATTACH         M  session_id u32 (!= 0) | incarnation u32 (!= 0); since 2.0; carries ONE descriptor (the worker's
  *                     end of a data link), passed with SCM_RIGHTS (see aworker_ipc_link.h)
  *   DETACH         M  session_id u32 (!= 0); since 2.0
+ *   STATE          W  session_id u32 (!= 0) | state u8 (enum aworker_ipc_attach_state: ATTACHED or DETACHED) |
+ *                     cause u8 (enum aworker_ipc_state_cause) | reserved u16 = 0 | users_unbound u16 | reserved u16 = 0;
+ *                     since 2.0 (S2-5): the worker's answer to ATTACH and DETACH, and its report of a data link lost
  *   CS7_INFO       W  count u8 (1..8) | count * { cs7_id u32 | primary_pc u32 (<= 0xffffff) |
  *                     asp_proto u8 (1..3, enum osmo_ss7_asp_protocol) | num_as u8 (>= 1, Application Servers on
  *                     that instance) | reserved u8[2] = 0 }
@@ -80,16 +84,33 @@
  *                     post_conn u8 | reserved u8[3] = 0
  * conn_id is <= AWORKER_IPC_CONN_ID_MAX (24 bit SCCP local reference, all-ones excluded).
  *
+ * Session and operator messages (since 2.0, S2-5; only on a link between the Supervisor and a client):
+ *   SESSION_OPEN   S  session_version u8 (!= 0) | reserved u8 = 0 | reserved u16 = 0 | doc_len u32 (!= 0); carries ONE
+ *                     descriptor: a sealed memfd holding the BSC's canonical configuration document (aworker_canon.h)
+ *   SESSION_ACCEPT C  session_id u32 (!= 0) | boot_nonce u64 (!= 0) | num_workers u8 (1..16) | reserved u8[3] = 0
+ *   SESSION_REJECT C  reason u8 (enum aworker_ipc_reject_reason) | reserved u8 = 0 | TEXT (the detail)
+ *   SESSION_CLOSE  B  reason u8 (enum aworker_ipc_close_cause) | reserved u8[3] = 0
+ *   WORKER_UP      C  worker_idx u16 (< 16) | reserved u16 = 0 | incarnation u32 (!= 0) | session_id u32 (!= 0) |
+ *                     the body of CS7_INFO; carries ONE descriptor: the client's end of that worker's data link
+ *   WORKER_DOWN    C  worker_idx u16 (< 16) | reason u8 (enum aworker_ipc_down_reason) | reserved u8 = 0 |
+ *                     incarnation u32 (!= 0) | session_id u32 (!= 0)
+ *   WORKER_STATE   C  worker_idx u16 (< 16) | pool_state u8 (enum aworker_state) | attach u8 (enum
+ *                     aworker_ipc_attach_state) | incarnation u32 | session_id u32
+ *   OP_REQUEST     S  op u8 (enum aworker_ipc_op) | reserved u8 = 0 | arg u16 (RESET_WORKER: the worker index, else 0)
+ *   OP_RESULT      C  op u8 (enum aworker_ipc_op) | reserved u8 = 0 | rc i32 (0 or a negative errno) | TEXT
+ * TEXT: len u16 (<= AWORKER_IPC_MAX_TEXT) + len octets of printable ASCII or '\n'; always the last element.
+ *
  * Classes (since 2.0; aworker_ipc_msg_class()). Every message type belongs to exactly one class, and a link carries
  * a configured set of classes (aworker_ipc_link.h); a record of another class closes it:
  *   LINK     HELLO, ECHO_REQ, ECHO_RSP: every link
  *   CONTROL  GOODBYE, CS7_INFO, ATTACH, DETACH: Supervisor (or osmo-bsc's pool) <-> worker
  *   DATA     USER_BIND, USER_UNBIND, USER_BIND_RESULT, TX_*, SCU_UP, TX_FAILED: BSC <-> worker
- *   SESSION  (no message yet): BSC or operator <-> Supervisor
+ *   SESSION  SESSION_*, WORKER_UP/DOWN/STATE, OP_REQUEST, OP_RESULT: BSC or operator <-> Supervisor
+ * (STATE is CONTROL: worker -> Supervisor.)
  * The worker link of osmo-bsc's pool and of bsc-aworker carries CONTROL and DATA (the default).
  *
- * Descriptors (since 2.0; aworker_ipc_msg_fds()): ATTACH takes exactly one, every other type none. ATTACH and DETACH
- * are defined here (S2-4); sessions, which send them, come later (S2-5).
+ * Descriptors (since 2.0; aworker_ipc_msg_fds()): ATTACH, SESSION_OPEN and WORKER_UP take exactly one, every other type
+ * none.
  *
  * SCU_UP parameters, per allowed (primitive, operation); every field of the osmo_scu_*_param struct:
  *   N-CONNECT.ind/.cnf  called ADDR | calling ADDR | responding ADDR | sccp_class u32 | importance u32 | conn_id u32
@@ -134,10 +155,19 @@ struct msgb;
 #define AWORKER_IPC_MAX_CS7		8
 #define AWORKER_IPC_CONN_ID_MAX		0x00fffffe
 #define AWORKER_IPC_CONN_ID_NONE	0xffffffff
+#define AWORKER_IPC_MAX_TEXT		3800
+#define AWORKER_IPC_MAX_WORKERS		16
+/*! Largest pool_state of WORKER_STATE: enum aworker_state's last value (AWORKER_ST_FAILED; checked in aworker_pool.c). */
+#define AWORKER_IPC_POOL_STATE_MAX	5
+/*! Version of the session protocol a SESSION_OPEN asks for (the link protocol's version is in the header). */
+#define AWORKER_IPC_SESSION_VERSION	1
 
 enum aworker_ipc_role {
 	AWORKER_IPC_ROLE_MAIN = 1,
 	AWORKER_IPC_ROLE_WORKER = 2,
+	/*! Session links (S2-5): the Supervisor, and its client (a BSC or an operator). */
+	AWORKER_IPC_ROLE_SUPERVISOR = 3,
+	AWORKER_IPC_ROLE_CLIENT = 4,
 };
 
 enum aworker_ipc_msg_type {
@@ -147,6 +177,7 @@ enum aworker_ipc_msg_type {
 	AWORKER_IPC_MT_GOODBYE = 0x04,
 	AWORKER_IPC_MT_ATTACH = 0x05,
 	AWORKER_IPC_MT_DETACH = 0x06,
+	AWORKER_IPC_MT_STATE = 0x07,
 	AWORKER_IPC_MT_CS7_INFO = 0x08,
 	AWORKER_IPC_MT_USER_BIND = 0x10,
 	AWORKER_IPC_MT_USER_UNBIND = 0x11,
@@ -158,6 +189,60 @@ enum aworker_ipc_msg_type {
 	AWORKER_IPC_MT_TX_DISCONN = 0x24,
 	AWORKER_IPC_MT_SCU_UP = 0x30,
 	AWORKER_IPC_MT_TX_FAILED = 0x31,
+	AWORKER_IPC_MT_SESSION_OPEN = 0x40,
+	AWORKER_IPC_MT_SESSION_ACCEPT = 0x41,
+	AWORKER_IPC_MT_SESSION_REJECT = 0x42,
+	AWORKER_IPC_MT_SESSION_CLOSE = 0x43,
+	AWORKER_IPC_MT_WORKER_UP = 0x44,
+	AWORKER_IPC_MT_WORKER_DOWN = 0x45,
+	AWORKER_IPC_MT_WORKER_STATE = 0x46,
+	AWORKER_IPC_MT_OP_REQUEST = 0x48,
+	AWORKER_IPC_MT_OP_RESULT = 0x49,
+};
+
+/*! A worker's attachment to a BSC session (STATE, WORKER_STATE). */
+enum aworker_ipc_attach_state {
+	AWORKER_IPC_ATT_NONE = 0,	/*!< WORKER_STATE only: not attached, nothing pending */
+	AWORKER_IPC_ATT_ATTACHED = 1,
+	AWORKER_IPC_ATT_DETACHED = 2,
+	AWORKER_IPC_ATT_ATTACHING = 3,	/*!< WORKER_STATE only: ATTACH sent, STATE not received yet */
+	AWORKER_IPC_ATT_DETACHING = 4,	/*!< WORKER_STATE only: DETACH sent, STATE not received yet */
+};
+
+/*! Why a worker sent STATE. */
+enum aworker_ipc_state_cause {
+	AWORKER_IPC_SC_ATTACH_OK = 1,		/*!< ATTACH accepted: the data link exists */
+	AWORKER_IPC_SC_ATTACH_REFUSED = 2,	/*!< ATTACH refused (not DETACHED, or another incarnation): fd closed */
+	AWORKER_IPC_SC_DETACH_REQ = 3,		/*!< DETACH done (or already detached from that session) */
+	AWORKER_IPC_SC_DATA_EOF = 4,		/*!< the data link's peer closed it: detached by the worker itself */
+	AWORKER_IPC_SC_DATA_ERROR = 5,		/*!< the data link failed otherwise: detached by the worker itself */
+};
+
+enum aworker_ipc_reject_reason {
+	AWORKER_IPC_REJ_BUSY = 1,		/*!< a session exists, or the last one is not finished */
+	AWORKER_IPC_REJ_VERSION = 2,		/*!< SESSION_OPEN asks for another session protocol version */
+	AWORKER_IPC_REJ_CONFIG_MISMATCH = 3,	/*!< the canonical documents differ (detail: first difference) */
+	AWORKER_IPC_REJ_BAD_DOCUMENT = 4,	/*!< the document's descriptor is not a sealed memfd of doc_len octets */
+	AWORKER_IPC_REJ_NO_SESSIONS = 5,	/*!< the pool is shutting down */
+};
+
+enum aworker_ipc_close_cause {
+	AWORKER_IPC_CC_NORMAL = 1,		/*!< the BSC ends its session */
+	AWORKER_IPC_CC_FENCED = 2,		/*!< the operator fenced the session */
+	AWORKER_IPC_CC_SHUTDOWN = 3,		/*!< the pool is shutting down */
+};
+
+enum aworker_ipc_down_reason {
+	AWORKER_IPC_DOWN_LOST = 1,		/*!< the worker process was lost (restart policy applies) */
+	AWORKER_IPC_DOWN_DETACHED = 2,		/*!< it detached from this session (its data link ended) */
+	AWORKER_IPC_DOWN_ATTACH_FAILED = 3,	/*!< attaching it to this session failed */
+};
+
+enum aworker_ipc_op {
+	AWORKER_IPC_OP_STATUS = 1,
+	AWORKER_IPC_OP_RESET_WORKER = 2,
+	AWORKER_IPC_OP_FENCE_SESSION = 3,
+	AWORKER_IPC_OP_POOL_SHUTDOWN = 4,
 };
 
 /*! Message classes: bit values, so that a set of them is an OR. */
@@ -304,6 +389,54 @@ struct aworker_ipc_msg {
 		struct {
 			uint32_t session_id;
 		} detach;
+		struct {
+			uint32_t session_id;
+			uint8_t state;		/*!< enum aworker_ipc_attach_state */
+			uint8_t cause;		/*!< enum aworker_ipc_state_cause */
+			uint16_t users_unbound;
+		} state;
+		struct {
+			uint8_t version;
+			uint32_t doc_len;
+		} session_open;
+		struct {
+			uint32_t session_id;
+			uint64_t boot_nonce;
+			uint8_t num_workers;
+		} session_accept;
+		struct {
+			uint8_t reason;		/*!< enum aworker_ipc_reject_reason */
+		} session_reject;		/*!< detail in text */
+		struct {
+			uint8_t reason;		/*!< enum aworker_ipc_close_cause */
+		} session_close;
+		struct {
+			uint16_t worker_idx;
+			uint32_t incarnation;
+			uint32_t session_id;
+			struct aworker_ipc_cs7_info cs7;
+		} worker_up;
+		struct {
+			uint16_t worker_idx;
+			uint8_t reason;		/*!< enum aworker_ipc_down_reason */
+			uint32_t incarnation;
+			uint32_t session_id;
+		} worker_down;
+		struct {
+			uint16_t worker_idx;
+			uint8_t pool_state;	/*!< enum aworker_state */
+			uint8_t attach;		/*!< enum aworker_ipc_attach_state */
+			uint32_t incarnation;
+			uint32_t session_id;
+		} worker_state;
+		struct {
+			uint8_t op;		/*!< enum aworker_ipc_op */
+			uint16_t arg;
+		} op_request;
+		struct {
+			uint8_t op;
+			int32_t rc;
+		} op_result;			/*!< text in text */
 		struct aworker_ipc_cs7_info cs7_info;
 		struct aworker_ipc_user_bind user_bind;
 		uint16_t bind_result;
@@ -337,6 +470,8 @@ struct aworker_ipc_msg {
 	} u;
 	/*! DATA of TX_UNITDATA, TX_CONN_REQ, TX_CONN_RESP, TX_DATA and SCU_UP; len == 0 otherwise. */
 	struct aworker_ipc_data data;
+	/*! TEXT of SESSION_REJECT and OP_RESULT (not NUL terminated); len == 0 otherwise. */
+	struct aworker_ipc_data text;
 };
 
 /* Decoding */
@@ -363,6 +498,29 @@ int aworker_ipc_enc_goodbye(void *ctx, struct msgb **out, uint8_t reason);
 int aworker_ipc_enc_attach(void *ctx, struct msgb **out, uint32_t session_id, uint32_t incarnation);
 int aworker_ipc_enc_detach(void *ctx, struct msgb **out, uint32_t session_id);
 int aworker_ipc_enc_cs7_info(void *ctx, struct msgb **out, const struct aworker_ipc_cs7_info *info);
+int aworker_ipc_enc_state(void *ctx, struct msgb **out, uint32_t session_id, uint8_t state, uint8_t cause,
+			  uint16_t users_unbound);
+/*! SESSION_OPEN: the record only; the document's descriptor is passed with aworker_ipc_link_send_fd(). */
+int aworker_ipc_enc_session_open(void *ctx, struct msgb **out, uint8_t version, uint32_t doc_len);
+int aworker_ipc_enc_session_accept(void *ctx, struct msgb **out, uint32_t session_id, uint64_t boot_nonce,
+				   uint8_t num_workers);
+/*! detail: printable ASCII (or '\n'), at most AWORKER_IPC_MAX_TEXT; longer is cut. NULL: none. */
+int aworker_ipc_enc_session_reject(void *ctx, struct msgb **out, uint8_t reason, const char *detail);
+int aworker_ipc_enc_session_close(void *ctx, struct msgb **out, uint8_t reason);
+/*! WORKER_UP: the record only; the data link's descriptor is passed with aworker_ipc_link_send_fd(). */
+int aworker_ipc_enc_worker_up(void *ctx, struct msgb **out, uint16_t worker_idx, uint32_t incarnation,
+			      uint32_t session_id, const struct aworker_ipc_cs7_info *cs7);
+int aworker_ipc_enc_worker_down(void *ctx, struct msgb **out, uint16_t worker_idx, uint8_t reason,
+				uint32_t incarnation, uint32_t session_id);
+int aworker_ipc_enc_worker_state(void *ctx, struct msgb **out, uint16_t worker_idx, uint8_t pool_state, uint8_t attach,
+				 uint32_t incarnation, uint32_t session_id);
+int aworker_ipc_enc_op_request(void *ctx, struct msgb **out, uint8_t op, uint16_t arg);
+/*! text as for SESSION_REJECT's detail. */
+int aworker_ipc_enc_op_result(void *ctx, struct msgb **out, uint8_t op, int32_t rc, const char *text);
+const char *aworker_ipc_reject_reason_name(uint8_t reason);
+const char *aworker_ipc_state_cause_name(uint8_t cause);
+const char *aworker_ipc_attach_state_name(uint8_t state);
+const char *aworker_ipc_op_name(uint8_t op);
 int aworker_ipc_enc_user_bind(void *ctx, struct msgb **out, uint32_t user_ref, uint32_t cs7_id, uint16_t ssn,
 			      const char *name);
 int aworker_ipc_enc_user_unbind(void *ctx, struct msgb **out, uint32_t user_ref);

@@ -135,8 +135,73 @@ static const struct value_string msg_type_names[] = {
 	{ AWORKER_IPC_MT_TX_DISCONN, "TX_DISCONN" },
 	{ AWORKER_IPC_MT_SCU_UP, "SCU_UP" },
 	{ AWORKER_IPC_MT_TX_FAILED, "TX_FAILED" },
+	{ AWORKER_IPC_MT_STATE, "STATE" },
+	{ AWORKER_IPC_MT_SESSION_OPEN, "SESSION_OPEN" },
+	{ AWORKER_IPC_MT_SESSION_ACCEPT, "SESSION_ACCEPT" },
+	{ AWORKER_IPC_MT_SESSION_REJECT, "SESSION_REJECT" },
+	{ AWORKER_IPC_MT_SESSION_CLOSE, "SESSION_CLOSE" },
+	{ AWORKER_IPC_MT_WORKER_UP, "WORKER_UP" },
+	{ AWORKER_IPC_MT_WORKER_DOWN, "WORKER_DOWN" },
+	{ AWORKER_IPC_MT_WORKER_STATE, "WORKER_STATE" },
+	{ AWORKER_IPC_MT_OP_REQUEST, "OP_REQUEST" },
+	{ AWORKER_IPC_MT_OP_RESULT, "OP_RESULT" },
 	{ 0, NULL }
 };
+
+static const struct value_string reject_reason_names[] = {
+	{ AWORKER_IPC_REJ_BUSY, "busy" },
+	{ AWORKER_IPC_REJ_VERSION, "version" },
+	{ AWORKER_IPC_REJ_CONFIG_MISMATCH, "config-mismatch" },
+	{ AWORKER_IPC_REJ_BAD_DOCUMENT, "bad-document" },
+	{ AWORKER_IPC_REJ_NO_SESSIONS, "no-sessions" },
+	{ 0, NULL }
+};
+
+static const struct value_string state_cause_names[] = {
+	{ AWORKER_IPC_SC_ATTACH_OK, "attach-ok" },
+	{ AWORKER_IPC_SC_ATTACH_REFUSED, "attach-refused" },
+	{ AWORKER_IPC_SC_DETACH_REQ, "detach-req" },
+	{ AWORKER_IPC_SC_DATA_EOF, "data-eof" },
+	{ AWORKER_IPC_SC_DATA_ERROR, "data-error" },
+	{ 0, NULL }
+};
+
+static const struct value_string attach_state_names[] = {
+	{ AWORKER_IPC_ATT_NONE, "none" },
+	{ AWORKER_IPC_ATT_ATTACHED, "attached" },
+	{ AWORKER_IPC_ATT_DETACHED, "detached" },
+	{ AWORKER_IPC_ATT_ATTACHING, "attaching" },
+	{ AWORKER_IPC_ATT_DETACHING, "detaching" },
+	{ 0, NULL }
+};
+
+static const struct value_string op_names[] = {
+	{ AWORKER_IPC_OP_STATUS, "status" },
+	{ AWORKER_IPC_OP_RESET_WORKER, "reset-worker" },
+	{ AWORKER_IPC_OP_FENCE_SESSION, "fence-session" },
+	{ AWORKER_IPC_OP_POOL_SHUTDOWN, "pool-shutdown" },
+	{ 0, NULL }
+};
+
+const char *aworker_ipc_reject_reason_name(uint8_t reason)
+{
+	return get_value_string(reject_reason_names, reason);
+}
+
+const char *aworker_ipc_state_cause_name(uint8_t cause)
+{
+	return get_value_string(state_cause_names, cause);
+}
+
+const char *aworker_ipc_attach_state_name(uint8_t state)
+{
+	return get_value_string(attach_state_names, state);
+}
+
+const char *aworker_ipc_op_name(uint8_t op)
+{
+	return get_value_string(op_names, op);
+}
 
 const char *aworker_ipc_msg_type_name(uint8_t msg_type)
 {
@@ -155,7 +220,23 @@ static bool type_known(uint8_t t, int *receiver)
 	case AWORKER_IPC_MT_ECHO_REQ:
 	case AWORKER_IPC_MT_ECHO_RSP:
 	case AWORKER_IPC_MT_GOODBYE:
+	case AWORKER_IPC_MT_SESSION_CLOSE:
 		*receiver = 0;
+		return true;
+	case AWORKER_IPC_MT_STATE:
+		*receiver = AWORKER_IPC_ROLE_MAIN;
+		return true;
+	case AWORKER_IPC_MT_SESSION_OPEN:
+	case AWORKER_IPC_MT_OP_REQUEST:
+		*receiver = AWORKER_IPC_ROLE_SUPERVISOR;
+		return true;
+	case AWORKER_IPC_MT_SESSION_ACCEPT:
+	case AWORKER_IPC_MT_SESSION_REJECT:
+	case AWORKER_IPC_MT_WORKER_UP:
+	case AWORKER_IPC_MT_WORKER_DOWN:
+	case AWORKER_IPC_MT_WORKER_STATE:
+	case AWORKER_IPC_MT_OP_RESULT:
+		*receiver = AWORKER_IPC_ROLE_CLIENT;
 		return true;
 	case AWORKER_IPC_MT_ATTACH:
 	case AWORKER_IPC_MT_DETACH:
@@ -185,7 +266,7 @@ static bool type_has_no_user_ref(uint8_t t)
 {
 	return t == AWORKER_IPC_MT_HELLO || t == AWORKER_IPC_MT_ECHO_REQ || t == AWORKER_IPC_MT_ECHO_RSP
 	       || t == AWORKER_IPC_MT_GOODBYE || t == AWORKER_IPC_MT_CS7_INFO || t == AWORKER_IPC_MT_ATTACH
-	       || t == AWORKER_IPC_MT_DETACH;
+	       || t == AWORKER_IPC_MT_DETACH || t == AWORKER_IPC_MT_STATE || aworker_ipc_msg_class(t) == AWORKER_IPC_CLASS_SESSION;
 }
 
 static bool type_is_tx(uint8_t t)
@@ -204,7 +285,18 @@ unsigned int aworker_ipc_msg_class(uint8_t msg_type)
 	case AWORKER_IPC_MT_CS7_INFO:
 	case AWORKER_IPC_MT_ATTACH:
 	case AWORKER_IPC_MT_DETACH:
+	case AWORKER_IPC_MT_STATE:
 		return AWORKER_IPC_CLASS_CONTROL;
+	case AWORKER_IPC_MT_SESSION_OPEN:
+	case AWORKER_IPC_MT_SESSION_ACCEPT:
+	case AWORKER_IPC_MT_SESSION_REJECT:
+	case AWORKER_IPC_MT_SESSION_CLOSE:
+	case AWORKER_IPC_MT_WORKER_UP:
+	case AWORKER_IPC_MT_WORKER_DOWN:
+	case AWORKER_IPC_MT_WORKER_STATE:
+	case AWORKER_IPC_MT_OP_REQUEST:
+	case AWORKER_IPC_MT_OP_RESULT:
+		return AWORKER_IPC_CLASS_SESSION;
 	case AWORKER_IPC_MT_USER_BIND:
 	case AWORKER_IPC_MT_USER_UNBIND:
 	case AWORKER_IPC_MT_USER_BIND_RESULT:
@@ -223,7 +315,8 @@ unsigned int aworker_ipc_msg_class(uint8_t msg_type)
 
 unsigned int aworker_ipc_msg_fds(uint8_t msg_type)
 {
-	return msg_type == AWORKER_IPC_MT_ATTACH ? 1 : 0;
+	return msg_type == AWORKER_IPC_MT_ATTACH || msg_type == AWORKER_IPC_MT_SESSION_OPEN
+	       || msg_type == AWORKER_IPC_MT_WORKER_UP ? 1 : 0;
 }
 
 const char *aworker_ipc_class_name(unsigned int cls)
@@ -533,7 +626,7 @@ int aworker_ipc_enc_hello_id(void *ctx, struct msgb **out, enum aworker_ipc_role
 	size_t ilen = ident ? strlen(ident) : 0;
 
 	*out = NULL;
-	if (role != AWORKER_IPC_ROLE_MAIN && role != AWORKER_IPC_ROLE_WORKER)
+	if (role < AWORKER_IPC_ROLE_MAIN || role > AWORKER_IPC_ROLE_CLIENT)
 		return -EINVAL;
 	if (ilen > AWORKER_IPC_MAX_IDENT || !printable(ident, ilen))
 		return -EINVAL;
@@ -630,6 +723,218 @@ int aworker_ipc_enc_cs7_info(void *ctx, struct msgb **out, const struct aworker_
 		put_u8(msg, e->num_as);
 		put_u8(msg, 0);
 		put_u8(msg, 0);
+	}
+	return frame_end(msg, out);
+}
+
+/* TEXT: printable ASCII or '\n'. */
+static bool text_ok(const char *s, size_t len)
+{
+	size_t i;
+	for (i = 0; i < len; i++) {
+		if ((s[i] < 0x20 || s[i] > 0x7e) && s[i] != '\n')
+			return false;
+	}
+	return true;
+}
+
+/* NULL: empty; longer than AWORKER_IPC_MAX_TEXT: cut. \returns -EINVAL for a character TEXT cannot carry. */
+static int put_text(struct msgb *msg, const char *text)
+{
+	size_t len = text ? strlen(text) : 0;
+
+	if (len > AWORKER_IPC_MAX_TEXT)
+		len = AWORKER_IPC_MAX_TEXT;
+	if (!text_ok(text, len))
+		return -EINVAL;
+	put_u16(msg, (uint16_t)len);
+	put_bytes(msg, text, len);
+	return 0;
+}
+
+int aworker_ipc_enc_state(void *ctx, struct msgb **out, uint32_t session_id, uint8_t state, uint8_t cause,
+			  uint16_t users_unbound)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (!session_id || (state != AWORKER_IPC_ATT_ATTACHED && state != AWORKER_IPC_ATT_DETACHED)
+	    || cause < AWORKER_IPC_SC_ATTACH_OK || cause > AWORKER_IPC_SC_DATA_ERROR)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_STATE, 0)))
+		return -ENOMEM;
+	put_u32(msg, session_id);
+	put_u8(msg, state);
+	put_u8(msg, cause);
+	put_u16(msg, 0);
+	put_u16(msg, users_unbound);
+	put_u16(msg, 0);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_session_open(void *ctx, struct msgb **out, uint8_t version, uint32_t doc_len)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (!version || !doc_len)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_SESSION_OPEN, 0)))
+		return -ENOMEM;
+	put_u8(msg, version);
+	put_u8(msg, 0);
+	put_u16(msg, 0);
+	put_u32(msg, doc_len);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_session_accept(void *ctx, struct msgb **out, uint32_t session_id, uint64_t boot_nonce,
+				   uint8_t num_workers)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (!session_id || !boot_nonce || num_workers < 1 || num_workers > AWORKER_IPC_MAX_WORKERS)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_SESSION_ACCEPT, 0)))
+		return -ENOMEM;
+	put_u32(msg, session_id);
+	put_u32(msg, (uint32_t)(boot_nonce >> 32));
+	put_u32(msg, (uint32_t)boot_nonce);
+	put_u8(msg, num_workers);
+	put_u8(msg, 0);
+	put_u16(msg, 0);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_session_reject(void *ctx, struct msgb **out, uint8_t reason, const char *detail)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (reason < AWORKER_IPC_REJ_BUSY || reason > AWORKER_IPC_REJ_NO_SESSIONS)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_SESSION_REJECT, 0)))
+		return -ENOMEM;
+	put_u8(msg, reason);
+	put_u8(msg, 0);
+	if (put_text(msg, detail) < 0) {
+		msgb_free(msg);
+		return -EINVAL;
+	}
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_session_close(void *ctx, struct msgb **out, uint8_t reason)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (reason < AWORKER_IPC_CC_NORMAL || reason > AWORKER_IPC_CC_SHUTDOWN)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_SESSION_CLOSE, 0)))
+		return -ENOMEM;
+	put_u8(msg, reason);
+	put_u8(msg, 0);
+	put_u16(msg, 0);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_worker_up(void *ctx, struct msgb **out, uint16_t worker_idx, uint32_t incarnation,
+			      uint32_t session_id, const struct aworker_ipc_cs7_info *cs7)
+{
+	struct msgb *msg;
+	unsigned int i;
+
+	*out = NULL;
+	if (worker_idx >= AWORKER_IPC_MAX_WORKERS || !incarnation || !session_id || !cs7 || cs7_info_check(cs7))
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_WORKER_UP, 0)))
+		return -ENOMEM;
+	put_u16(msg, worker_idx);
+	put_u16(msg, 0);
+	put_u32(msg, incarnation);
+	put_u32(msg, session_id);
+	put_u8(msg, cs7->count);
+	for (i = 0; i < cs7->count; i++) {
+		put_u32(msg, cs7->e[i].cs7_id);
+		put_u32(msg, cs7->e[i].primary_pc);
+		put_u8(msg, cs7->e[i].asp_proto);
+		put_u8(msg, cs7->e[i].num_as);
+		put_u16(msg, 0);
+	}
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_worker_down(void *ctx, struct msgb **out, uint16_t worker_idx, uint8_t reason,
+				uint32_t incarnation, uint32_t session_id)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (worker_idx >= AWORKER_IPC_MAX_WORKERS || reason < AWORKER_IPC_DOWN_LOST
+	    || reason > AWORKER_IPC_DOWN_ATTACH_FAILED || !incarnation || !session_id)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_WORKER_DOWN, 0)))
+		return -ENOMEM;
+	put_u16(msg, worker_idx);
+	put_u8(msg, reason);
+	put_u8(msg, 0);
+	put_u32(msg, incarnation);
+	put_u32(msg, session_id);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_worker_state(void *ctx, struct msgb **out, uint16_t worker_idx, uint8_t pool_state, uint8_t attach,
+				 uint32_t incarnation, uint32_t session_id)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (worker_idx >= AWORKER_IPC_MAX_WORKERS || pool_state > AWORKER_IPC_POOL_STATE_MAX
+	    || attach > AWORKER_IPC_ATT_DETACHING)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_WORKER_STATE, 0)))
+		return -ENOMEM;
+	put_u16(msg, worker_idx);
+	put_u8(msg, pool_state);
+	put_u8(msg, attach);
+	put_u32(msg, incarnation);
+	put_u32(msg, session_id);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_op_request(void *ctx, struct msgb **out, uint8_t op, uint16_t arg)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (op < AWORKER_IPC_OP_STATUS || op > AWORKER_IPC_OP_POOL_SHUTDOWN
+	    || (op == AWORKER_IPC_OP_RESET_WORKER ? arg >= AWORKER_IPC_MAX_WORKERS : arg != 0))
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_OP_REQUEST, 0)))
+		return -ENOMEM;
+	put_u8(msg, op);
+	put_u8(msg, 0);
+	put_u16(msg, arg);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_op_result(void *ctx, struct msgb **out, uint8_t op, int32_t rc, const char *text)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (op < AWORKER_IPC_OP_STATUS || op > AWORKER_IPC_OP_POOL_SHUTDOWN || rc > 0)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_OP_RESULT, 0)))
+		return -ENOMEM;
+	put_u8(msg, op);
+	put_u8(msg, 0);
+	put_u32(msg, (uint32_t)rc);
+	if (put_text(msg, text) < 0) {
+		msgb_free(msg);
+		return -EINVAL;
 	}
 	return frame_end(msg, out);
 }
@@ -1055,6 +1360,55 @@ static void get_data(struct rd *r, struct aworker_ipc_data *d)
 	d->len = r->err ? 0 : len;
 }
 
+/* TEXT: u16 length, then printable ASCII or '\n'; a view into the record. */
+static void get_text(struct rd *r, struct aworker_ipc_data *t)
+{
+	uint16_t len = get_u16(r);
+	const uint8_t *p;
+
+	if (r->err)
+		return;
+	if (len > AWORKER_IPC_MAX_TEXT) {
+		rd_fail(r, AWORKER_IPC_ERR_BAD_STRING);
+		return;
+	}
+	p = rd_take(r, len);
+	if (!p)
+		return;
+	if (!text_ok((const char *)p, len)) {
+		rd_fail(r, AWORKER_IPC_ERR_BAD_STRING);
+		return;
+	}
+	t->buf = p;
+	t->len = len;
+}
+
+/* The body of CS7_INFO (also in WORKER_UP). */
+static void get_cs7_info(struct rd *r, struct aworker_ipc_cs7_info *info)
+{
+	unsigned int i;
+	int rc;
+
+	info->count = get_u8(r);
+	if (r->err)
+		return;
+	if (info->count < 1 || info->count > AWORKER_IPC_MAX_CS7) {
+		rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		return;
+	}
+	for (i = 0; i < info->count; i++) {
+		struct aworker_ipc_cs7_entry *e = &info->e[i];
+		e->cs7_id = get_u32(r);
+		e->primary_pc = get_u32(r);
+		e->asp_proto = get_u8(r);
+		e->num_as = get_u8(r);
+		if (get_u8(r) != 0 || get_u8(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+	}
+	if (!r->err && (rc = cs7_info_check(info)))
+		rd_fail(r, rc);
+}
+
 /* Fixed-length printable string preceded by its u8 length */
 static void get_string(struct rd *r, char *dst, size_t min_len, size_t max_len)
 {
@@ -1173,7 +1527,7 @@ static void dec_body(struct rd *r, struct aworker_ipc_msg *m)
 		m->u.hello.max_frame = get_u16(r);
 		m->u.hello.max_data = get_u16(r);
 		m->u.hello.pid = get_u32(r);
-		if (!r->err && m->u.hello.role != AWORKER_IPC_ROLE_MAIN && m->u.hello.role != AWORKER_IPC_ROLE_WORKER)
+		if (!r->err && (m->u.hello.role < AWORKER_IPC_ROLE_MAIN || m->u.hello.role > AWORKER_IPC_ROLE_CLIENT))
 			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
 		get_string(r, m->u.hello.ident, 0, AWORKER_IPC_MAX_IDENT);
 		/* since 2.0 */
@@ -1208,28 +1562,119 @@ static void dec_body(struct rd *r, struct aworker_ipc_msg *m)
 		if (!r->err && m->u.goodbye_reason != AWORKER_IPC_GOODBYE_SHUTDOWN)
 			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
 		break;
-	case AWORKER_IPC_MT_CS7_INFO: {
-		unsigned int i;
-		m->u.cs7_info.count = get_u8(r);
-		if (r->err)
-			break;
-		if (m->u.cs7_info.count < 1 || m->u.cs7_info.count > AWORKER_IPC_MAX_CS7) {
-			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
-			break;
-		}
-		for (i = 0; i < m->u.cs7_info.count; i++) {
-			struct aworker_ipc_cs7_entry *e = &m->u.cs7_info.e[i];
-			e->cs7_id = get_u32(r);
-			e->primary_pc = get_u32(r);
-			e->asp_proto = get_u8(r);
-			e->num_as = get_u8(r);
-			if (get_u8(r) != 0 || get_u8(r) != 0)
-				rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
-		}
-		if (!r->err && (rc = cs7_info_check(&m->u.cs7_info)))
-			rd_fail(r, rc);
+	case AWORKER_IPC_MT_CS7_INFO:
+		get_cs7_info(r, &m->u.cs7_info);
 		break;
-	}
+	case AWORKER_IPC_MT_STATE:
+		m->u.state.session_id = get_u32(r);
+		m->u.state.state = get_u8(r);
+		m->u.state.cause = get_u8(r);
+		if (get_u16(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		m->u.state.users_unbound = get_u16(r);
+		if (get_u16(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		if (!r->err && (!m->u.state.session_id
+				|| (m->u.state.state != AWORKER_IPC_ATT_ATTACHED
+				    && m->u.state.state != AWORKER_IPC_ATT_DETACHED)
+				|| m->u.state.cause < AWORKER_IPC_SC_ATTACH_OK
+				|| m->u.state.cause > AWORKER_IPC_SC_DATA_ERROR))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
+	case AWORKER_IPC_MT_SESSION_OPEN:
+		m->u.session_open.version = get_u8(r);
+		if (get_u8(r) != 0 || get_u16(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		m->u.session_open.doc_len = get_u32(r);
+		if (!r->err && (!m->u.session_open.version || !m->u.session_open.doc_len))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
+	case AWORKER_IPC_MT_SESSION_ACCEPT:
+		m->u.session_accept.session_id = get_u32(r);
+		m->u.session_accept.boot_nonce = (uint64_t)get_u32(r) << 32;
+		m->u.session_accept.boot_nonce |= get_u32(r);
+		m->u.session_accept.num_workers = get_u8(r);
+		if (get_u8(r) != 0 || get_u16(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		if (!r->err && (!m->u.session_accept.session_id || !m->u.session_accept.boot_nonce
+				|| m->u.session_accept.num_workers < 1
+				|| m->u.session_accept.num_workers > AWORKER_IPC_MAX_WORKERS))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
+	case AWORKER_IPC_MT_SESSION_REJECT:
+		m->u.session_reject.reason = get_u8(r);
+		if (get_u8(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		if (!r->err && (m->u.session_reject.reason < AWORKER_IPC_REJ_BUSY
+				|| m->u.session_reject.reason > AWORKER_IPC_REJ_NO_SESSIONS))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		get_text(r, &m->text);
+		break;
+	case AWORKER_IPC_MT_SESSION_CLOSE:
+		m->u.session_close.reason = get_u8(r);
+		if (get_u8(r) != 0 || get_u16(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		if (!r->err && (m->u.session_close.reason < AWORKER_IPC_CC_NORMAL
+				|| m->u.session_close.reason > AWORKER_IPC_CC_SHUTDOWN))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
+	case AWORKER_IPC_MT_WORKER_UP:
+		m->u.worker_up.worker_idx = get_u16(r);
+		if (get_u16(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		m->u.worker_up.incarnation = get_u32(r);
+		m->u.worker_up.session_id = get_u32(r);
+		if (!r->err && (m->u.worker_up.worker_idx >= AWORKER_IPC_MAX_WORKERS || !m->u.worker_up.incarnation
+				|| !m->u.worker_up.session_id))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		if (!r->err)
+			get_cs7_info(r, &m->u.worker_up.cs7);
+		break;
+	case AWORKER_IPC_MT_WORKER_DOWN:
+		m->u.worker_down.worker_idx = get_u16(r);
+		m->u.worker_down.reason = get_u8(r);
+		if (get_u8(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		m->u.worker_down.incarnation = get_u32(r);
+		m->u.worker_down.session_id = get_u32(r);
+		if (!r->err && (m->u.worker_down.worker_idx >= AWORKER_IPC_MAX_WORKERS
+				|| m->u.worker_down.reason < AWORKER_IPC_DOWN_LOST
+				|| m->u.worker_down.reason > AWORKER_IPC_DOWN_ATTACH_FAILED
+				|| !m->u.worker_down.incarnation || !m->u.worker_down.session_id))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
+	case AWORKER_IPC_MT_WORKER_STATE:
+		m->u.worker_state.worker_idx = get_u16(r);
+		m->u.worker_state.pool_state = get_u8(r);
+		m->u.worker_state.attach = get_u8(r);
+		m->u.worker_state.incarnation = get_u32(r);
+		m->u.worker_state.session_id = get_u32(r);
+		if (!r->err && (m->u.worker_state.worker_idx >= AWORKER_IPC_MAX_WORKERS
+				|| m->u.worker_state.pool_state > AWORKER_IPC_POOL_STATE_MAX
+				|| m->u.worker_state.attach > AWORKER_IPC_ATT_DETACHING))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
+	case AWORKER_IPC_MT_OP_REQUEST:
+		m->u.op_request.op = get_u8(r);
+		if (get_u8(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		m->u.op_request.arg = get_u16(r);
+		if (!r->err && (m->u.op_request.op < AWORKER_IPC_OP_STATUS
+				|| m->u.op_request.op > AWORKER_IPC_OP_POOL_SHUTDOWN
+				|| (m->u.op_request.op == AWORKER_IPC_OP_RESET_WORKER
+				    ? m->u.op_request.arg >= AWORKER_IPC_MAX_WORKERS : m->u.op_request.arg != 0)))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
+	case AWORKER_IPC_MT_OP_RESULT:
+		m->u.op_result.op = get_u8(r);
+		if (get_u8(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		m->u.op_result.rc = (int32_t)get_u32(r);
+		if (!r->err && (m->u.op_result.op < AWORKER_IPC_OP_STATUS
+				|| m->u.op_result.op > AWORKER_IPC_OP_POOL_SHUTDOWN || m->u.op_result.rc > 0))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		get_text(r, &m->text);
+		break;
 	case AWORKER_IPC_MT_USER_BIND:
 		m->u.user_bind.cs7_id = get_u32(r);
 		m->u.user_bind.ssn = get_u16(r);

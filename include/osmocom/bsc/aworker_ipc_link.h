@@ -25,7 +25,7 @@
  * changes the osmo_io buffer counts (more than one buffer would merge or split records).
  *
  * Lifecycle: HELLO_WAIT -> READY -> CLOSED. Each side queues its HELLO (seq 1) on allocation. The first record
- * received must be a HELLO with seq 1, the opposite role, the same worker index and the same frame/data limits, and
+ * received must be a HELLO with seq 1, the opposite role (main <-> worker, Supervisor <-> client), the same worker index and the same frame/data limits, and
  * no identity that contradicts the own one (cfg->id): a boot nonce, incarnation or session_id that both sides
  * assert (non-zero) must be equal. Otherwise the link closes (AWORKER_IPC_CLOSE_INCOMPATIBLE). The peer's minor
  * version may differ (see aworker_ipc.h). aworker_ipc_link_send() returns -EBUSY until the peer's HELLO was accepted (then

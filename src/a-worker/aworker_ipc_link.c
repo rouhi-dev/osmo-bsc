@@ -73,9 +73,9 @@ struct aworker_ipc_link {
 	bool free_pending;
 };
 
+static const char *const role_names[] = { "?", "main", "worker", "supervisor", "client" };
 #define LOG_LINK(link, lvl, fmt, args...) \
-	LOGP((link)->log_cat, lvl, "aworker-ipc(%s idx=%u): " fmt, \
-	     (link)->role == AWORKER_IPC_ROLE_MAIN ? "main" : "worker", (link)->worker_idx, ## args)
+	LOGP((link)->log_cat, lvl, "aworker-ipc(%s idx=%u): " fmt, role_names[(link)->role], (link)->worker_idx, ## args)
 
 static const struct value_string close_reason_names[] = {
 	{ AWORKER_IPC_CLOSE_LOCAL, "local" },
@@ -104,7 +104,16 @@ const char *aworker_ipc_close_reason_name(enum aworker_ipc_close_reason reason)
 
 static enum aworker_ipc_role peer_role(const struct aworker_ipc_link *link)
 {
-	return link->role == AWORKER_IPC_ROLE_MAIN ? AWORKER_IPC_ROLE_WORKER : AWORKER_IPC_ROLE_MAIN;
+	switch (link->role) {
+	case AWORKER_IPC_ROLE_MAIN:
+		return AWORKER_IPC_ROLE_WORKER;
+	case AWORKER_IPC_ROLE_WORKER:
+		return AWORKER_IPC_ROLE_MAIN;
+	case AWORKER_IPC_ROLE_SUPERVISOR:
+		return AWORKER_IPC_ROLE_CLIENT;
+	default:
+		return AWORKER_IPC_ROLE_SUPERVISOR;
+	}
 }
 
 /* The transmit queue was discarded (or the link is going away): close the descriptors of its records. */
@@ -566,7 +575,7 @@ int aworker_ipc_link_alloc(struct aworker_ipc_link **out, void *ctx, int fd, con
 	*out = NULL;
 	if (!cfg || !ops || !ops->rx_cb || !ops->closed_cb)
 		return -EINVAL;
-	if (cfg->role != AWORKER_IPC_ROLE_MAIN && cfg->role != AWORKER_IPC_ROLE_WORKER)
+	if (cfg->role < AWORKER_IPC_ROLE_MAIN || cfg->role > AWORKER_IPC_ROLE_CLIENT)
 		return -EINVAL;
 	ident = cfg->ident ? cfg->ident : "";
 	if (strlen(ident) > AWORKER_IPC_MAX_IDENT)
@@ -604,7 +613,9 @@ int aworker_ipc_link_alloc(struct aworker_ipc_link **out, void *ctx, int fd, con
 	}
 
 	link->iofd = osmo_iofd_setup(link, fd, link->role == AWORKER_IPC_ROLE_MAIN ? "aworker-ipc-main"
-							: "aworker-ipc-worker",
+					: link->role == AWORKER_IPC_ROLE_WORKER ? "aworker-ipc-worker"
+					: link->role == AWORKER_IPC_ROLE_SUPERVISOR ? "aworker-ipc-supervisor"
+					: "aworker-ipc-client",
 				     OSMO_IO_FD_MODE_RECVMSG_SENDMSG, &link_ioops, link);
 	if (!link->iofd) {
 		msgb_free(hello);

@@ -788,8 +788,8 @@ static void test_c5_malformed(void)
 	expect("SCU_UP N-DISCONNECT.ind originator 3", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_VALUE);
 
 	/* C8: HELLO: role u8 | reserved u8 | worker_idx u16 | max_frame u16 | max_data u16 | pid u32 | ident */
-	r = base_hello; r.b[OFF_BODY] = 3;
-	expect("HELLO role 3", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_VALUE);
+	r = base_hello; r.b[OFF_BODY] = 5;
+	expect("HELLO role 5", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_VALUE);
 	r = base_hello; r.b[OFF_BODY + 1] = 1;
 	expect("HELLO reserved 1", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_RESERVED);
 	r = base_hello; r.b[OFF_BODY + 13] = 0x01;
@@ -905,6 +905,50 @@ static int reencode(const struct aworker_ipc_msg *m, struct msgb **out)
 	case AWORKER_IPC_MT_DETACH:
 		rc = aworker_ipc_enc_detach(ctx, out, u->detach.session_id);
 		break;
+	case AWORKER_IPC_MT_STATE:
+		rc = aworker_ipc_enc_state(ctx, out, u->state.session_id, u->state.state, u->state.cause,
+					   u->state.users_unbound);
+		break;
+	case AWORKER_IPC_MT_SESSION_OPEN:
+		rc = aworker_ipc_enc_session_open(ctx, out, u->session_open.version, u->session_open.doc_len);
+		break;
+	case AWORKER_IPC_MT_SESSION_ACCEPT:
+		rc = aworker_ipc_enc_session_accept(ctx, out, u->session_accept.session_id, u->session_accept.boot_nonce,
+						    u->session_accept.num_workers);
+		break;
+	case AWORKER_IPC_MT_SESSION_REJECT: {
+		char t[AWORKER_IPC_MAX_TEXT + 1];
+		memcpy(t, m->text.buf, m->text.len);
+		t[m->text.len] = '\0';
+		rc = aworker_ipc_enc_session_reject(ctx, out, u->session_reject.reason, t);
+		break;
+	}
+	case AWORKER_IPC_MT_SESSION_CLOSE:
+		rc = aworker_ipc_enc_session_close(ctx, out, u->session_close.reason);
+		break;
+	case AWORKER_IPC_MT_WORKER_UP:
+		rc = aworker_ipc_enc_worker_up(ctx, out, u->worker_up.worker_idx, u->worker_up.incarnation,
+					       u->worker_up.session_id, &u->worker_up.cs7);
+		break;
+	case AWORKER_IPC_MT_WORKER_DOWN:
+		rc = aworker_ipc_enc_worker_down(ctx, out, u->worker_down.worker_idx, u->worker_down.reason,
+						 u->worker_down.incarnation, u->worker_down.session_id);
+		break;
+	case AWORKER_IPC_MT_WORKER_STATE:
+		rc = aworker_ipc_enc_worker_state(ctx, out, u->worker_state.worker_idx, u->worker_state.pool_state,
+						  u->worker_state.attach, u->worker_state.incarnation,
+						  u->worker_state.session_id);
+		break;
+	case AWORKER_IPC_MT_OP_REQUEST:
+		rc = aworker_ipc_enc_op_request(ctx, out, u->op_request.op, u->op_request.arg);
+		break;
+	case AWORKER_IPC_MT_OP_RESULT: {
+		char t[AWORKER_IPC_MAX_TEXT + 1];
+		memcpy(t, m->text.buf, m->text.len);
+		t[m->text.len] = '\0';
+		rc = aworker_ipc_enc_op_result(ctx, out, u->op_result.op, u->op_result.rc, t);
+		break;
+	}
 	case AWORKER_IPC_MT_USER_BIND:
 		rc = aworker_ipc_enc_user_bind(ctx, out, m->user_ref, u->user_bind.cs7_id, u->user_bind.ssn,
 					       u->user_bind.name);
@@ -2040,7 +2084,10 @@ static void test_k1_k4_classes(void)
 {
 	static const uint8_t types[] = {
 		AWORKER_IPC_MT_HELLO, AWORKER_IPC_MT_ECHO_REQ, AWORKER_IPC_MT_ECHO_RSP, AWORKER_IPC_MT_GOODBYE,
-		AWORKER_IPC_MT_ATTACH, AWORKER_IPC_MT_DETACH,
+		AWORKER_IPC_MT_ATTACH, AWORKER_IPC_MT_DETACH, AWORKER_IPC_MT_STATE,
+		AWORKER_IPC_MT_SESSION_OPEN, AWORKER_IPC_MT_SESSION_ACCEPT, AWORKER_IPC_MT_SESSION_REJECT,
+		AWORKER_IPC_MT_SESSION_CLOSE, AWORKER_IPC_MT_WORKER_UP, AWORKER_IPC_MT_WORKER_DOWN,
+		AWORKER_IPC_MT_WORKER_STATE, AWORKER_IPC_MT_OP_REQUEST, AWORKER_IPC_MT_OP_RESULT,
 		AWORKER_IPC_MT_CS7_INFO, AWORKER_IPC_MT_USER_BIND, AWORKER_IPC_MT_USER_UNBIND,
 		AWORKER_IPC_MT_USER_BIND_RESULT, AWORKER_IPC_MT_TX_UNITDATA, AWORKER_IPC_MT_TX_CONN_REQ,
 		AWORKER_IPC_MT_TX_CONN_RESP, AWORKER_IPC_MT_TX_DATA, AWORKER_IPC_MT_TX_DISCONN, AWORKER_IPC_MT_SCU_UP,
@@ -2061,7 +2108,9 @@ static void test_k1_k4_classes(void)
 	}
 	for (t = 0; t < 256; t++) {
 		bool known = aworker_ipc_type_valid_for(t, AWORKER_IPC_ROLE_MAIN)
-			     || aworker_ipc_type_valid_for(t, AWORKER_IPC_ROLE_WORKER);
+			     || aworker_ipc_type_valid_for(t, AWORKER_IPC_ROLE_WORKER)
+			     || aworker_ipc_type_valid_for(t, AWORKER_IPC_ROLE_SUPERVISOR)
+			     || aworker_ipc_type_valid_for(t, AWORKER_IPC_ROLE_CLIENT);
 		n_known += known;
 		CHECK(known == (aworker_ipc_msg_class(t) != 0));
 	}
@@ -2444,6 +2493,339 @@ static void test_f1_f6_fd_passing(void)
 	printf("  F6 ATTACH takes one descriptor, every other type none\n");
 }
 
+/***********************************************************************
+ * S1-S7: the session protocol (S2-5): STATE, SESSION_*, WORKER_*, OP_*
+ ***********************************************************************/
+
+/* Decode r as receiver; \returns 0 or the error, m filled. */
+static int dec_as(struct aworker_ipc_msg *m, const struct rec *r, enum aworker_ipc_role receiver)
+{
+	return aworker_ipc_dec(m, r->b, r->len, receiver);
+}
+
+static struct aworker_ipc_cs7_info s_cs7(void)
+{
+	struct aworker_ipc_cs7_info i = { .count = 1 };
+	i.e[0] = (struct aworker_ipc_cs7_entry){ .cs7_id = 1, .primary_pc = 188, .asp_proto = OSMO_SS7_ASP_PROT_M3UA,
+						 .num_as = 1 };
+	return i;
+}
+
+static void test_s1_s7_session(void)
+{
+	static const enum aworker_ipc_role roles[] = { AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ROLE_WORKER,
+						       AWORKER_IPC_ROLE_SUPERVISOR, AWORKER_IPC_ROLE_CLIENT };
+	static const char *const rname[] = { "?", "main", "worker", "supervisor", "client" };
+	struct aworker_ipc_cs7_info cs7 = s_cs7();
+	struct aworker_ipc_msg m;
+	struct msgb *msg;
+	struct rec r, all[10];
+	unsigned int i, j, n_all = 0;
+	char longtext[AWORKER_IPC_MAX_TEXT + 50];
+	int rc;
+
+	printf("S1-S7: the session protocol (S2-5)\n");
+
+	/* S1: every new message, encoded and decoded by its receiver, with its values */
+	CHECK(aworker_ipc_enc_state(ctx, &msg, 7, AWORKER_IPC_ATT_DETACHED, AWORKER_IPC_SC_DATA_EOF, 3) == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_session_open(ctx, &msg, AWORKER_IPC_SESSION_VERSION, 1234) == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_session_accept(ctx, &msg, 7, 0x1122334455667788ULL, 2) == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_session_reject(ctx, &msg, AWORKER_IPC_REJ_CONFIG_MISMATCH, "line 3, part P\nmore") == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_session_close(ctx, &msg, AWORKER_IPC_CC_FENCED) == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_worker_up(ctx, &msg, 1, 4, 7, &cs7) == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_worker_down(ctx, &msg, 1, AWORKER_IPC_DOWN_LOST, 4, 7) == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_worker_state(ctx, &msg, 1, 2, AWORKER_IPC_ATT_ATTACHED, 4, 7) == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_op_request(ctx, &msg, AWORKER_IPC_OP_RESET_WORKER, 15) == 0);
+	rec_from(&all[n_all++], msg);
+	CHECK(aworker_ipc_enc_op_result(ctx, &msg, AWORKER_IPC_OP_STATUS, -16, "worker 0: READY\n") == 0);
+	rec_from(&all[n_all++], msg);
+
+	for (i = 0; i < n_all; i++) {
+		uint8_t t = all[i].b[3];
+		int r0;
+		printf("  S1 %-15s class %-8s fds %u, decoded by", aworker_ipc_msg_type_name(t),
+		       aworker_ipc_class_name(aworker_ipc_msg_class(t)), aworker_ipc_msg_fds(t));
+		for (j = 0; j < ARRAY_SIZE(roles); j++) {
+			r0 = dec_as(&m, &all[i], roles[j]);
+			if (r0 == 0)
+				printf(" %s", rname[roles[j]]);
+			else
+				CHECK(r0 == -AWORKER_IPC_ERR_WRONG_DIRECTION);
+		}
+		printf("\n");
+	}
+	CHECK(dec_as(&m, &all[0], AWORKER_IPC_ROLE_MAIN) == 0 && m.u.state.session_id == 7
+	      && m.u.state.state == AWORKER_IPC_ATT_DETACHED && m.u.state.cause == AWORKER_IPC_SC_DATA_EOF
+	      && m.u.state.users_unbound == 3 && m.user_ref == 0 && m.fd == -1);
+	CHECK(dec_as(&m, &all[1], AWORKER_IPC_ROLE_SUPERVISOR) == 0 && m.u.session_open.version == 1
+	      && m.u.session_open.doc_len == 1234);
+	CHECK(dec_as(&m, &all[2], AWORKER_IPC_ROLE_CLIENT) == 0 && m.u.session_accept.session_id == 7
+	      && m.u.session_accept.boot_nonce == 0x1122334455667788ULL && m.u.session_accept.num_workers == 2);
+	CHECK(dec_as(&m, &all[3], AWORKER_IPC_ROLE_CLIENT) == 0
+	      && m.u.session_reject.reason == AWORKER_IPC_REJ_CONFIG_MISMATCH && m.text.len == 19
+	      && !memcmp(m.text.buf, "line 3, part P\nmore", 19));
+	CHECK(dec_as(&m, &all[4], AWORKER_IPC_ROLE_SUPERVISOR) == 0 && m.u.session_close.reason == AWORKER_IPC_CC_FENCED);
+	CHECK(dec_as(&m, &all[5], AWORKER_IPC_ROLE_CLIENT) == 0 && m.u.worker_up.worker_idx == 1
+	      && m.u.worker_up.incarnation == 4 && m.u.worker_up.session_id == 7 && m.u.worker_up.cs7.count == 1
+	      && m.u.worker_up.cs7.e[0].primary_pc == 188);
+	CHECK(dec_as(&m, &all[6], AWORKER_IPC_ROLE_CLIENT) == 0 && m.u.worker_down.reason == AWORKER_IPC_DOWN_LOST
+	      && m.u.worker_down.incarnation == 4);
+	CHECK(dec_as(&m, &all[7], AWORKER_IPC_ROLE_CLIENT) == 0 && m.u.worker_state.pool_state == 2
+	      && m.u.worker_state.attach == AWORKER_IPC_ATT_ATTACHED);
+	CHECK(dec_as(&m, &all[8], AWORKER_IPC_ROLE_SUPERVISOR) == 0 && m.u.op_request.op == AWORKER_IPC_OP_RESET_WORKER
+	      && m.u.op_request.arg == 15);
+	CHECK(dec_as(&m, &all[9], AWORKER_IPC_ROLE_CLIENT) == 0 && m.u.op_result.rc == -16 && m.text.len == 16);
+	printf("  S1 every field as encoded; TEXT carries '\\n'\n");
+
+	/* S2: encoder refusals */
+	memset(longtext, 'x', sizeof(longtext) - 1);
+	longtext[sizeof(longtext) - 1] = '\0';
+	CHECK(aworker_ipc_enc_state(ctx, &msg, 0, AWORKER_IPC_ATT_ATTACHED, AWORKER_IPC_SC_ATTACH_OK, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_state(ctx, &msg, 1, AWORKER_IPC_ATT_ATTACHING, AWORKER_IPC_SC_ATTACH_OK, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_state(ctx, &msg, 1, AWORKER_IPC_ATT_ATTACHED, 6, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_open(ctx, &msg, 0, 1) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_open(ctx, &msg, 1, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_accept(ctx, &msg, 0, 1, 1) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_accept(ctx, &msg, 1, 0, 1) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_accept(ctx, &msg, 1, 1, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_accept(ctx, &msg, 1, 1, 17) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_reject(ctx, &msg, 6, NULL) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_reject(ctx, &msg, AWORKER_IPC_REJ_BUSY, "tab\there") == -EINVAL && !msg);
+	CHECK(aworker_ipc_enc_session_close(ctx, &msg, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_worker_up(ctx, &msg, 16, 1, 1, &cs7) == -EINVAL);
+	CHECK(aworker_ipc_enc_worker_up(ctx, &msg, 0, 0, 1, &cs7) == -EINVAL);
+	CHECK(aworker_ipc_enc_worker_up(ctx, &msg, 0, 1, 0, &cs7) == -EINVAL);
+	CHECK(aworker_ipc_enc_worker_down(ctx, &msg, 0, 4, 1, 1) == -EINVAL);
+	CHECK(aworker_ipc_enc_worker_state(ctx, &msg, 0, 6, 0, 0, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_worker_state(ctx, &msg, 0, 0, 5, 0, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_op_request(ctx, &msg, AWORKER_IPC_OP_STATUS, 1) == -EINVAL);
+	CHECK(aworker_ipc_enc_op_request(ctx, &msg, AWORKER_IPC_OP_RESET_WORKER, 16) == -EINVAL);
+	CHECK(aworker_ipc_enc_op_request(ctx, &msg, 5, 0) == -EINVAL);
+	CHECK(aworker_ipc_enc_op_result(ctx, &msg, AWORKER_IPC_OP_STATUS, 1, NULL) == -EINVAL);
+	CHECK(aworker_ipc_enc_op_result(ctx, &msg, AWORKER_IPC_OP_STATUS, 0, longtext) == 0);
+	rec_from(&r, msg);
+	CHECK(dec_as(&m, &r, AWORKER_IPC_ROLE_CLIENT) == 0 && m.text.len == AWORKER_IPC_MAX_TEXT);
+	/* one octet more than the limit, as a peer could send it: refused by the decoder */
+	r.b[r.len++] = 'x';
+	osmo_store16be(AWORKER_IPC_MAX_TEXT + 1, r.b + AWORKER_IPC_HDR_LEN + 6);
+	osmo_store16be(r.len - AWORKER_IPC_HDR_LEN, r.b + 6);
+	expect("S2 OP_RESULT with a TEXT of 3801 octets", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_STRING);
+	{
+		struct aworker_ipc_cs7_info bad = cs7;
+		bad.count = 0;
+		CHECK(aworker_ipc_enc_worker_up(ctx, &msg, 0, 1, 1, &bad) == -EINVAL);
+		bad = cs7;
+		bad.e[0].primary_pc = 0x01000000;
+		CHECK(aworker_ipc_enc_worker_up(ctx, &msg, 0, 1, 1, &bad) == -EINVAL);
+	}
+	printf("  S2 encoders refuse zero identities, unknown reasons/ops/states, index 16, a control character in TEXT;"
+	       " a TEXT longer than %u is cut\n", AWORKER_IPC_MAX_TEXT);
+
+	/* S3: decoder refusals (byte changes of valid records; body offset 16) */
+	r = all[0]; r.b[16 + 3] = 0;
+	expect("S3 STATE session_id 0", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[0]; r.b[16 + 4] = AWORKER_IPC_ATT_ATTACHING;
+	expect("S3 STATE state attaching", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[0]; r.b[16 + 6] = 1;
+	expect("S3 STATE reserved", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_RESERVED);
+	r = all[1]; r.b[16 + 0] = 0;
+	expect("S3 SESSION_OPEN version 0", &r, AWORKER_IPC_ROLE_SUPERVISOR, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[1]; r.b[16 + 0] = 9;
+	expect("S3 SESSION_OPEN version 9 (refused by the Supervisor, not the codec)", &r, AWORKER_IPC_ROLE_SUPERVISOR,
+	       AWORKER_IPC_ERR_NONE);
+	r = all[2]; r.b[16 + 12] = 17;
+	expect("S3 SESSION_ACCEPT 17 workers", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[3]; r.b[16 + 4 + 2] = '\t';
+	expect("S3 SESSION_REJECT TEXT with a tab", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_STRING);
+	r = all[3]; r.b[16 + 3] = 20;
+	expect("S3 SESSION_REJECT TEXT longer than the record", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_TRUNCATED);
+	r = all[5]; r.b[16 + 1] = 16;
+	expect("S3 WORKER_UP index 16", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[5]; r.b[16 + 12] = 0;
+	expect("S3 WORKER_UP without cs7 instances", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[6]; r.b[16 + 2] = 0;
+	expect("S3 WORKER_DOWN reason 0", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[7]; r.b[16 + 2] = 6;
+	expect("S3 WORKER_STATE pool state 6", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[8]; r.b[16 + 0] = AWORKER_IPC_OP_STATUS;
+	expect("S3 OP_REQUEST status with an argument", &r, AWORKER_IPC_ROLE_SUPERVISOR, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[9]; r.b[16 + 2] = 0; r.b[16 + 5] = 1;
+	expect("S3 OP_RESULT rc > 0", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_VALUE);
+	r = all[4]; osmo_store32be(5, r.b + 12);
+	expect("S3 SESSION_CLOSE with a user_ref", &r, AWORKER_IPC_ROLE_CLIENT, AWORKER_IPC_ERR_BAD_USER_REF);
+
+	/* S4: HELLO of the session roles; role 5 refused */
+	for (i = AWORKER_IPC_ROLE_SUPERVISOR; i <= AWORKER_IPC_ROLE_CLIENT; i++) {
+		CHECK(aworker_ipc_enc_hello(ctx, &msg, i, 0, 9, "bsc-aworker") == 0);
+		rec_from(&r, msg);
+		rc = dec_as(&m, &r, AWORKER_IPC_ROLE_MAIN);
+		CHECK(rc == 0 && m.u.hello.role == i);
+	}
+	CHECK(aworker_ipc_enc_hello(ctx, &msg, 5, 0, 9, "x") == -EINVAL);
+	printf("  S4 HELLO roles 3 (supervisor) and 4 (client); role 5 refused by the encoder\n");
+}
+
+/* S5/S6: a Supervisor <-> client link pair (session class only) */
+static int tl_alloc_sess(struct tl *t, const char *name, int fd, enum aworker_ipc_role role, bool fd_passing)
+{
+	struct aworker_ipc_link_cfg cfg = {
+		.role = role, .worker_idx = 0, .pid = 2000 + role, .ident = "test", .log_cat = DLGLOBAL,
+		.classes = AWORKER_IPC_CLASS_SESSION, .fd_passing = fd_passing,
+	};
+	memset(t, 0, sizeof(*t));
+	t->name = name;
+	t->fd = fd;
+	t->order_ok = true;
+	t->taken_fd = -1;
+	t->seen_fd = -1;
+	return aworker_ipc_link_alloc(&t->link, ctx, fd, &cfg, &tl_ops, t);
+}
+
+static void test_s5_s6_session_link(void)
+{
+	struct tl s, c, w;
+	struct msgb *msg;
+	unsigned int before = count_fds();
+	int sv[2], fd;
+	char buf[8];
+
+	printf("S5-S6: a session link (Supervisor <-> client)\n");
+	mk_pair(sv);
+	CHECK(tl_alloc_sess(&s, "supervisor", sv[0], AWORKER_IPC_ROLE_SUPERVISOR, true) == 0);
+	CHECK(tl_alloc_sess(&c, "client", sv[1], AWORKER_IPC_ROLE_CLIENT, true) == 0);
+	s.take_fd = true;
+	PUMP_UNTIL(s.ready && c.ready);
+	CHECK(s.ready && c.ready);
+
+	/* SESSION_OPEN with its document (a memfd) */
+	fd = content_fd("aworker-canonical-config 1\n");
+	CHECK(aworker_ipc_enc_session_open(ctx, &msg, AWORKER_IPC_SESSION_VERSION, 27) == 0);
+	CHECK(aworker_ipc_link_send_fd(c.link, msg, fd, NULL) == 0);
+	PUMP_UNTIL(s.rx == 1);
+	CHECK(s.rx == 1 && s.last.type == AWORKER_IPC_MT_SESSION_OPEN && s.taken_fd >= 0
+	      && pread(s.taken_fd, buf, 7, 0) == 7 && !memcmp(buf, "aworker", 7));
+	close(s.taken_fd);
+	printf("  S5 SESSION_OPEN carries its document's descriptor to the Supervisor\n");
+
+	/* SESSION_OPEN without one is refused by the sender; a CONTROL or DATA record by class */
+	CHECK(aworker_ipc_enc_session_open(ctx, &msg, AWORKER_IPC_SESSION_VERSION, 27) == 0);
+	CHECK(aworker_ipc_link_send(c.link, msg, NULL) == -EINVAL);
+	CHECK(aworker_ipc_enc_goodbye(ctx, &msg, AWORKER_IPC_GOODBYE_SHUTDOWN) == 0);
+	CHECK(aworker_ipc_link_send(s.link, msg, NULL) == -EINVAL);
+	CHECK(aworker_ipc_enc_session_close(ctx, &msg, AWORKER_IPC_CC_NORMAL) == 0);
+	CHECK(aworker_ipc_link_send(c.link, msg, NULL) == 0);
+	CHECK(aworker_ipc_enc_session_close(ctx, &msg, AWORKER_IPC_CC_FENCED) == 0);
+	CHECK(aworker_ipc_link_send(s.link, msg, NULL) == 0);
+	PUMP_UNTIL(s.rx == 2 && c.rx == 1);
+	CHECK(s.last.type == AWORKER_IPC_MT_SESSION_CLOSE && c.last.type == AWORKER_IPC_MT_SESSION_CLOSE
+	      && c.last.u.session_close.reason == AWORKER_IPC_CC_FENCED);
+	/* the Supervisor's ECHO_REQ is answered by the client's link: the ECHO_RSP reaches the Supervisor's rx_cb */
+	CHECK(aworker_ipc_enc_echo(ctx, &msg, false, 3) == 0);
+	CHECK(aworker_ipc_link_send(s.link, msg, NULL) == 0);
+	PUMP_UNTIL(s.rx == 3);
+	CHECK(s.rx == 3 && s.last.type == AWORKER_IPC_MT_ECHO_RSP && s.last.u.echo_token == 3 && c.rx == 1
+	      && !s.closed && !c.closed);
+	printf("  S5 no SESSION_OPEN without a descriptor; GOODBYE (control) refused on a session link; SESSION_CLOSE"
+	       " both ways; ECHO answered by the link\n");
+	tl_free(&s);
+	tl_free(&c);
+	pump(2);
+
+	/* S6: a client HELLO to a worker link, and a session record on a control link, are refused */
+	mk_pair(sv);
+	CHECK(tl_alloc_sess(&c, "client", sv[0], AWORKER_IPC_ROLE_CLIENT, false) == 0);
+	CHECK(tl_alloc_cls(&w, "worker", sv[1], AWORKER_IPC_ROLE_WORKER, 0) == 0);
+	PUMP_UNTIL(c.closed && w.closed);
+	printf("  S6 client against a worker: %s / %s\n", aworker_ipc_close_reason_name(c.ci.reason),
+	       aworker_ipc_close_reason_name(w.ci.reason));
+	CHECK(c.ci.reason == AWORKER_IPC_CLOSE_INCOMPATIBLE && w.ci.reason == AWORKER_IPC_CLOSE_INCOMPATIBLE);
+	tl_free(&c);
+	tl_free(&w);
+	cls_pair(&s, &w, AWORKER_IPC_CLASS_CONTROL, AWORKER_IPC_CLASS_CONTROL);
+	CHECK(aworker_ipc_enc_state(ctx, &msg, 1, AWORKER_IPC_ATT_ATTACHED, AWORKER_IPC_SC_ATTACH_OK, 0) == 0);
+	CHECK(aworker_ipc_link_send(w.link, msg, NULL) == 0);
+	CHECK(aworker_ipc_enc_session_close(ctx, &msg, AWORKER_IPC_CC_NORMAL) == 0);
+	CHECK(aworker_ipc_link_send(w.link, msg, NULL) == -EINVAL);
+	PUMP_UNTIL(s.rx == 1);
+	CHECK(s.rx == 1 && s.last.type == AWORKER_IPC_MT_STATE && !s.closed);
+	printf("  S6 STATE travels on a control link; SESSION_CLOSE is refused there\n");
+	tl_free(&s);
+	tl_free(&w);
+	pump(2);
+	CHECK(count_fds() == before);
+}
+
+/* S7: a mutation sweep over the new records, decoded by every role; whatever is accepted re-encodes identically. */
+static void test_s7_sweep(void)
+{
+	static const enum aworker_ipc_role roles[] = { AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ROLE_SUPERVISOR,
+						       AWORKER_IPC_ROLE_CLIENT };
+	struct aworker_ipc_cs7_info cs7 = s_cs7();
+	static struct rec seeds[16];
+	unsigned int n = 0, i, accepted = 0, rejected = 0, mismatch = 0;
+	struct msgb *msg;
+	size_t blocks;
+
+#define SEED(expr) do { CHECK((expr) == 0); rec_from(&seeds[n++], msg); } while (0)
+	SEED(aworker_ipc_enc_state(ctx, &msg, 7, AWORKER_IPC_ATT_ATTACHED, AWORKER_IPC_SC_ATTACH_OK, 0));
+	SEED(aworker_ipc_enc_session_open(ctx, &msg, 1, 600));
+	SEED(aworker_ipc_enc_session_accept(ctx, &msg, 7, 99, 2));
+	SEED(aworker_ipc_enc_session_reject(ctx, &msg, AWORKER_IPC_REJ_BUSY, "busy: session 6 is CLOSING"));
+	SEED(aworker_ipc_enc_session_close(ctx, &msg, AWORKER_IPC_CC_NORMAL));
+	SEED(aworker_ipc_enc_worker_up(ctx, &msg, 0, 1, 7, &cs7));
+	SEED(aworker_ipc_enc_worker_down(ctx, &msg, 0, AWORKER_IPC_DOWN_DETACHED, 1, 7));
+	SEED(aworker_ipc_enc_worker_state(ctx, &msg, 0, 5, 0, 1, 7));
+	SEED(aworker_ipc_enc_op_request(ctx, &msg, AWORKER_IPC_OP_FENCE_SESSION, 0));
+	SEED(aworker_ipc_enc_op_result(ctx, &msg, AWORKER_IPC_OP_STATUS, 0, "session 7 ACTIVE\nworker 0 READY\n"));
+#undef SEED
+
+	printf("S7: mutation sweep of the session records\n");
+	blocks = talloc_total_blocks(ctx);
+	for (i = 0; i < 100000; i++) {
+		struct rec r = seeds[lcg() % n];
+		unsigned int nmut = 1 + lcg() % 3, k;
+		struct aworker_ipc_msg m;
+
+		for (k = 0; k < nmut; k++) {
+			uint32_t pos = lcg() % r.len;
+			switch (lcg() % 4) {
+			case 0: r.b[pos] ^= 1 << (lcg() % 8); break;
+			case 1: r.b[pos] = lcg(); break;
+			case 2: r.b[pos] = 0; break;
+			case 3: r.b[pos] += 1; break;
+			}
+		}
+		if (lcg() % 8 == 0)
+			r.len = OSMO_MIN(r.len + (lcg() % 5), sizeof(r.b)) - (lcg() % 5);
+		if (aworker_ipc_dec(&m, r.b, r.len, roles[lcg() % ARRAY_SIZE(roles)]) != 0) {
+			rejected++;
+			continue;
+		}
+		accepted++;
+		if (m.type == AWORKER_IPC_MT_HELLO && m.u.hello.minor != AWORKER_IPC_VERSION_MINOR)
+			continue;
+		if (reencode(&m, &msg) != 0) {
+			mismatch++;
+			continue;
+		}
+		if (msgb_length(msg) != r.len || memcmp(msgb_data(msg), r.b, r.len))
+			mismatch++;
+		msgb_free(msg);
+	}
+	printf("  100000 mutated records: %u accepted, %u rejected, %u not canonical\n", accepted, rejected, mismatch);
+	CHECK(mismatch == 0);
+	CHECK(accepted > 1000);
+	CHECK(talloc_total_blocks(ctx) == blocks);
+}
+
 int main(int argc, char **argv)
 {
 	size_t blocks;
@@ -2477,6 +2859,9 @@ int main(int argc, char **argv)
 	test_v1_v6_version_identity();
 	test_k1_k4_classes();
 	test_f1_f6_fd_passing();
+	test_s1_s7_session();
+	test_s5_s6_session_link();
+	test_s7_sweep();
 
 	printf("talloc blocks at the end: %s\n", talloc_total_blocks(ctx) == blocks ? "unchanged" : "LEAK");
 	CHECK(talloc_total_blocks(ctx) == blocks);

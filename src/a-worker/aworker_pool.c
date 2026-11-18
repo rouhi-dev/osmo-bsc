@@ -79,6 +79,8 @@ static struct aworker_pool_cfg g_cfg = {
 
 static struct aworker_pool *g_pool;
 
+osmo_static_assert(AWORKER_ST_FAILED == AWORKER_IPC_POOL_STATE_MAX, aworker_ipc_pool_state_max);
+
 /* Set when the pool asked osmo-bsc to shut down because a worker could not be kept running. Outlives the pool. */
 static bool g_fatal;
 

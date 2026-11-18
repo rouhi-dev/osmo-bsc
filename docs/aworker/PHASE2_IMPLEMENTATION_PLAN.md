@@ -11,9 +11,9 @@ below). Baseline: `a-worker-pool` at `e54578f2c` (Phase 1).
 > S1 is closed and accepted (uncommitted on `fa01448ea`). The S2-0 review (§14) records the approved decisions, the
 > implementation subphases S2-1 … S2-8 and their mapping to the phases of §13.
 >
-> **Status (2026-11-18):** S1 and S2-1 are closed and accepted; S2-2 steps 1–10 are done: implemented, documented
-> (step 9) and finally verified (step 10, §14.5); acceptance by the project owner is pending.
-> S2-3 … S2-8 have not started. The executable name is `bsc-aworker` (decision B3).
+> **Status (2026-11-18):** S1, S2-1 and S2-2 are closed and accepted (S2-2 record: §14.5). S2-3, the standalone
+> Supervisor `bsc-aworker`, is implemented and verified (§14.6); S2-4 … S2-8 have not started. The executable name is
+> `bsc-aworker` (decision B3).
 
 ## 0. Approved decisions this plan implements
 
@@ -550,12 +550,14 @@ default is now 60 s; an explicit `startup-timeout` still replaces it. The manual
   role only, SUP §4.1). Limitations carried into S2-2 and resolved there: the C8 hook needed a real-binary test (R-2),
   `show startup-config` in inline mode (D-8), and the missing official transcript runner (D-10).
 * **S2-2** (single read, worker snapshots, legacy mode): steps 1–8 implemented and verified, step 9 documentation
-  (`b48979738`), step 10 final verification passed; record and results in §14.5.
+  (`b48979738`), step 10 final verification passed (`9412b2f15`); accepted. Record and results in §14.5.
+* **S2-3** (standalone `bsc-aworker`): stages 1–5 implemented, verified and committed one by one; record in §14.6.
 * **Commits:** `15c749359` "aworker: implement shared config and worker snapshots" (S1, S2-1 and S2-2 steps 1–6),
   `5f4483f0c` "aworker: integrate snapshots with pool workers" (step 7), `b4d890241` "aworker: record the config path
   in inline mode (D-8)" (step 8). The first one combines several subphases, against the "one change per commit" rule of
   §13.1, by the project owner's decision: they share files and dependencies, and a split commit would not build.
-  Pushed to `origin` on 2026-11-17 (`e54578f2c..b4d890241`, together with the 2a-1 … 2a-5 commits).
+  Pushed to `origin` on 2026-11-17 (`e54578f2c..b4d890241`, together with the 2a-1 … 2a-5 commits). The later commits
+  (S2-2 steps 9–10, S2-3) are local, not pushed.
 
 ## 13. Revised plan: standalone Supervisor (S1 closed; S2 in progress, see §12 and §14)
 
@@ -807,8 +809,8 @@ not "do not merge".
 * **Existing tests:** P1–P20 (file form, unchanged argv), T1–T11, legacy E2E (file form).
 * **Acceptance:** both legacy forms pass E2E; no file access by an inline-form worker (verified, e.g. by moving the
   file away after start).
-* **Status:** all ten steps of the approved sequence done; the final verification (step 10) passed; acceptance by the
-  project owner pending. Decisions, tests, results and limitations: §14.5.
+* **Status:** all ten steps of the approved sequence done; the final verification (step 10) passed; accepted.
+  Decisions, tests, results and limitations: §14.5.
 
 #### S2-3: standalone `bsc-aworker` (no sessions)
 
@@ -841,6 +843,8 @@ not "do not merge".
   worker role reuses the S2-2 contract `--aworker-fd`, `--aworker-index`, `--aworker-snapshot-fd` with strict
   validation (index 0–15 as digits), hidden from `bsc-aworker`'s public help; identity prefixes only in the new
   executable. S2-3 starts only after S2-2 is accepted (its final verification, step 10, has passed) and S2-3 is authorized.
+* **Status:** implemented and verified (stages 1–5 and a final verification); record, tests, results and
+  limitations: §14.6.
 
 #### S2-4: IPC v2 and fd-passing primitives
 
@@ -944,7 +948,7 @@ not "do not merge".
 | **CD-1** | Exact contents of the canonical configuration document (D-S5 contents; D-S3/D-S4 detail) | proposal SUP §4.6 (H/P/C); C is syntactic, not effective (see SUP §4.6 note) | **S2-5** | explicit values; effective defaults (explicit in P; how defaults of cs7 commands are represented in C); normalized ordering and representation; per-worker cs7 and transport configuration; pool and Supervisor settings; treatment of semantically identical but differently formatted or spelled configurations. Raw-file comparison is **not** acceptable. |
 | **D-S12** | Session ECHO keys and values | keys proposed, values open | **S2-5** (keys and initial values); values confirmed by S2-8 measurements | interval and miss threshold; state transitions per SUP §9.2 |
 | **N5** | Session/operator socket security | open | **S2-5** | socket directory and file ownership and mode; peer authorization (`SO_PEERCRED` uid/gid policy, session vs operator role); stale socket handling (only after acquiring the lock, never while another Supervisor holds it); lock semantics (`flock` exclusive non-blocking on a lock file for the Supervisor's lifetime; path); rejection of unauthorized local clients before any processing; abstract-namespace sockets excluded or justified. umask alone is **not** a sufficient policy. |
-| D-S10 | Logging | **resolved by B2** (SUP §7), with limitations | — (remaining work in **S2-3**) | durable concurrent shared-file regression test; `wq` mode unverified, no claim made |
+| D-S10 | Logging | **resolved by B2** (SUP §7), with limitations; the durable test exists since S2-3 (`tests/aworker_logfile`) | — | `wq` mode unverified, no claim made |
 | D-S3 | Config mismatch → BSC exits | approved direction, detail proposed | S2-7 (behaviour); CD-1 first | — |
 | D-S9 | Detach release timeout | **unresolved** | S2-6 sign-off | §13.4 measurements |
 | D-S7 | Supervisor TCP port | deferred | only if a TCP interface is ever added | — |
@@ -1041,3 +1045,44 @@ its workers); `real_s22.py` 72/72 normal, 73/73 ASan; E2E legacy 46/46, inline 4
 * 2026-11-17 16:57 and overnight: host reboots. `/tmp` is emptied at boot (tmpfiles rule), so the 641 preserved
   `/tmp/aworker_*` test directories were lost (not recoverable); the interrupted step-10 mutation run left one mutant
   in the worktree, restored from the driver's on-disk copy (identical to the commit) before resuming.
+
+### 14.6 S2-3 implementation record (standalone Supervisor `bsc-aworker`)
+
+**Scope as implemented:** the approved S2-3 objective (§14.3) with decisions B1–B5 (§14.2): the program `bsc-aworker`
+runs the pool on its own, from `osmo-bsc.cfg`, with no BSC attached and controlled by signals only. Not in S2-3, and not
+implemented: sessions and fd passing (S2-4, S2-5), the operator channel and its socket security (S2-5, N5), the
+detached worker (S2-6), the BSC session client and supervisor mode in osmo-bsc (S2-7).
+
+**Stages** (each verified with normal and ASan/UBSan builds, all suites, and a mutation run of its own, then committed):
+
+| Stage | Content | Commit | Mutations (caught / run) |
+|---|---|---|---|
+| 1 | N4: the SCCP-user API moved unchanged to `aworker_sccp_user.h`; `aworker_pool.h` and `libaworker` without `bsc_sccp_backend.h`; no behaviour change (all outputs, osmo-bsc `--help` and `--vty-ref-xml` byte-identical) | `2cd86852c` | — (no behaviour) |
+| — | test fix: P21 first collects orphans of earlier tests (an ASan-only race, 1 in 8 runs; 20/20 afterwards) | `f1c98eb23` | — |
+| 2 | `aworker_pool_supervisor_read_config()`: single read; `a-worker-pool` with ≥ 1 worker, every worker inline (D-S1); the Supervisor view only (log targets, `a-worker-pool`); no `on-worker-failure shutdown` (D-S8); new test `tests/aworker_supervisor` | `f04ce1041` | 10/10 |
+| 3 | `bsc-aworker` (`aworker_main.c`): Supervisor role (pool, signals, no server, exit codes 0/1/2) and the hidden worker role (B4); linked against `libaworker` and the Osmocom libraries only; new real-binary test `aworker_supervisor_proc_test` | `8dd320179` | 14/15 (A8 equivalent: the pool's `atexit()` handler stops it) |
+| 4 | D-S10/B5: identity prefixes and the program name in `bsc-aworker` only (`--aworker-incarnation`, Supervisor only); FAILED message without the VTY reset hint in the Supervisor; durable shared-file test `tests/aworker_logfile` | `8728fb0d5` | 11/11 |
+| 5 | documentation (this record, SUP status and as-implemented notes) | (this revision) | — |
+
+**Tests** (`make check`, 22 tests): `aworker_supervisor` (configuration rules, each in a child process),
+`aworker_supervisor_proc_test` (the real binary: options and worker-role options, configuration errors, workers READY
+as children running the Supervisor's own image with only their snapshot option, the Supervisor holding the two sealed
+snapshots and no network socket, restart from the original snapshot after the file was moved and replaced -- inotify:
+never reopened --, restart limit and FAILED, SIGTERM with GOODBYE and exit 0, SIGKILL of the Supervisor ending its
+workers, the executable replaced on disk, identity prefixes, the `log file` target kept by the Supervisor and not
+opened by the workers), `aworker_logfile` (D-S10). Linkage: no BSC symbol defined; every undefined symbol resolves in
+libosmocore, libosmovty, libosmo-sigtran, talloc or libc. Regression: P1–P30, T1–T12 and every golden unchanged;
+osmo-bsc `--help`, `--vty-ref-xml` and its real-binary checks (`real_s22.py`) unchanged.
+
+**Known limitations:**
+* No BSC attaches yet: osmo-bsc and `bsc-aworker` must not run the same inline pool at the same time (SUP status
+  note); the workers leave SSN 254 unbound.
+* No reset or status command in the Supervisor before the operator channel (S2-5); a FAILED worker needs a restart of
+  `bsc-aworker`. Control is by signals only.
+* The per-start startup timeout is not exercised with the real binary (a real worker becomes READY right after its
+  parse; it cannot be held in STARTING without a test seam). The same library code is tested by P12, P17–P20.
+* `--aworker-incarnation` extends the B4 worker-role contract (internal, `bsc-aworker` only, strictly validated); the
+  B4 options themselves are unchanged.
+* osmo-bsc's `logging filter imsi` is accepted by `bsc-aworker` without effect.
+* `wq` log mode untested (B2); packaging, systemd units and installation layout are out of scope (SUP §15).
+* The file-form deprecation notice (SUP §4.5) is still not implemented (legacy mode, not S2-3).

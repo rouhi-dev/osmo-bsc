@@ -17,10 +17,10 @@ Status: **proposal for review**. Nothing in this document is implemented. Phase 
 > Supervisor does. §17 is superseded as noted there. The models, recovery questions, scheduling, connection-loss
 > analysis and the 2b–2e designs remain valid.
 >
-> **Status (2026-11-18, after S2-2 step 10):** S1, S2-1 and S2-2 (all ten steps) are implemented and verified: the inline form and worker
-> configuration snapshots work in legacy mode, with osmo-bsc still the workers' parent. The Supervisor executable
-> `bsc-aworker` and supervisor mode are not implemented yet (S2-3 onwards). Record: `PHASE2_IMPLEMENTATION_PLAN.md`
-> §12 and §14.5.
+> **Status (2026-11-18, after S2-3):** S1, S2-1 and S2-2 are accepted: the inline form and worker configuration
+> snapshots work in legacy mode, with osmo-bsc the workers' parent. S2-3 adds the standalone Supervisor `bsc-aworker`,
+> which runs the pool on its own, without osmo-bsc; no BSC attaches to it yet (sessions: S2-4 onwards). Record:
+> `PHASE2_IMPLEMENTATION_PLAN.md` §12, §14.5 and §14.6.
 
 Baseline inspected:
 

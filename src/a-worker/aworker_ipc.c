@@ -122,6 +122,8 @@ static const struct value_string msg_type_names[] = {
 	{ AWORKER_IPC_MT_ECHO_REQ, "ECHO_REQ" },
 	{ AWORKER_IPC_MT_ECHO_RSP, "ECHO_RSP" },
 	{ AWORKER_IPC_MT_GOODBYE, "GOODBYE" },
+	{ AWORKER_IPC_MT_ATTACH, "ATTACH" },
+	{ AWORKER_IPC_MT_DETACH, "DETACH" },
 	{ AWORKER_IPC_MT_CS7_INFO, "CS7_INFO" },
 	{ AWORKER_IPC_MT_USER_BIND, "USER_BIND" },
 	{ AWORKER_IPC_MT_USER_UNBIND, "USER_UNBIND" },
@@ -155,6 +157,8 @@ static bool type_known(uint8_t t, int *receiver)
 	case AWORKER_IPC_MT_GOODBYE:
 		*receiver = 0;
 		return true;
+	case AWORKER_IPC_MT_ATTACH:
+	case AWORKER_IPC_MT_DETACH:
 	case AWORKER_IPC_MT_USER_BIND:
 	case AWORKER_IPC_MT_USER_UNBIND:
 	case AWORKER_IPC_MT_TX_UNITDATA:
@@ -180,7 +184,8 @@ static bool type_known(uint8_t t, int *receiver)
 static bool type_has_no_user_ref(uint8_t t)
 {
 	return t == AWORKER_IPC_MT_HELLO || t == AWORKER_IPC_MT_ECHO_REQ || t == AWORKER_IPC_MT_ECHO_RSP
-	       || t == AWORKER_IPC_MT_GOODBYE || t == AWORKER_IPC_MT_CS7_INFO;
+	       || t == AWORKER_IPC_MT_GOODBYE || t == AWORKER_IPC_MT_CS7_INFO || t == AWORKER_IPC_MT_ATTACH
+	       || t == AWORKER_IPC_MT_DETACH;
 }
 
 static bool type_is_tx(uint8_t t)
@@ -197,6 +202,8 @@ unsigned int aworker_ipc_msg_class(uint8_t msg_type)
 		return AWORKER_IPC_CLASS_LINK;
 	case AWORKER_IPC_MT_GOODBYE:
 	case AWORKER_IPC_MT_CS7_INFO:
+	case AWORKER_IPC_MT_ATTACH:
+	case AWORKER_IPC_MT_DETACH:
 		return AWORKER_IPC_CLASS_CONTROL;
 	case AWORKER_IPC_MT_USER_BIND:
 	case AWORKER_IPC_MT_USER_UNBIND:
@@ -212,6 +219,11 @@ unsigned int aworker_ipc_msg_class(uint8_t msg_type)
 	default:
 		return 0;
 	}
+}
+
+unsigned int aworker_ipc_msg_fds(uint8_t msg_type)
+{
+	return msg_type == AWORKER_IPC_MT_ATTACH ? 1 : 0;
 }
 
 const char *aworker_ipc_class_name(unsigned int cls)
@@ -545,6 +557,33 @@ int aworker_ipc_enc_hello_id(void *ctx, struct msgb **out, enum aworker_ipc_role
 	put_u32(msg, (uint32_t)id->boot_nonce);
 	put_u32(msg, id->incarnation);
 	put_u32(msg, id->session_id);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_attach(void *ctx, struct msgb **out, uint32_t session_id, uint32_t incarnation)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (!session_id || !incarnation)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_ATTACH, 0)))
+		return -ENOMEM;
+	put_u32(msg, session_id);
+	put_u32(msg, incarnation);
+	return frame_end(msg, out);
+}
+
+int aworker_ipc_enc_detach(void *ctx, struct msgb **out, uint32_t session_id)
+{
+	struct msgb *msg;
+
+	*out = NULL;
+	if (!session_id)
+		return -EINVAL;
+	if (!(msg = frame_start(ctx, AWORKER_IPC_MT_DETACH, 0)))
+		return -ENOMEM;
+	put_u32(msg, session_id);
 	return frame_end(msg, out);
 }
 
@@ -1153,6 +1192,17 @@ static void dec_body(struct rd *r, struct aworker_ipc_msg *m)
 	case AWORKER_IPC_MT_ECHO_RSP:
 		m->u.echo_token = get_u32(r);
 		break;
+	case AWORKER_IPC_MT_ATTACH:
+		m->u.attach.session_id = get_u32(r);
+		m->u.attach.incarnation = get_u32(r);
+		if (!r->err && (!m->u.attach.session_id || !m->u.attach.incarnation))
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
+	case AWORKER_IPC_MT_DETACH:
+		m->u.detach.session_id = get_u32(r);
+		if (!r->err && !m->u.detach.session_id)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
+		break;
 	case AWORKER_IPC_MT_GOODBYE:
 		m->u.goodbye_reason = get_u8(r);
 		if (!r->err && m->u.goodbye_reason != AWORKER_IPC_GOODBYE_SHUTDOWN)
@@ -1257,6 +1307,7 @@ int aworker_ipc_dec(struct aworker_ipc_msg *out, const uint8_t *buf, size_t len,
 	int dir;
 
 	memset(out, 0, sizeof(*out));
+	out->fd = -1;
 	if (len < AWORKER_IPC_HDR_LEN)
 		return -AWORKER_IPC_ERR_FRAME_TOO_SHORT;
 	if (len > AWORKER_IPC_MAX_FRAME)
@@ -1287,6 +1338,7 @@ int aworker_ipc_dec(struct aworker_ipc_msg *out, const uint8_t *buf, size_t len,
 	if (r.err) {
 		int err = r.err;
 		memset(out, 0, sizeof(*out));
+		out->fd = -1;
 		return -err;
 	}
 	return 0;

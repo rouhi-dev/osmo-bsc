@@ -49,6 +49,20 @@
  * Delivery accounting: aworker_ipc_link_send() returns the record's sequence number; the closed_cb info reports
  * the highest sequence number that the kernel fully accepted (last_written_seq). Records with a higher sequence
  * number never left this process.
+ *
+ * DESCRIPTORS (since 2.0; SCM_RIGHTS on this link; at most one per record, aworker_ipc_msg_fds() of its type):
+ * Sending (aworker_ipc_link_send_fd()): the link takes the descriptor over in every case. osmo_io copies only its
+ * number when the record is queued, and the kernel duplicates it only when the record is actually sent, so the link
+ * keeps it open until the record's send completed, then closes it; if the record is discarded instead -- the link
+ * closes or is freed with it still queued, or it could not be queued -- the link closes it then. A record of a type
+ * that takes a descriptor cannot be sent without one (aworker_ipc_link_send() refuses it), and vice versa.
+ * Receiving (only with cfg->fd_passing; a link without it has no control buffer, so a descriptor sent to it makes
+ * the kernel report MSG_CTRUNC): every received descriptor is made close-on-exec at once (osmo_io cannot pass
+ * MSG_CMSG_CLOEXEC). MSG_CTRUNC, a control message other than SCM_RIGHTS, or a descriptor count that is not exactly
+ * that of the record's type closes every received descriptor, then the link (AWORKER_IPC_CLOSE_RX_FD); so does every
+ * other receive error of a record that came with descriptors. A record's descriptor is handed to rx_cb in msg->fd;
+ * rx_cb takes it with aworker_ipc_link_take_fd(), otherwise the link closes it when rx_cb returns. Every received
+ * descriptor thus has exactly one owner, or is closed.
  */
 
 #include <stdint.h>
@@ -81,6 +95,8 @@ enum aworker_ipc_close_reason {
 	AWORKER_IPC_CLOSE_TX_QUEUE_FULL,	/*!< transmit queue full */
 	AWORKER_IPC_CLOSE_NO_MEMORY,		/*!< allocation failure */
 	AWORKER_IPC_CLOSE_CLASS,		/*!< a record of a class this link does not carry; err = msg type */
+	AWORKER_IPC_CLOSE_RX_FD,		/*!< descriptors received wrongly: err = -EMSGSIZE (MSG_CTRUNC),
+						 *   -EPROTO (not SCM_RIGHTS), or the number received */
 };
 
 const char *aworker_ipc_close_reason_name(enum aworker_ipc_close_reason reason);
@@ -108,6 +124,7 @@ struct aworker_ipc_link_cfg {
 	const char *ident;		/*!< sent in HELLO, informational (<= 64 printable ASCII characters) */
 	struct aworker_ipc_identity id;	/*!< sent in HELLO; checked against the peer's (0 fields: not asserted) */
 	unsigned int classes;		/*!< enum aworker_ipc_class set besides LINK; 0: CONTROL | DATA */
+	bool fd_passing;		/*!< receive descriptors (a control buffer for one per record) */
 	unsigned int txqueue_max;	/*!< 0: default (1024 records) */
 	int log_cat;			/*!< logging category */
 };
@@ -124,6 +141,12 @@ struct aworker_ipc_link_stats {
 int aworker_ipc_link_alloc(struct aworker_ipc_link **out, void *ctx, int fd, const struct aworker_ipc_link_cfg *cfg,
 			   const struct aworker_ipc_link_ops *ops, void *priv);
 int aworker_ipc_link_send(struct aworker_ipc_link *link, struct msgb *msg, uint32_t *seq);
+/*! Send a record of a type that carries a descriptor (ATTACH), with \a fd. Takes ownership of msg AND fd in every
+ * case (fd is closed on every failure). \returns 0, or as aworker_ipc_link_send(); -EBADF if fd is not open. */
+int aworker_ipc_link_send_fd(struct aworker_ipc_link *link, struct msgb *msg, int fd, uint32_t *seq);
+/*! In rx_cb only: take the descriptor received with the current record (msg->fd). \returns it, or -1 if there is none
+ * or it was taken already. The caller owns it from then on. */
+int aworker_ipc_link_take_fd(struct aworker_ipc_link *link);
 void aworker_ipc_link_close(struct aworker_ipc_link *link);
 void aworker_ipc_link_free(struct aworker_ipc_link *link);
 

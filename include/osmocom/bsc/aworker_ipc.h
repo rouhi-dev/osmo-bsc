@@ -61,6 +61,9 @@
  *                     means "not asserted" (see aworker_ipc_link.h for how a link compares them).
  *   ECHO_REQ/RSP   B  token u32
  *   GOODBYE        B  reason u8 (enum aworker_ipc_goodbye_reason)
+ *   ATTACH         M  session_id u32 (!= 0) | incarnation u32 (!= 0); since 2.0; carries ONE descriptor (the worker's
+ *                     end of a data link), passed with SCM_RIGHTS (see aworker_ipc_link.h)
+ *   DETACH         M  session_id u32 (!= 0); since 2.0
  *   CS7_INFO       W  count u8 (1..8) | count * { cs7_id u32 | primary_pc u32 (<= 0xffffff) |
  *                     asp_proto u8 (1..3, enum osmo_ss7_asp_protocol) | num_as u8 (>= 1, Application Servers on
  *                     that instance) | reserved u8[2] = 0 }
@@ -80,10 +83,13 @@
  * Classes (since 2.0; aworker_ipc_msg_class()). Every message type belongs to exactly one class, and a link carries
  * a configured set of classes (aworker_ipc_link.h); a record of another class closes it:
  *   LINK     HELLO, ECHO_REQ, ECHO_RSP: every link
- *   CONTROL  GOODBYE, CS7_INFO: Supervisor (or osmo-bsc's pool) <-> worker
+ *   CONTROL  GOODBYE, CS7_INFO, ATTACH, DETACH: Supervisor (or osmo-bsc's pool) <-> worker
  *   DATA     USER_BIND, USER_UNBIND, USER_BIND_RESULT, TX_*, SCU_UP, TX_FAILED: BSC <-> worker
  *   SESSION  (no message yet): BSC or operator <-> Supervisor
  * The worker link of osmo-bsc's pool and of bsc-aworker carries CONTROL and DATA (the default).
+ *
+ * Descriptors (since 2.0; aworker_ipc_msg_fds()): ATTACH takes exactly one, every other type none. ATTACH and DETACH
+ * are defined here (S2-4); sessions, which send them, come later (S2-5).
  *
  * SCU_UP parameters, per allowed (primitive, operation); every field of the osmo_scu_*_param struct:
  *   N-CONNECT.ind/.cnf  called ADDR | calling ADDR | responding ADDR | sccp_class u32 | importance u32 | conn_id u32
@@ -139,6 +145,8 @@ enum aworker_ipc_msg_type {
 	AWORKER_IPC_MT_ECHO_REQ = 0x02,
 	AWORKER_IPC_MT_ECHO_RSP = 0x03,
 	AWORKER_IPC_MT_GOODBYE = 0x04,
+	AWORKER_IPC_MT_ATTACH = 0x05,
+	AWORKER_IPC_MT_DETACH = 0x06,
 	AWORKER_IPC_MT_CS7_INFO = 0x08,
 	AWORKER_IPC_MT_USER_BIND = 0x10,
 	AWORKER_IPC_MT_USER_UNBIND = 0x11,
@@ -162,6 +170,8 @@ enum aworker_ipc_class {
 
 /*! The class of a message type; 0 for an unknown type. */
 unsigned int aworker_ipc_msg_class(uint8_t msg_type);
+/*! How many descriptors a record of this type carries (SCM_RIGHTS): 0 or 1. */
+unsigned int aworker_ipc_msg_fds(uint8_t msg_type);
 const char *aworker_ipc_class_name(unsigned int cls);
 
 enum aworker_ipc_goodbye_reason {
@@ -280,10 +290,20 @@ struct aworker_ipc_msg {
 	uint8_t type;			/*!< enum aworker_ipc_msg_type */
 	uint32_t seq;
 	uint32_t user_ref;
+	/*! The descriptor received with the record (aworker_ipc_msg_fds() of its type), -1 if none. aworker_ipc_dec()
+	 * sets -1; the link sets it, and owns it, see aworker_ipc_link_take_fd(). */
+	int fd;
 	union {
 		struct aworker_ipc_hello hello;
 		uint32_t echo_token;
 		uint8_t goodbye_reason;
+		struct {
+			uint32_t session_id;
+			uint32_t incarnation;
+		} attach;
+		struct {
+			uint32_t session_id;
+		} detach;
 		struct aworker_ipc_cs7_info cs7_info;
 		struct aworker_ipc_user_bind user_bind;
 		uint16_t bind_result;
@@ -339,6 +359,9 @@ int aworker_ipc_enc_hello_id(void *ctx, struct msgb **out, enum aworker_ipc_role
 			     uint32_t pid, const char *ident, const struct aworker_ipc_identity *id);
 int aworker_ipc_enc_echo(void *ctx, struct msgb **out, bool response, uint32_t token);
 int aworker_ipc_enc_goodbye(void *ctx, struct msgb **out, uint8_t reason);
+/*! ATTACH: the record only; its descriptor is passed with aworker_ipc_link_send_fd(). */
+int aworker_ipc_enc_attach(void *ctx, struct msgb **out, uint32_t session_id, uint32_t incarnation);
+int aworker_ipc_enc_detach(void *ctx, struct msgb **out, uint32_t session_id);
 int aworker_ipc_enc_cs7_info(void *ctx, struct msgb **out, const struct aworker_ipc_cs7_info *info);
 int aworker_ipc_enc_user_bind(void *ctx, struct msgb **out, uint32_t user_ref, uint32_t cs7_id, uint16_t ssn,
 			      const char *name);

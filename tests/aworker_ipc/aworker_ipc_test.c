@@ -22,6 +22,7 @@
  * otherwise forwards to the real one. This only works for the poll backend (io_uring does not call sendmsg()). */
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -31,7 +32,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <osmocom/core/application.h>
@@ -896,6 +899,12 @@ static int reencode(const struct aworker_ipc_msg *m, struct msgb **out)
 	case AWORKER_IPC_MT_GOODBYE:
 		rc = aworker_ipc_enc_goodbye(ctx, out, u->goodbye_reason);
 		break;
+	case AWORKER_IPC_MT_ATTACH:
+		rc = aworker_ipc_enc_attach(ctx, out, u->attach.session_id, u->attach.incarnation);
+		break;
+	case AWORKER_IPC_MT_DETACH:
+		rc = aworker_ipc_enc_detach(ctx, out, u->detach.session_id);
+		break;
 	case AWORKER_IPC_MT_USER_BIND:
 		rc = aworker_ipc_enc_user_bind(ctx, out, m->user_ref, u->user_bind.cs7_id, u->user_bind.ssn,
 					       u->user_bind.name);
@@ -1241,6 +1250,9 @@ struct tl {
 	bool free_in_rx;
 	bool close_in_rx;
 	bool free_in_closed;
+	bool take_fd;			/* rx_cb takes the record's descriptor (aworker_ipc_link_take_fd()) */
+	int taken_fd;			/* the descriptor taken, -1 */
+	int seen_fd;			/* msg->fd as rx_cb saw it */
 };
 
 static void tl_ready(struct aworker_ipc_link *link, const struct aworker_ipc_hello *peer)
@@ -1254,6 +1266,9 @@ static void tl_rx(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m
 	struct tl *t = aworker_ipc_link_get_priv(link);
 	t->rx++;
 	t->last = *msg;
+	t->seen_fd = msg->fd;
+	if (t->take_fd)
+		t->taken_fd = aworker_ipc_link_take_fd(link);
 	t->last_data_len = msg->data.len;
 	t->last_data0 = msg->data.len ? msg->data.buf[0] : 0;
 	if (msg->type == AWORKER_IPC_MT_TX_DATA && msg->data.len >= 4) {
@@ -1325,6 +1340,21 @@ static int tl_alloc_cls(struct tl *t, const char *name, int fd, enum aworker_ipc
 	t->name = name;
 	t->fd = fd;
 	t->order_ok = true;
+	return aworker_ipc_link_alloc(&t->link, ctx, fd, &cfg, &tl_ops, t);
+}
+
+static int tl_alloc_fdp(struct tl *t, const char *name, int fd, enum aworker_ipc_role role, bool fd_passing)
+{
+	struct aworker_ipc_link_cfg cfg = {
+		.role = role, .worker_idx = 1, .pid = 1000 + role, .ident = "test", .log_cat = DLGLOBAL,
+		.fd_passing = fd_passing,
+	};
+	memset(t, 0, sizeof(*t));
+	t->name = name;
+	t->fd = fd;
+	t->order_ok = true;
+	t->taken_fd = -1;
+	t->seen_fd = -1;
 	return aworker_ipc_link_alloc(&t->link, ctx, fd, &cfg, &tl_ops, t);
 }
 
@@ -2010,6 +2040,7 @@ static void test_k1_k4_classes(void)
 {
 	static const uint8_t types[] = {
 		AWORKER_IPC_MT_HELLO, AWORKER_IPC_MT_ECHO_REQ, AWORKER_IPC_MT_ECHO_RSP, AWORKER_IPC_MT_GOODBYE,
+		AWORKER_IPC_MT_ATTACH, AWORKER_IPC_MT_DETACH,
 		AWORKER_IPC_MT_CS7_INFO, AWORKER_IPC_MT_USER_BIND, AWORKER_IPC_MT_USER_UNBIND,
 		AWORKER_IPC_MT_USER_BIND_RESULT, AWORKER_IPC_MT_TX_UNITDATA, AWORKER_IPC_MT_TX_CONN_REQ,
 		AWORKER_IPC_MT_TX_CONN_RESP, AWORKER_IPC_MT_TX_DATA, AWORKER_IPC_MT_TX_DISCONN, AWORKER_IPC_MT_SCU_UP,
@@ -2035,7 +2066,7 @@ static void test_k1_k4_classes(void)
 		CHECK(known == (aworker_ipc_msg_class(t) != 0));
 	}
 	CHECK(n_known == ARRAY_SIZE(types));
-	printf("  K1 %u known types, each in exactly one class; the 241 other values in none\n", n_known);
+	printf("  K1 %u known types, each in exactly one class; the %u other values in none\n", n_known, 256 - n_known);
 
 	/* K2: a DATA-only main side: sending a CONTROL record is refused, the link stays up; receiving one closes it */
 	cls_pair(&m, &w, AWORKER_IPC_CLASS_DATA, 0);
@@ -2088,6 +2119,331 @@ static void test_k1_k4_classes(void)
 	CHECK(talloc_total_blocks(ctx) == blocks);
 }
 
+/***********************************************************************
+ * F1-F6: descriptors passed with SCM_RIGHTS (ATTACH)
+ ***********************************************************************/
+
+/* Open descriptors of this process (both ends of every test link are here, so any leak shows). */
+static unsigned int count_fds(void)
+{
+	struct dirent *de;
+	unsigned int n = 0;
+	DIR *d = opendir("/proc/self/fd");
+
+	OSMO_ASSERT(d);
+	while ((de = readdir(d)))
+		n += de->d_name[0] != '.';
+	closedir(d);
+	return n - 1;	/* the directory's own descriptor */
+}
+
+/* A memfd with known contents. */
+static int content_fd(const char *text)
+{
+	int fd = memfd_create("aworker-ipc-test", MFD_CLOEXEC);
+	OSMO_ASSERT(fd >= 0 && write(fd, text, strlen(text)) == (ssize_t)strlen(text));
+	return fd;
+}
+
+static bool same_file(int a, int b)
+{
+	struct stat sa, sb;
+	return !fstat(a, &sa) && !fstat(b, &sb) && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* Send a record with seq and these descriptors (n may be 0) as one SCM_RIGHTS control message, raw. */
+static void raw_send_fds(int sock, struct msgb *msg, uint32_t seq, const int *fds, unsigned int n)
+{
+	union {
+		char buf[CMSG_SPACE(4 * sizeof(int))];
+		struct cmsghdr align;
+	} cbuf;
+	struct iovec iov;
+	struct msghdr mh = {};
+
+	aworker_ipc_frame_set_seq(msgb_data(msg), seq);
+	iov.iov_base = msgb_data(msg);
+	iov.iov_len = msgb_length(msg);
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	if (n) {
+		struct cmsghdr *cm;
+		memset(&cbuf, 0, sizeof(cbuf));
+		mh.msg_control = cbuf.buf;
+		mh.msg_controllen = CMSG_SPACE(n * sizeof(int));
+		cm = CMSG_FIRSTHDR(&mh);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type = SCM_RIGHTS;
+		cm->cmsg_len = CMSG_LEN(n * sizeof(int));
+		memcpy(CMSG_DATA(cm), fds, n * sizeof(int));
+	}
+	OSMO_ASSERT(sendmsg(sock, &mh, 0) == (ssize_t)msgb_length(msg));
+	msgb_free(msg);
+}
+
+static struct msgb *attach_rec(void)
+{
+	struct msgb *msg;
+	OSMO_ASSERT(aworker_ipc_enc_attach(ctx, &msg, 5, 7) == 0);
+	return msg;
+}
+
+/* A worker link (fd_passing as given) against a raw main peer that sends HELLO (seq 1) and then inject(); the
+ * worker must close with reason/err, deliver nothing, and the process must hold exactly the descriptors it held
+ * before (every received one closed). */
+static void fd_raw_case(const char *what, bool fd_passing, bool hello_first, void (*inject)(int sock),
+			enum aworker_ipc_close_reason reason, int err)
+{
+	unsigned int before = count_fds();
+	size_t blocks = talloc_total_blocks(ctx);
+	struct tl w;
+	int sv[2];
+
+	mk_pair(sv);
+	CHECK(tl_alloc_fdp(&w, "worker", sv[1], AWORKER_IPC_ROLE_WORKER, fd_passing) == 0);
+	if (hello_first)
+		raw_send(sv[0], raw_hello(AWORKER_IPC_ROLE_MAIN, 1), 1);
+	inject(sv[0]);
+	PUMP_UNTIL(w.closed);
+	printf("  %s: %s, err %d; delivered %u\n", what, w.closed ? aworker_ipc_close_reason_name(w.ci.reason)
+	       : "NOT closed", w.ci.err, w.rx);
+	CHECK(w.closed == 1 && w.ci.reason == reason && w.ci.err == err && w.rx == 0);
+	tl_free(&w);
+	close(sv[0]);
+	pump(2);
+	CHECK(count_fds() == before);
+	CHECK(talloc_total_blocks(ctx) == blocks);
+}
+
+static void inj_attach_no_fd(int sock)
+{
+	raw_send_fds(sock, attach_rec(), 2, NULL, 0);
+}
+
+static void inj_goodbye_with_fd(int sock)
+{
+	struct msgb *msg;
+	int fd = content_fd("x");
+	OSMO_ASSERT(aworker_ipc_enc_goodbye(ctx, &msg, AWORKER_IPC_GOODBYE_SHUTDOWN) == 0);
+	raw_send_fds(sock, msg, 2, &fd, 1);
+	close(fd);
+}
+
+static void inj_attach_two_fds(int sock)
+{
+	int fds[2] = { content_fd("a"), content_fd("b") };
+	raw_send_fds(sock, attach_rec(), 2, fds, 2);
+	close(fds[0]);
+	close(fds[1]);
+}
+
+/* More than the control buffer holds (CMSG_SPACE(sizeof(int)) has room for two on LP64 through alignment). */
+static void inj_attach_three_fds(int sock)
+{
+	int fds[3] = { content_fd("a"), content_fd("b"), content_fd("c") };
+	raw_send_fds(sock, attach_rec(), 2, fds, 3);
+	close(fds[0]);
+	close(fds[1]);
+	close(fds[2]);
+}
+
+static void inj_attach_fd(int sock)
+{
+	int fd = content_fd("x");
+	raw_send_fds(sock, attach_rec(), 2, &fd, 1);
+	close(fd);
+}
+
+static void inj_bad_magic_with_fd(int sock)
+{
+	struct msgb *msg = attach_rec();
+	int fd = content_fd("x");
+	msgb_data(msg)[0] = 'X';
+	raw_send_fds(sock, msg, 2, &fd, 1);
+	close(fd);
+}
+
+static void inj_bad_seq_with_fd(int sock)
+{
+	int fd = content_fd("x");
+	raw_send_fds(sock, attach_rec(), 5, &fd, 1);
+	close(fd);
+}
+
+static void inj_attach_fd_as_first(int sock)
+{
+	int fd = content_fd("x");
+	raw_send_fds(sock, attach_rec(), 1, &fd, 1);
+	close(fd);
+}
+
+static void fd_pair(struct tl *m, struct tl *w, bool w_takes)
+{
+	int sv[2];
+
+	mk_pair(sv);
+	CHECK(tl_alloc_fdp(m, "main", sv[0], AWORKER_IPC_ROLE_MAIN, false) == 0);
+	CHECK(tl_alloc_fdp(w, "worker", sv[1], AWORKER_IPC_ROLE_WORKER, true) == 0);
+	w->take_fd = w_takes;
+	PUMP_UNTIL(m->ready && w->ready);
+	CHECK(m->ready && w->ready);
+}
+
+static void test_f1_f6_fd_passing(void)
+{
+	struct aworker_ipc_msg dm;
+	struct msgb *msg;
+	struct rec r;
+	struct tl m, w;
+	unsigned int before;
+	char buf[16];
+	int fd, keep, rc;
+
+	printf("F1-F6: descriptors passed with SCM_RIGHTS (ATTACH)\n");
+
+	/* F1: arrives intact; refers to the same open file; close-on-exec; the sender's copy closed once sent */
+	before = count_fds();
+	fd_pair(&m, &w, true);
+	fd = content_fd("hello-fd");
+	keep = dup(fd);
+	CHECK(aworker_ipc_link_send_fd(m.link, attach_rec(), fd, NULL) == 0);
+	PUMP_UNTIL(w.rx == 1);
+	pump(5);
+	CHECK(w.rx == 1 && w.last.type == AWORKER_IPC_MT_ATTACH && w.last.u.attach.session_id == 5
+	      && w.last.u.attach.incarnation == 7);
+	CHECK(w.taken_fd >= 0 && same_file(w.taken_fd, keep));
+	CHECK((fcntl(w.taken_fd, F_GETFD) & FD_CLOEXEC) != 0);
+	CHECK(pread(w.taken_fd, buf, 8, 0) == 8 && !memcmp(buf, "hello-fd", 8));
+	/* the links' 2 sockets, keep and the taken descriptor: the sender's copy is closed */
+	CHECK(count_fds() == before + 4);
+	printf("  F1 ATTACH with a memfd: the received descriptor is the same open file (same inode, contents),"
+	       " close-on-exec; the sender's copy is closed after the send\n");
+	close(w.taken_fd);
+	close(keep);
+
+	/* F2: rx_cb does not take it: the link closes it */
+	w.take_fd = false;
+	fd = content_fd("not taken");
+	CHECK(aworker_ipc_link_send_fd(m.link, attach_rec(), fd, NULL) == 0);
+	PUMP_UNTIL(w.rx == 2);
+	pump(5);
+	CHECK(w.rx == 2 && w.seen_fd >= 0 && fcntl(w.seen_fd, F_GETFD) < 0);
+	CHECK(count_fds() == before + 2);
+	printf("  F2 not taken by rx_cb: closed by the link when rx_cb returned\n");
+
+	/* F4: sender side refusals; every descriptor handed over is closed */
+	fd = content_fd("x");
+	CHECK(aworker_ipc_enc_goodbye(ctx, &msg, AWORKER_IPC_GOODBYE_SHUTDOWN) == 0);
+	CHECK(aworker_ipc_link_send_fd(m.link, msg, fd, NULL) == -EINVAL && fcntl(fd, F_GETFD) < 0);
+	CHECK(aworker_ipc_link_send(m.link, attach_rec(), NULL) == -EINVAL);
+	CHECK(aworker_ipc_link_send_fd(m.link, attach_rec(), 999, NULL) == -EBADF);
+	pump(5);
+	CHECK(!m.closed && !w.closed && w.rx == 2 && count_fds() == before + 2);
+	printf("  F4 GOODBYE with a descriptor, ATTACH without one: refused (-EINVAL), the descriptor closed, nothing"
+	       " sent, the link up; a descriptor that is not open: -EBADF\n");
+
+	/* F4: queued, then the link is freed before the record was written: the descriptor is closed */
+	fd = content_fd("queued");
+	CHECK(aworker_ipc_link_send_fd(m.link, attach_rec(), fd, NULL) == 0);
+	tl_free(&m);
+	CHECK(fcntl(fd, F_GETFD) < 0);
+	tl_free(&w);
+	pump(2);
+	CHECK(count_fds() == before);
+	printf("  F4 queued and the link freed before it was sent: the descriptor closed\n");
+
+	/* F4: queued, then the link is closed (not freed) before the record was written */
+	fd_pair(&m, &w, true);
+	fd = content_fd("queued, closed");
+	CHECK(aworker_ipc_link_send_fd(m.link, attach_rec(), fd, NULL) == 0);
+	aworker_ipc_link_close(m.link);
+	CHECK(fcntl(fd, F_GETFD) < 0);
+	pump(5);
+	CHECK(w.rx == 0);
+	tl_free(&m);
+	tl_free(&w);
+	pump(2);
+	CHECK(count_fds() == before);
+	printf("  F4 queued and the link closed before it was sent: the descriptor closed, nothing delivered\n");
+
+	/* F4: the transmit queue is full when a record with a descriptor is queued: closed with the link */
+	{
+		struct aworker_ipc_link_cfg mcfg = {
+			.role = AWORKER_IPC_ROLE_MAIN, .worker_idx = 1, .pid = 1, .ident = "test", .log_cat = DLGLOBAL,
+			.txqueue_max = 1,
+		};
+		int sv[2];
+
+		mk_pair(sv);
+		memset(&m, 0, sizeof(m));
+		m.name = "main";
+		m.fd = sv[0];
+		m.taken_fd = m.seen_fd = -1;
+		CHECK(aworker_ipc_link_alloc(&m.link, ctx, sv[0], &mcfg, &tl_ops, &m) == 0);
+		CHECK(tl_alloc_fdp(&w, "worker", sv[1], AWORKER_IPC_ROLE_WORKER, true) == 0);
+		PUMP_UNTIL(m.ready && w.ready);
+		CHECK(aworker_ipc_enc_detach(ctx, &msg, 5) == 0);
+		CHECK(aworker_ipc_link_send(m.link, msg, NULL) == 0);	/* fills the queue (not pumped) */
+		fd = content_fd("queue full");
+		CHECK(aworker_ipc_link_send_fd(m.link, attach_rec(), fd, NULL) == -ENOSPC);
+		CHECK(fcntl(fd, F_GETFD) < 0);
+		CHECK(m.closed == 1 && m.ci.reason == AWORKER_IPC_CLOSE_TX_QUEUE_FULL);
+		tl_free(&m);
+		tl_free(&w);
+		pump(2);
+		CHECK(count_fds() == before);
+		printf("  F4 the transmit queue full: -ENOSPC, the link closed, the descriptor closed\n");
+	}
+
+	/* F4: a closed link */
+	fd_pair(&m, &w, true);
+	aworker_ipc_link_close(m.link);
+	fd = content_fd("x");
+	CHECK(aworker_ipc_link_send_fd(m.link, attach_rec(), fd, NULL) == -ENOTCONN && fcntl(fd, F_GETFD) < 0);
+	tl_free(&m);
+	tl_free(&w);
+	pump(2);
+	CHECK(count_fds() == before);
+	printf("  F4 on a closed link: -ENOTCONN, the descriptor closed\n");
+
+	/* F3: every wrong receipt closes every received descriptor, then the link */
+	fd_raw_case("F3 ATTACH without its descriptor", true, true, inj_attach_no_fd, AWORKER_IPC_CLOSE_RX_FD, 0);
+	fd_raw_case("F3 GOODBYE with a descriptor", true, true, inj_goodbye_with_fd, AWORKER_IPC_CLOSE_RX_FD, 1);
+	fd_raw_case("F3 ATTACH with two descriptors", true, true, inj_attach_two_fds, AWORKER_IPC_CLOSE_RX_FD, 2);
+	fd_raw_case("F3 ATTACH with three descriptors (MSG_CTRUNC)", true, true, inj_attach_three_fds,
+		    AWORKER_IPC_CLOSE_RX_FD, -EMSGSIZE);
+	fd_raw_case("F3 ATTACH with a descriptor on a link without fd_passing (MSG_CTRUNC)", false, true, inj_attach_fd,
+		    AWORKER_IPC_CLOSE_RX_FD, -EMSGSIZE);
+	fd_raw_case("F3 malformed record with a descriptor", true, true, inj_bad_magic_with_fd,
+		    AWORKER_IPC_CLOSE_PROTOCOL, -AWORKER_IPC_ERR_BAD_MAGIC);
+	fd_raw_case("F3 ATTACH with a descriptor out of sequence", true, true, inj_bad_seq_with_fd,
+		    AWORKER_IPC_CLOSE_BAD_SEQ, 5);
+	fd_raw_case("F3 ATTACH with a descriptor before HELLO", true, false, inj_attach_fd_as_first,
+		    AWORKER_IPC_CLOSE_NO_HELLO, AWORKER_IPC_MT_ATTACH);
+
+	/* F5: ATTACH / DETACH codec */
+	CHECK(aworker_ipc_enc_attach(ctx, &msg, 0, 7) == -EINVAL && !msg);
+	CHECK(aworker_ipc_enc_attach(ctx, &msg, 5, 0) == -EINVAL && !msg);
+	CHECK(aworker_ipc_enc_detach(ctx, &msg, 0) == -EINVAL && !msg);
+	CHECK(aworker_ipc_enc_detach(ctx, &msg, 9) == 0);
+	rec_from(&r, msg);
+	rc = aworker_ipc_dec(&dm, r.b, r.len, AWORKER_IPC_ROLE_WORKER);
+	CHECK(rc == 0 && dm.type == AWORKER_IPC_MT_DETACH && dm.u.detach.session_id == 9 && dm.fd == -1);
+	expect("F5 DETACH to the main process", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_WRONG_DIRECTION);
+	rec_from(&r, attach_rec());
+	r.b[AWORKER_IPC_HDR_LEN + 3] = 0; r.b[AWORKER_IPC_HDR_LEN + 2] = 0;	/* session_id 5 -> 0 */
+	expect("F5 ATTACH with session 0", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_VALUE);
+	rec_from(&r, attach_rec());
+	r.b[15] = 1;
+	expect("F5 ATTACH with user_ref 1", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_USER_REF);
+	printf("  F5 ATTACH/DETACH: session and incarnation 0 refused; worker-bound only; user_ref 0\n");
+
+	/* F6: what takes a descriptor */
+	CHECK(aworker_ipc_msg_fds(AWORKER_IPC_MT_ATTACH) == 1 && aworker_ipc_msg_fds(AWORKER_IPC_MT_DETACH) == 0
+	      && aworker_ipc_msg_fds(AWORKER_IPC_MT_GOODBYE) == 0 && aworker_ipc_msg_fds(AWORKER_IPC_MT_HELLO) == 0);
+	printf("  F6 ATTACH takes one descriptor, every other type none\n");
+}
+
 int main(int argc, char **argv)
 {
 	size_t blocks;
@@ -2120,6 +2476,7 @@ int main(int argc, char **argv)
 	test_l14_l19_injection();
 	test_v1_v6_version_identity();
 	test_k1_k4_classes();
+	test_f1_f6_fd_passing();
 
 	printf("talloc blocks at the end: %s\n", talloc_total_blocks(ctx) == blocks ? "unchanged" : "LEAK");
 	CHECK(talloc_total_blocks(ctx) == blocks);

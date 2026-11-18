@@ -122,7 +122,7 @@ C5/C8/C9: malformed records
   GOODBYE reason 2: bad-value
   USER_BIND_RESULT 4: bad-value
 C6: mutation sweep
-  200000 mutated records: 38090 accepted (200 of them a HELLO of a higher minor version), 161910 rejected, 0 not canonical
+  200000 mutated records: 38102 accepted (200 of them a HELLO of a higher minor version), 161898 rejected, 0 not canonical
 C10: libosmo-sigtran per-operation data limits
   TX_UNITDATA: max 1139; 1139: 0, 1140: -EMSGSIZE
   TX_CONN_REQ: max 255; 255: 0, 256: -EMSGSIZE
@@ -262,6 +262,8 @@ K1-K4: message classes per channel
   K1 ECHO_REQ         link
   K1 ECHO_RSP         link
   K1 GOODBYE          control
+  K1 ATTACH           control
+  K1 DETACH           control
   K1 CS7_INFO         control
   K1 USER_BIND        data
   K1 USER_UNBIND      data
@@ -273,10 +275,31 @@ K1-K4: message classes per channel
   K1 TX_DISCONN       data
   K1 SCU_UP           data
   K1 TX_FAILED        data
-  K1 15 known types, each in exactly one class; the 241 other values in none
+  K1 17 known types, each in exactly one class; the 239 other values in none
   K2 data-only link: sending GOODBYE (control) refused, nothing sent, the link stays up
   K2 data-only link receiving CS7_INFO (control): closed (class), not delivered
   K3 control-only link receiving USER_BIND (data): closed (class), not delivered
   K4 default link: control and data both delivered; a session-only link still answers ECHO (link)
+F1-F6: descriptors passed with SCM_RIGHTS (ATTACH)
+  F1 ATTACH with a memfd: the received descriptor is the same open file (same inode, contents), close-on-exec; the sender's copy is closed after the send
+  F2 not taken by rx_cb: closed by the link when rx_cb returned
+  F4 GOODBYE with a descriptor, ATTACH without one: refused (-EINVAL), the descriptor closed, nothing sent, the link up; a descriptor that is not open: -EBADF
+  F4 queued and the link freed before it was sent: the descriptor closed
+  F4 queued and the link closed before it was sent: the descriptor closed, nothing delivered
+  F4 the transmit queue full: -ENOSPC, the link closed, the descriptor closed
+  F4 on a closed link: -ENOTCONN, the descriptor closed
+  F3 ATTACH without its descriptor: rx-fd, err 0; delivered 0
+  F3 GOODBYE with a descriptor: rx-fd, err 1; delivered 0
+  F3 ATTACH with two descriptors: rx-fd, err 2; delivered 0
+  F3 ATTACH with three descriptors (MSG_CTRUNC): rx-fd, err -90; delivered 0
+  F3 ATTACH with a descriptor on a link without fd_passing (MSG_CTRUNC): rx-fd, err -90; delivered 0
+  F3 malformed record with a descriptor: protocol, err -3; delivered 0
+  F3 ATTACH with a descriptor out of sequence: bad-seq, err 5; delivered 0
+  F3 ATTACH with a descriptor before HELLO: no-hello, err 5; delivered 0
+  F5 DETACH to the main process: wrong-direction
+  F5 ATTACH with session 0: bad-value
+  F5 ATTACH with user_ref 1: bad-user-ref
+  F5 ATTACH/DETACH: session and incarnation 0 refused; worker-bound only; user_ref 0
+  F6 ATTACH takes one descriptor, every other type none
 talloc blocks at the end: unchanged
 PASSED

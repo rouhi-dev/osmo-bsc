@@ -1115,10 +1115,11 @@ descriptor count; the ATTACH/DETACH codec). `tests/aworker_worker`: a worker ass
 main process is refused by both. Unchanged: P1–P30, T1–T12, `aworker_supervisor` tests and `real_s22.py`.
 
 **Known limitations:**
-* The legacy and inline E2E (`run_e2e.py`) were **not executed** for S2-4: an Osmocom lab running on the same host
-  (a separate tmux session, started 2026-11-18) holds the Abis and MSC ports the E2E topology needs, and is not
-  stopped by these tests. For the same reason the VTY transcripts (`vtyrun.py`: the test osmo-bsc cannot bind
-  0.0.0.0:3002) were not executed. Real osmo-bsc workers were exercised through `real_s22.py` (unchanged result).
+* The legacy and inline E2E (`run_e2e.py`) and the VTY transcripts (`vtyrun.py`) could not run on the host while an
+  Osmocom lab there held the same fixed ports on wildcard addresses (0.0.0.0:3002 …; a bind of 127.0.40.x to the
+  same port is refused then). They were run afterwards, unchanged, in a private network namespace
+  (`busybox unshare -r -n`, own loopback; the lab untouched) against the clean builds below: E2E legacy 46/46,
+  inline 49/49; VTY transcripts 5/5 on the normal and the ASan build, 0 sanitizer reports; results as in S2-3.
 * **Final verification** (clean `git archive` builds of `8ec333b34`, normal and ASan): `make check` 22/22 on both;
   every A-worker test run directly 3× on both builds, output identical to its golden, 0 sanitizer reports from any
   process; `real_s22.py` PASS on both (normal byte-identical to the S2-2 golden); `osmo-bsc --help` and

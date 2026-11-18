@@ -1117,7 +1117,13 @@ main process is refused by both. Unchanged: P1–P30, T1–T12, `aworker_supervi
 **Known limitations:**
 * The legacy and inline E2E (`run_e2e.py`) were **not executed** for S2-4: an Osmocom lab running on the same host
   (a separate tmux session, started 2026-11-18) holds the Abis and MSC ports the E2E topology needs, and is not
-  stopped by these tests. Real osmo-bsc workers were exercised through `real_s22.py` (unchanged result).
+  stopped by these tests. For the same reason the VTY transcripts (`vtyrun.py`: the test osmo-bsc cannot bind
+  0.0.0.0:3002) were not executed. Real osmo-bsc workers were exercised through `real_s22.py` (unchanged result).
+* **Final verification** (clean `git archive` builds of `8ec333b34`, normal and ASan): `make check` 22/22 on both;
+  every A-worker test run directly 3× on both builds, output identical to its golden, 0 sanitizer reports from any
+  process; `real_s22.py` PASS on both (normal byte-identical to the S2-2 golden); `osmo-bsc --help` and
+  `--vty-ref-xml` identical to S2-3; `bsc-aworker` links no BSC code; harness files and the old build directories
+  unchanged.
 * ATTACH and DETACH are defined but not sent or handled by the pool or the worker until S2-5; a worker receiving one
   today ignores it (the link closes an untaken descriptor).
 * The boot nonce is random per pool start of either program; osmo-bsc's workers assert no identity (legacy).

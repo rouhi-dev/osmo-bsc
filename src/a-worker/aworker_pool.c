@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/random.h>
 #include <limits.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -1140,6 +1141,8 @@ static int link_create(struct aworker *w, int fd)
 		.pid = (uint32_t)getpid(),
 		.ident = aworker_program_name,
 		.log_cat = aworker_log_cat,
+		/* This pool, and the start number of the process the link is for (starts counts it below). */
+		.id = { .boot_nonce = w->pool->boot_nonce, .incarnation = w->starts + 1 },
 	};
 	int rc;
 
@@ -1567,6 +1570,11 @@ static struct aworker_pool *pool_alloc(void *ctx, unsigned int num)
 	}
 	pool->num = num;
 	pool->next_user_ref = 1;
+	/* The pool's identity in the IPC (HELLO): random and never 0 (0 means "not asserted"). */
+	do {
+		if (getrandom(&pool->boot_nonce, sizeof(pool->boot_nonce), 0) != sizeof(pool->boot_nonce))
+			pool->boot_nonce = ((uint64_t)getpid() << 32) ^ (uint64_t)time(NULL);
+	} while (!pool->boot_nonce);
 	INIT_LLIST_HEAD(&pool->users);
 	osmo_timer_setup(&pool->startup_timer, startup_timer_cb, pool);
 

@@ -705,8 +705,10 @@ static void test_c5_malformed(void)
 	expect("bad magic", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_MAGIC);
 	r = base_cr; r.b[2] = 0;
 	expect("version 0", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_VERSION);
-	r = base_cr; r.b[2] = 2;
-	expect("version 2", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_VERSION);
+	r = base_cr; r.b[2] = 1;
+	expect("version 1 (the old major)", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_VERSION);
+	r = base_cr; r.b[2] = 3;
+	expect("version 3", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_VERSION);
 	r = base_cr; r.b[5] = 1;
 	expect("flags 1", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_FLAGS);
 	r = base_cr; r.b[7]++;
@@ -791,7 +793,7 @@ static void test_c5_malformed(void)
 	expect("HELLO ident with control character", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_STRING);
 	r = base_hello; r.b[OFF_BODY + 12] = 65;
 	expect("HELLO ident_len 65", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_BAD_STRING);
-	r = base_hello; r.b[OFF_BODY + 12] = 3;
+	r = base_hello; r.b[OFF_BODY + 12] = 40;
 	expect("HELLO ident_len beyond record", &r, AWORKER_IPC_ROLE_MAIN, AWORKER_IPC_ERR_TRUNCATED);
 
 	/* USER_BIND: cs7_id u32 | ssn u16 | name */
@@ -879,7 +881,8 @@ static int reencode(const struct aworker_ipc_msg *m, struct msgb **out)
 
 	switch (m->type) {
 	case AWORKER_IPC_MT_HELLO:
-		rc = aworker_ipc_enc_hello(ctx, out, u->hello.role, u->hello.worker_idx, u->hello.pid, u->hello.ident);
+		rc = aworker_ipc_enc_hello_id(ctx, out, u->hello.role, u->hello.worker_idx, u->hello.pid, u->hello.ident,
+					      &u->hello.id);
 		if (rc == 0) {	/* the encoder always writes our own limits */
 			uint8_t *b = msgb_data(*out) + OFF_BODY;
 			b[4] = u->hello.max_frame >> 8; b[5] = u->hello.max_frame & 0xff;
@@ -942,7 +945,7 @@ static void test_c6_mutation_sweep(void)
 {
 	struct rec seeds[16];
 	unsigned int n_seeds = 0, i;
-	unsigned int accepted = 0, rejected = 0, mismatch = 0;
+	unsigned int accepted = 0, rejected = 0, mismatch = 0, higher_minor = 0;
 	struct osmo_sccp_addr a_gt, a_ip6, a_ip4;
 	struct osmo_scu_prim p;
 	struct msgb *msg;
@@ -1003,6 +1006,12 @@ static void test_c6_mutation_sweep(void)
 			continue;
 		}
 		accepted++;
+		/* A HELLO of a higher minor version is accepted with what follows its known fields ignored: it cannot
+		 * be re-encoded identically, by design. */
+		if (m.type == AWORKER_IPC_MT_HELLO && m.u.hello.minor != AWORKER_IPC_VERSION_MINOR) {
+			higher_minor++;
+			continue;
+		}
 		if (reencode(&m, &msg) != 0) {
 			mismatch++;
 			continue;
@@ -1011,8 +1020,8 @@ static void test_c6_mutation_sweep(void)
 			mismatch++;
 		msgb_free(msg);
 	}
-	printf("  200000 mutated records: %u accepted, %u rejected, %u not canonical\n", accepted, rejected,
-	       mismatch);
+	printf("  200000 mutated records: %u accepted (%u of them a HELLO of a higher minor version), %u rejected, %u not"
+	       " canonical\n", accepted, higher_minor, rejected, mismatch);
 	CHECK(mismatch == 0);
 	CHECK(talloc_total_blocks(ctx) == blocks);
 }
@@ -1292,6 +1301,20 @@ static int tl_alloc(struct tl *t, const char *name, int fd, enum aworker_ipc_rol
 	return aworker_ipc_link_alloc(&t->link, ctx, fd, &cfg, &tl_ops, t);
 }
 
+static int tl_alloc_id(struct tl *t, const char *name, int fd, enum aworker_ipc_role role, uint16_t idx,
+		       const struct aworker_ipc_identity *id)
+{
+	struct aworker_ipc_link_cfg cfg = {
+		.role = role, .worker_idx = idx, .pid = 1000 + role, .ident = "test", .log_cat = DLGLOBAL,
+		.id = *id,
+	};
+	memset(t, 0, sizeof(*t));
+	t->name = name;
+	t->fd = fd;
+	t->order_ok = true;
+	return aworker_ipc_link_alloc(&t->link, ctx, fd, &cfg, &tl_ops, t);
+}
+
 static void tl_free(struct tl *t)
 {
 	if (t->link)
@@ -1504,10 +1527,10 @@ static void inj_no_hello(int fd)
 	raw_send(fd, msg, 1);
 }
 static void inj_hello_seq2(int fd) { raw_send(fd, raw_hello(AWORKER_IPC_ROLE_WORKER, 3), 2); }
-static void inj_version2(int fd)
+static void inj_version1(int fd)
 {
 	struct msgb *msg = raw_hello(AWORKER_IPC_ROLE_WORKER, 3);
-	msgb_data(msg)[2] = 2;
+	msgb_data(msg)[2] = 1;
 	raw_send(fd, msg, 1);
 }
 static void inj_dup_hello(int fd)
@@ -1560,7 +1583,7 @@ static void test_l3_l5_raw_peer(void)
 	raw_case("peer HELLO with different limits", inj_limits);
 	raw_case("first record is not a HELLO", inj_no_hello);
 	raw_case("HELLO with seq 2", inj_hello_seq2);
-	raw_case("HELLO with version 2", inj_version2);
+	raw_case("HELLO with version 1 (the old major)", inj_version1);
 	raw_case("second HELLO", inj_dup_hello);
 	raw_case("sequence gap", inj_seq_gap);
 	raw_case("4097 octet record", inj_oversize_4097);
@@ -1857,6 +1880,93 @@ static const struct log_info test_log_info = {
 	.num_cat = ARRAY_SIZE(test_log_cat),
 };
 
+
+/***********************************************************************
+ * V1-V6: protocol 2.0 -- versions and the identity in HELLO
+ ***********************************************************************/
+
+static void id_link_case(const char *what, struct aworker_ipc_identity m_id, struct aworker_ipc_identity w_id,
+			 bool expect_ready)
+{
+	struct tl m, w;
+	int sv[2];
+	size_t blocks = talloc_total_blocks(ctx);
+
+	mk_pair(sv);
+	CHECK(tl_alloc_id(&m, "main", sv[0], AWORKER_IPC_ROLE_MAIN, 1, &m_id) == 0);
+	CHECK(tl_alloc_id(&w, "worker", sv[1], AWORKER_IPC_ROLE_WORKER, 1, &w_id) == 0);
+	PUMP_UNTIL((m.ready && w.ready) || m.closed || w.closed);
+	pump(5);
+	printf("  %s: %s\n", what, m.ready && w.ready && !m.closed && !w.closed ? "linked"
+	       : m.closed && m.ci.reason == AWORKER_IPC_CLOSE_INCOMPATIBLE ? "refused (incompatible)"
+	       : "OTHER");
+	if (expect_ready)
+		CHECK(m.ready && w.ready && !m.closed && !w.closed);
+	else
+		CHECK(m.closed == 1 && m.ci.reason == AWORKER_IPC_CLOSE_INCOMPATIBLE);
+	tl_free(&m);
+	tl_free(&w);
+	pump(2);
+	CHECK(talloc_total_blocks(ctx) == blocks);
+}
+
+static void test_v1_v6_version_identity(void)
+{
+	const struct aworker_ipc_identity id = { .boot_nonce = 0x0123456789abcdefULL, .incarnation = 7,
+						 .session_id = 3 };
+	struct aworker_ipc_msg m;
+	struct msgb *msg;
+	struct rec r, base;
+
+	printf("V1-V6: protocol 2.0: versions and the identity in HELLO\n");
+
+	/* V1: the identity survives the round trip; the own minor version is sent */
+	CHECK(aworker_ipc_enc_hello_id(ctx, &msg, AWORKER_IPC_ROLE_MAIN, 5, 99, "v2", &id) == 0);
+	rec_from(&base, msg);
+	CHECK(aworker_ipc_dec(&m, base.b, base.len, AWORKER_IPC_ROLE_WORKER) == 0);
+	CHECK(m.u.hello.minor == AWORKER_IPC_VERSION_MINOR && m.u.hello.id.boot_nonce == id.boot_nonce
+	      && m.u.hello.id.incarnation == 7 && m.u.hello.id.session_id == 3 && m.u.hello.worker_idx == 5);
+	printf("  V1 HELLO 2.%u: boot nonce %016llx, incarnation %u, session %u decoded as sent\n", m.u.hello.minor,
+	       (unsigned long long)m.u.hello.id.boot_nonce, m.u.hello.id.incarnation, m.u.hello.id.session_id);
+
+	/* V2: a higher minor version may append fields: accepted, ignored */
+	r = base;
+	r.b[base.len - 20] = AWORKER_IPC_VERSION_MINOR + 1;	/* the minor octet of the 2.0 extension */
+	memcpy(r.b + r.len, "\x01\x02\x03\x04", 4);
+	r.len += 4;
+	osmo_store16be(r.len - AWORKER_IPC_HDR_LEN, r.b + 6);
+	CHECK(aworker_ipc_dec(&m, r.b, r.len, AWORKER_IPC_ROLE_WORKER) == 0);
+	CHECK(m.u.hello.minor == AWORKER_IPC_VERSION_MINOR + 1 && m.u.hello.id.incarnation == 7);
+	printf("  V2 HELLO of minor %u with 4 more octets: accepted, the octets ignored\n", AWORKER_IPC_VERSION_MINOR + 1);
+
+	/* V3: the own minor version may not: trailing data */
+	r.b[base.len - 20] = AWORKER_IPC_VERSION_MINOR;
+	expect("V3 HELLO of the own minor with 4 more octets", &r, AWORKER_IPC_ROLE_WORKER,
+	       AWORKER_IPC_ERR_TRAILING_DATA);
+
+	/* V4: the reserved fields of the extension, and a HELLO without it (a 1.x HELLO in a 2.x frame) */
+	r = base;
+	r.b[base.len - 19] = 1;
+	expect("V4 HELLO extension reserved u8 = 1", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_RESERVED);
+	r = base;
+	r.b[base.len - 17] = 1;
+	expect("V4 HELLO extension reserved u16 = 1", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_BAD_RESERVED);
+	r = base;
+	r.len -= 20;
+	osmo_store16be(r.len - AWORKER_IPC_HDR_LEN, r.b + 6);
+	expect("V4 HELLO without the 2.0 extension", &r, AWORKER_IPC_ROLE_WORKER, AWORKER_IPC_ERR_TRUNCATED);
+
+	/* V5/V6: the link compares what both sides assert */
+	id_link_case("V5 same identity on both sides", id, id, true);
+	id_link_case("V5 worker asserts nothing", id, (struct aworker_ipc_identity){}, true);
+	id_link_case("V5 main asserts only the boot nonce, worker only the incarnation",
+		     (struct aworker_ipc_identity){ .boot_nonce = 1 }, (struct aworker_ipc_identity){ .incarnation = 9 },
+		     true);
+	id_link_case("V6 different incarnation", id, (struct aworker_ipc_identity){ .incarnation = 8 }, false);
+	id_link_case("V6 different boot nonce", id, (struct aworker_ipc_identity){ .boot_nonce = 2 }, false);
+	id_link_case("V6 different session", id, (struct aworker_ipc_identity){ .session_id = 4 }, false);
+}
+
 int main(int argc, char **argv)
 {
 	size_t blocks;
@@ -1887,6 +1997,7 @@ int main(int argc, char **argv)
 	test_l8_l12_lifecycle();
 	test_l13_fd_types();
 	test_l14_l19_injection();
+	test_v1_v6_version_identity();
 
 	printf("talloc blocks at the end: %s\n", talloc_total_blocks(ctx) == blocks ? "unchanged" : "LEAK");
 	CHECK(talloc_total_blocks(ctx) == blocks);

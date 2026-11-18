@@ -293,6 +293,8 @@ struct w_case {
 	bool closed_fd;		/* a descriptor that is not open */
 	const char *legacy_file;/* legacy mode: this config file */
 	bool bypass_d13;
+	unsigned int incarnation;	/* the worker's (aworker_incarnation; 0: unknown) */
+	unsigned int main_incarnation;	/* what the main process' HELLO asserts (0: nothing) */
 };
 
 /* What the child reported, and how it ended. */
@@ -322,6 +324,7 @@ static void run_worker(const struct w_case *c, struct w_result *r)
 		.worker_idx = (uint16_t)c->idx,
 		.ident = "aworker_worker_test",
 		.log_cat = DAWORKER,
+		.id = { .incarnation = c->main_incarnation },
 	};
 	struct aworker_ipc_link *link = NULL;
 	char logpath[300];
@@ -370,6 +373,7 @@ static void run_worker(const struct w_case *c, struct w_result *r)
 		}
 		g_child.bypass_d13 = c->bypass_d13;
 		atexit(child_atexit);
+		aworker_incarnation = c->incarnation;
 		aworker_run(ctx, sp[1], c->idx, c->legacy_file, snap_fd);
 	}
 	close(sp[1]);
@@ -637,6 +641,22 @@ static void part_w(void)
 	CHECK(r.exit_code == AWORKER_EXIT_CONFIG && !r.cs7_info);
 	CHECK(logged(&r, "has an 'a-worker-pool' section"));
 	talloc_free(t);
+
+	/* Protocol 2.0: a worker that knows its incarnation asserts it in its HELLO; a main process expecting another
+	 * one is refused by both sides, before the worker reports anything. */
+	memset(&c, 0, sizeof(c));
+	c.label = "worker 1's view, incarnation 5, the main process expects 5";
+	c.idx = 1;
+	c.text = w1;
+	c.incarnation = 5;
+	c.main_incarnation = 5;
+	w_case(&c, &r);
+	CHECK(r.exit_code == AWORKER_EXIT_OK && r.cs7_info && r.cs7_id == 1);
+	c.label = "worker 1's view, incarnation 5, the main process expects 6";
+	c.main_incarnation = 6;
+	w_case(&c, &r);
+	CHECK(r.exit_code == AWORKER_EXIT_LINK && !r.cs7_info);
+	CHECK(logged(&r, "peer HELLO: incarnation 6, expected 5"));
 	talloc_free(w0);
 	talloc_free(w1);
 }

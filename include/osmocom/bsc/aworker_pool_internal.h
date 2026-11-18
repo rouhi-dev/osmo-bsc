@@ -113,6 +113,7 @@ struct aworker_pool {
 	struct osmo_timer_list startup_timer;
 	struct ownership own;			/*!< expected ownership, built at start */
 	bool no_fork;				/*!< started with aworker_pool_start_with_fds() */
+	uint64_t boot_nonce;			/*!< random, never 0: this pool's identity in every worker HELLO */
 	bool stopping;
 	/*! Inline form: each worker's configuration snapshot (aworker_snapshot.h), made from the main configuration file
 	 * as read once at startup, before the first worker is forked. Every start of worker i -- the first, each

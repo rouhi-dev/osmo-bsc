@@ -473,6 +473,13 @@ static int check_user_ref(uint32_t user_ref)
 int aworker_ipc_enc_hello(void *ctx, struct msgb **out, enum aworker_ipc_role role, uint16_t worker_idx,
 			  uint32_t pid, const char *ident)
 {
+	return aworker_ipc_enc_hello_id(ctx, out, role, worker_idx, pid, ident, NULL);
+}
+
+int aworker_ipc_enc_hello_id(void *ctx, struct msgb **out, enum aworker_ipc_role role, uint16_t worker_idx,
+			     uint32_t pid, const char *ident, const struct aworker_ipc_identity *id)
+{
+	static const struct aworker_ipc_identity none;
 	struct msgb *msg;
 	size_t ilen = ident ? strlen(ident) : 0;
 
@@ -491,6 +498,16 @@ int aworker_ipc_enc_hello(void *ctx, struct msgb **out, enum aworker_ipc_role ro
 	put_u32(msg, pid);
 	put_u8(msg, (uint8_t)ilen);
 	put_bytes(msg, ident, ilen);
+	/* since 2.0 */
+	if (!id)
+		id = &none;
+	put_u8(msg, AWORKER_IPC_VERSION_MINOR);
+	put_u8(msg, 0);
+	put_u16(msg, 0);
+	put_u32(msg, (uint32_t)(id->boot_nonce >> 32));
+	put_u32(msg, (uint32_t)id->boot_nonce);
+	put_u32(msg, id->incarnation);
+	put_u32(msg, id->session_id);
 	return frame_end(msg, out);
 }
 
@@ -1083,6 +1100,17 @@ static void dec_body(struct rd *r, struct aworker_ipc_msg *m)
 		if (!r->err && m->u.hello.role != AWORKER_IPC_ROLE_MAIN && m->u.hello.role != AWORKER_IPC_ROLE_WORKER)
 			rd_fail(r, AWORKER_IPC_ERR_BAD_VALUE);
 		get_string(r, m->u.hello.ident, 0, AWORKER_IPC_MAX_IDENT);
+		/* since 2.0 */
+		m->u.hello.minor = get_u8(r);
+		if (get_u8(r) != 0 || get_u16(r) != 0)
+			rd_fail(r, AWORKER_IPC_ERR_BAD_RESERVED);
+		m->u.hello.id.boot_nonce = (uint64_t)get_u32(r) << 32;
+		m->u.hello.id.boot_nonce |= get_u32(r);
+		m->u.hello.id.incarnation = get_u32(r);
+		m->u.hello.id.session_id = get_u32(r);
+		/* A higher minor version may append fields: skip them (minor additions are optional). */
+		if (!r->err && m->u.hello.minor > AWORKER_IPC_VERSION_MINOR)
+			r->pos = r->len;
 		break;
 	case AWORKER_IPC_MT_ECHO_REQ:
 	case AWORKER_IPC_MT_ECHO_RSP:

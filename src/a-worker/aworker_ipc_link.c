@@ -39,6 +39,7 @@ struct aworker_ipc_link {
 	uint16_t worker_idx;
 	int log_cat;
 	char ident[AWORKER_IPC_MAX_IDENT + 1];
+	struct aworker_ipc_identity id;
 	const struct aworker_ipc_link_ops *ops;
 	void *priv;
 
@@ -183,6 +184,22 @@ static bool hello_compatible(struct aworker_ipc_link *link, const struct aworker
 	if (h->max_frame != AWORKER_IPC_MAX_FRAME || h->max_data != AWORKER_IPC_MAX_DATA) {
 		LOG_LINK(link, LOGL_ERROR, "peer HELLO: limits frame=%u data=%u, expected frame=%u data=%u\n",
 			 h->max_frame, h->max_data, AWORKER_IPC_MAX_FRAME, AWORKER_IPC_MAX_DATA);
+		return false;
+	}
+	/* Identity: what both sides assert must agree. */
+	if (h->id.boot_nonce && link->id.boot_nonce && h->id.boot_nonce != link->id.boot_nonce) {
+		LOG_LINK(link, LOGL_ERROR, "peer HELLO: boot nonce %016llx, expected %016llx\n",
+			 (unsigned long long)h->id.boot_nonce, (unsigned long long)link->id.boot_nonce);
+		return false;
+	}
+	if (h->id.incarnation && link->id.incarnation && h->id.incarnation != link->id.incarnation) {
+		LOG_LINK(link, LOGL_ERROR, "peer HELLO: incarnation %u, expected %u\n", h->id.incarnation,
+			 link->id.incarnation);
+		return false;
+	}
+	if (h->id.session_id && link->id.session_id && h->id.session_id != link->id.session_id) {
+		LOG_LINK(link, LOGL_ERROR, "peer HELLO: session %u, expected %u\n", h->id.session_id,
+			 link->id.session_id);
 		return false;
 	}
 	if (strcmp(h->ident, link->ident))
@@ -403,13 +420,14 @@ int aworker_ipc_link_alloc(struct aworker_ipc_link **out, void *ctx, int fd, con
 	link->worker_idx = cfg->worker_idx;
 	link->log_cat = cfg->log_cat;
 	OSMO_STRLCPY_ARRAY(link->ident, ident);
+	link->id = cfg->id;
 	link->ops = ops;
 	link->priv = priv;
 	link->state = AWORKER_IPC_LINK_HELLO_WAIT;
 	link->rx_next_seq = 1;
 
 	/* Encode the HELLO before touching the fd, so that most failures leave the fd unmodified. */
-	rc = aworker_ipc_enc_hello(link, &hello, link->role, link->worker_idx, cfg->pid, link->ident);
+	rc = aworker_ipc_enc_hello_id(link, &hello, link->role, link->worker_idx, cfg->pid, link->ident, &link->id);
 	if (rc < 0) {
 		talloc_free(link);
 		return rc;

@@ -17,8 +17,8 @@
  */
 #pragma once
 
-/* PROTOCOL (version 1)
- * ====================
+/* PROTOCOL (version 2.0)
+ * ======================
  *
  * Transport: one AF_UNIX SOCK_SEQPACKET connection per worker; one record == one message (see aworker_ipc_link.h).
  * All integers are big-endian. No C structs or pointers are put on the wire. Every field is validated on decode;
@@ -26,7 +26,8 @@
  *
  * Common header (AWORKER_IPC_HDR_LEN = 16 octets):
  *   0  u8[2] magic     'A' 'W'
- *   2  u8    version   AWORKER_IPC_VERSION; the only version field of the protocol, exact match required
+ *   2  u8    version   AWORKER_IPC_VERSION, the MAJOR version: exact match required (records of another major
+ *                       version are refused). The minor version is in HELLO only.
  *   3  u8    msg_type  enum aworker_ipc_msg_type; must be valid for the direction
  *   4  u16   flags     must be 0
  *   6  u16   body_len  must equal record length - 16
@@ -50,7 +51,14 @@
  *
  * Bodies (direction: B = both, M = main->worker, W = worker->main):
  *   HELLO          B  role u8 (1 main, 2 worker) | reserved u8 = 0 | worker_idx u16 | max_frame u16 | max_data u16 |
- *                     pid u32 | ident_len u8 (<= 64) | ident (printable ASCII)
+ *                     pid u32 | ident_len u8 (<= 64) | ident (printable ASCII) |
+ *                     (since 2.0) minor u8 | reserved u8 = 0 | reserved u16 = 0 | boot_nonce u64 | incarnation u32 |
+ *                     session_id u32 | (minor > own minor only) further octets, ignored
+ *                     Minor versions only append optional fields: a receiver accepts a HELLO of a higher minor and
+ *                     ignores what it does not know, and refuses trailing octets from a peer of its own or a lower
+ *                     minor. boot_nonce (random per Supervisor / pool start), incarnation (per worker start, within
+ *                     that boot) and session_id (per BSC session, within that boot) identify the sender's view; 0
+ *                     means "not asserted" (see aworker_ipc_link.h for how a link compares them).
  *   ECHO_REQ/RSP   B  token u32
  *   GOODBYE        B  reason u8 (enum aworker_ipc_goodbye_reason)
  *   CS7_INFO       W  count u8 (1..8) | count * { cs7_id u32 | primary_pc u32 (<= 0xffffff) |
@@ -100,7 +108,8 @@ struct msgb;
 
 #define AWORKER_IPC_MAGIC0		0x41	/* 'A' */
 #define AWORKER_IPC_MAGIC1		0x57	/* 'W' */
-#define AWORKER_IPC_VERSION		1
+#define AWORKER_IPC_VERSION		2	/* major */
+#define AWORKER_IPC_VERSION_MINOR	0
 #define AWORKER_IPC_HDR_LEN		16
 #define AWORKER_IPC_MAX_FRAME		4096
 #define AWORKER_IPC_MAX_DATA		2048
@@ -199,8 +208,17 @@ struct aworker_ipc_data {
 	uint16_t len;
 };
 
+/*! Who a HELLO's sender is, as far as it knows (0: not asserted). */
+struct aworker_ipc_identity {
+	uint64_t boot_nonce;		/*!< random, per Supervisor / pool start */
+	uint32_t incarnation;		/*!< start number of the worker process within that boot */
+	uint32_t session_id;		/*!< BSC session within that boot */
+};
+
 struct aworker_ipc_hello {
 	uint8_t role;			/*!< enum aworker_ipc_role */
+	uint8_t minor;			/*!< the sender's minor protocol version */
+	struct aworker_ipc_identity id;
 	uint16_t worker_idx;
 	uint16_t max_frame;
 	uint16_t max_data;
@@ -293,8 +311,12 @@ struct msgb *aworker_ipc_build_scu_prim(void *ctx, const struct aworker_ipc_msg 
  * Encoders taking a 'struct msgb *data' ALWAYS take ownership of it (also on error), like the osmo_sccp_tx_*_msg()
  * helpers, and carry msgb_data()/msgb_length() of it. Encoders taking a pointer + length do not take ownership. */
 
+/*! A HELLO of this protocol version that asserts no identity. */
 int aworker_ipc_enc_hello(void *ctx, struct msgb **out, enum aworker_ipc_role role, uint16_t worker_idx,
 			  uint32_t pid, const char *ident);
+/*! A HELLO asserting \a id (NULL: none). */
+int aworker_ipc_enc_hello_id(void *ctx, struct msgb **out, enum aworker_ipc_role role, uint16_t worker_idx,
+			     uint32_t pid, const char *ident, const struct aworker_ipc_identity *id);
 int aworker_ipc_enc_echo(void *ctx, struct msgb **out, bool response, uint32_t token);
 int aworker_ipc_enc_goodbye(void *ctx, struct msgb **out, uint8_t reason);
 int aworker_ipc_enc_cs7_info(void *ctx, struct msgb **out, const struct aworker_ipc_cs7_info *info);

@@ -25,8 +25,10 @@
  * changes the osmo_io buffer counts (more than one buffer would merge or split records).
  *
  * Lifecycle: HELLO_WAIT -> READY -> CLOSED. Each side queues its HELLO (seq 1) on allocation. The first record
- * received must be a HELLO with seq 1, the opposite role, the same worker index and the same frame/data limits;
- * otherwise the link closes. aworker_ipc_link_send() returns -EBUSY until the peer's HELLO was accepted (then
+ * received must be a HELLO with seq 1, the opposite role, the same worker index and the same frame/data limits, and
+ * no identity that contradicts the own one (cfg->id): a boot nonce, incarnation or session_id that both sides
+ * assert (non-zero) must be equal. Otherwise the link closes (AWORKER_IPC_CLOSE_INCOMPATIBLE). The peer's minor
+ * version may differ (see aworker_ipc.h). aworker_ipc_link_send() returns -EBUSY until the peer's HELLO was accepted (then
  * ready_cb is called) and -ENOTCONN once closed. Received sequence numbers must increase by exactly 1.
  * ECHO_REQ is answered by the link itself; all other messages after HELLO are passed to rx_cb.
  *
@@ -67,7 +69,8 @@ enum aworker_ipc_close_reason {
 	AWORKER_IPC_CLOSE_BAD_SEQ,		/*!< received sequence number not previous + 1 */
 	AWORKER_IPC_CLOSE_NO_HELLO,		/*!< first record was not a HELLO */
 	AWORKER_IPC_CLOSE_DUP_HELLO,		/*!< HELLO after the handshake */
-	AWORKER_IPC_CLOSE_INCOMPATIBLE,		/*!< peer HELLO: wrong role, worker index or limits */
+	AWORKER_IPC_CLOSE_INCOMPATIBLE,		/*!< peer HELLO: wrong role, worker index or limits, or a
+						 *   contradicting identity */
 	AWORKER_IPC_CLOSE_TX_ERROR,		/*!< sendmsg() error; err = -errno */
 	AWORKER_IPC_CLOSE_TX_PARTIAL,		/*!< sendmsg() accepted only part of a record; err = bytes sent */
 	AWORKER_IPC_CLOSE_TX_SEQ,		/*!< send completions out of order */
@@ -98,6 +101,7 @@ struct aworker_ipc_link_cfg {
 	uint16_t worker_idx;		/*!< worker index; must match the peer's */
 	uint32_t pid;			/*!< sent in HELLO, informational */
 	const char *ident;		/*!< sent in HELLO, informational (<= 64 printable ASCII characters) */
+	struct aworker_ipc_identity id;	/*!< sent in HELLO; checked against the peer's (0 fields: not asserted) */
 	unsigned int txqueue_max;	/*!< 0: default (1024 records) */
 	int log_cat;			/*!< logging category */
 };

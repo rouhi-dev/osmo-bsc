@@ -29,21 +29,21 @@ C2: worker->main round trips and rebuilt primitives
   N-STATE.ind len=0: 35 octets, primitive rebuilt (connectionless allocation)
   N-PCSTATE.ind len=0: 38 octets, primitive rebuilt (connectionless allocation)
 C3: golden vectors
-  HELLO main idx=3 (37):
-    41 57 01 01 00 00 00 15 00 00 00 01 00 00 00 00 01 00 00 03 10 00 08 00 01 02 03 04 08 6f 73 6d
-    6f 2d 62 73 63
+  HELLO main idx=3 (57):
+    41 57 02 01 00 00 00 29 00 00 00 01 00 00 00 00 01 00 00 03 10 00 08 00 01 02 03 04 08 6f 73 6d
+    6f 2d 62 73 63 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
   TX_DATA (25):
-    41 57 01 23 00 00 00 09 00 00 00 02 0a 0b 0c 0d 00 ab cd ef 00 03 01 02 03
+    41 57 02 23 00 00 00 09 00 00 00 02 0a 0b 0c 0d 00 ab cd ef 00 03 01 02 03
   TX_DISCONN (97):
-    41 57 01 24 00 00 00 51 ff ff ff fe 00 00 00 05 00 00 01 02 01 00 00 00 07 01 04 07 00 00 00 01
+    41 57 02 24 00 00 00 51 ff ff ff fe 00 00 00 05 00 00 01 02 01 00 00 00 07 01 04 07 00 00 00 01
     00 00 00 04 1f 34 39 33 30 31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 36 37 38 39 30 31 32 33
     34 35 36 37 00 00 12 34 56 00 00 00 fe 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
     80
   SCU_UP N-PCSTATE.ind (38):
-    41 57 01 30 00 00 00 16 00 00 00 00 00 00 00 07 0a 02 00 00 00 00 43 21 00 00 00 06 00 00 00 03
+    41 57 02 30 00 00 00 16 00 00 00 00 00 00 00 07 0a 02 00 00 00 00 43 21 00 00 00 06 00 00 00 03
     00 00 00 05 00 00
   TX_FAILED (36):
-    41 57 01 31 00 00 00 14 00 00 00 00 00 00 00 09 01 02 03 04 21 02 00 10 00 ab cd ef ff ff ff ea
+    41 57 02 31 00 00 00 14 00 00 00 00 00 00 00 09 01 02 03 04 21 02 00 10 00 ab cd ef ff ff ff ea
     02 00 00 00
 C4: boundaries and C7: msgb ownership on error paths
   TX_DATA len=2049: -EMSGSIZE
@@ -69,7 +69,8 @@ C5/C8/C9: malformed records
   4097 octet record: frame-too-long
   bad magic: bad-magic
   version 0: bad-version
-  version 2: bad-version
+  version 1 (the old major): bad-version
+  version 3: bad-version
   flags 1: bad-flags
   body_len + 1: bad-body-len
   unknown type 0x7f: unknown-type
@@ -121,7 +122,7 @@ C5/C8/C9: malformed records
   GOODBYE reason 2: bad-value
   USER_BIND_RESULT 4: bad-value
 C6: mutation sweep
-  200000 mutated records: 36640 accepted, 163360 rejected, 0 not canonical
+  200000 mutated records: 38090 accepted (200 of them a HELLO of a higher minor version), 161910 rejected, 0 not canonical
 C10: libosmo-sigtran per-operation data limits
   TX_UNITDATA: max 1139; 1139: 0, 1140: -EMSGSIZE
   TX_CONN_REQ: max 255; 255: 0, 256: -EMSGSIZE
@@ -141,7 +142,7 @@ C11: CS7_INFO
   count=8: 113 octets, round trip ok
   direction: worker->main only
   CS7_INFO 1 entry (29):
-    41 57 01 08 00 00 00 0d 00 00 00 02 00 00 00 00 01 00 00 00 00 00 11 22 00 02 01 00 00
+    41 57 02 08 00 00 00 0d 00 00 00 02 00 00 00 00 01 00 00 00 00 00 11 22 00 02 01 00 00
   encoder refuses: count 0 and 9, proto none and 4, num_as 0, pc > 24 bit, duplicate cs7 id, NULL
   decoder rejects 8 field violations
   decoder rejects: truncated body, trailing octets, non-zero user_ref
@@ -172,7 +173,7 @@ L3-L5: incompatible and malformed peers (raw socket peer)
  HELLO with seq 2
   main closed 1 time(s): bad-seq, err=2, last_written_seq=0, last_queued_seq=1
   raw peer: 0 record(s) then EOF
- HELLO with version 2
+ HELLO with version 1 (the old major)
   main closed 1 time(s): protocol, err=bad-version, last_written_seq=0, last_queued_seq=1
   raw peer: 0 record(s) then EOF
  second HELLO
@@ -243,5 +244,18 @@ L14-L19: send failures injected below osmo_io
   worker received 0 of the 2 records
   worker closed 1 time(s): peer-eof, err=0, last_written_seq=1, last_queued_seq=1
   L19: fault injection active: yes
+V1-V6: protocol 2.0: versions and the identity in HELLO
+  V1 HELLO 2.0: boot nonce 0123456789abcdef, incarnation 7, session 3 decoded as sent
+  V2 HELLO of minor 1 with 4 more octets: accepted, the octets ignored
+  V3 HELLO of the own minor with 4 more octets: trailing-data
+  V4 HELLO extension reserved u8 = 1: bad-reserved
+  V4 HELLO extension reserved u16 = 1: bad-reserved
+  V4 HELLO without the 2.0 extension: truncated
+  V5 same identity on both sides: linked
+  V5 worker asserts nothing: linked
+  V5 main asserts only the boot nonce, worker only the incarnation: linked
+  V6 different incarnation: refused (incompatible)
+  V6 different boot nonce: refused (incompatible)
+  V6 different session: refused (incompatible)
 talloc blocks at the end: unchanged
 PASSED

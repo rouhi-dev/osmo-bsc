@@ -774,6 +774,8 @@ void aworker_run(void *ctx, int fd, unsigned int worker_idx, const char *cfg_fil
 		.worker_idx = (uint16_t)worker_idx,
 		.ident = aworker_program_name,
 		.log_cat = aworker_log_cat,
+		/* What this process knows of its identity: its start number, if bsc-aworker's Supervisor passed it. */
+		.id = { .incarnation = aworker_incarnation },
 	};
 	int rc;
 

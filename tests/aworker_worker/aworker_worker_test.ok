@@ -64,6 +64,20 @@ W: snapshot mode, the real aworker_run() in a child, really parsed
     child: exit: parses 0; snapshot descriptor none; cs7 instances 1; listening sockets 0
     main process: no CS7_INFO
     exit code 66
+  worker 1's view, incarnation 5, the main process expects 5 (worker 1):
+    child: view check: 0 problem(s)
+    child: parse started; snapshot descriptor closed then
+    child: parse result 0; afterwards: cs7 instances 1, listening sockets 1
+    child: exit: parses 1; snapshot descriptor closed; cs7 instances 1; listening sockets 1
+    main process: CS7_INFO with 1 cs7 instance(s), the first 1
+    exit code 0
+  worker 1's view, incarnation 5, the main process expects 6 (worker 1):
+    child: view check: 0 problem(s)
+    child: parse started; snapshot descriptor closed then
+    child: parse result 0; afterwards: cs7 instances 1, listening sockets 1
+    child: exit: parses 1; snapshot descriptor closed; cs7 instances 1; listening sockets 1
+    main process: no CS7_INFO
+    exit code 67
 R-1: the osmo-bsc command line (descriptors 900 and up are not open)
   --aworker-snapshot-fd without --aworker-fd: exit 2
   with --aworker-config as well: exit 2

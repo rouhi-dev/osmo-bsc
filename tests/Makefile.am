@@ -12,6 +12,7 @@ SUBDIRS = \
 	aworker_supervisor \
 	aworker_logfile \
 	aworker_canon \
+	aworker_session \
 	bsc \
 	codec_pref \
 	gsm0408 \

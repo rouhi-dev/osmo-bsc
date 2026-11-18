@@ -1,0 +1,28 @@
+W1: the worker's control link (CONTROL only) and CS7_INFO
+  handshake complete, CS7_INFO for cs7 instance 0
+W2: ATTACH, the data link, an SCCP user over it
+  ATTACH(5): STATE session 5 attached attach-ok, users unbound 0
+  USER_BIND over the data link: USER_BIND_RESULT 0
+W3: ATTACH while attached is refused; the descriptor is closed unused
+  ATTACH(6): STATE session 6 attached attach-refused, users unbound 0
+W4: DETACH: users unbound, the data link closed (EOF at the BSC end)
+  DETACH(5): STATE session 5 detached detach-req, users unbound 1
+  BSC end: peer-eof
+W5: DETACH again: answered the same way (idempotent)
+  DETACH(5) again: STATE session 5 detached detach-req, users unbound 0
+W6: ATTACH for another incarnation is refused; the descriptor is closed unused
+  ATTACH(7, incarnation 4): STATE session 7 detached attach-refused, users unbound 0
+W7: the BSC end goes away: the worker sees EOF itself and detaches
+  unsolicited: STATE session 8 detached data-eof, users unbound 1
+W8: a BSC end of another session fails the data handshake: detached
+  data HELLO for session 10: STATE session 9 detached data-error, users unbound 0
+W8b: a BSC end of another Supervisor boot (right session) fails the data handshake as well
+  data HELLO of another boot: STATE session 11 detached data-error, users unbound 0
+W9: GOODBYE ends the worker
+  exit 0
+W10: an SCCP-user record on the control link closes it: the worker exits
+  exit 67
+W11: osmo-bsc's worker (legacy): one link for control and SCCP users, as before; no ATTACH
+  USER_BIND on the one link: USER_BIND_RESULT 0
+  ATTACH to a legacy worker: exit 67
+PASSED

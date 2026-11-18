@@ -252,6 +252,8 @@ static void worker_role(void)
 		}
 		aworker_incarnation = (unsigned int)inc;
 	}
+	/* S2-5: a control link to the Supervisor, data links per BSC session (aworker.h). */
+	aworker_split_links = true;
 	aworker_run(g_ctx, g_aworker_fd, (unsigned int)idx, NULL, g_snapshot_fd);
 }
 

@@ -256,6 +256,7 @@ AC_OUTPUT(
     tests/aworker_supervisor/Makefile
     tests/aworker_logfile/Makefile
     tests/aworker_canon/Makefile
+    tests/aworker_session/Makefile
     tests/bsc/Makefile
     tests/codec_pref/Makefile
     tests/gsm0408/Makefile

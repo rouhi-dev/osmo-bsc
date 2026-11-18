@@ -76,7 +76,11 @@ static struct {
 	const char *snap_text;
 	size_t snap_len;
 	int own_cs7;			/*!< snapshot mode: the cs7 instance the view declares for this worker */
-	struct aworker_ipc_link *link;
+	struct aworker_ipc_link *link;	/*!< to the main process / Supervisor (split links: the control link) */
+	/* Split links (aworker_split_links): the data link to the attached BSC, NULL while DETACHED. */
+	struct aworker_ipc_link *data;
+	uint32_t session_id;		/*!< the session attached to (valid while data != NULL) */
+	uint64_t boot_nonce;		/*!< the Supervisor's, from its HELLO on the control link */
 	struct llist_head cs7s;		/*!< struct aworker_cs7 */
 	struct llist_head users;	/*!< struct aworker_wuser */
 	int exit_code;
@@ -84,6 +88,8 @@ static struct {
 	/*! CS7_INFO, encoded once the cs7 instances are up and sent as soon as the handshake completes. */
 	struct msgb *cs7_info;
 } g_w;
+
+bool aworker_split_links;
 
 /* "aworker <idx>: ", or with a known incarnation (bsc-aworker, B5) "aworker <idx> inc <n>: ". */
 #define LOGAW(lvl, fmt, args...) LOGP(aworker_log_cat, lvl, "%s" fmt, g_w.prefix, ## args)
@@ -128,8 +134,33 @@ static struct aworker_wuser *user_by_cs7_ssn(uint32_t cs7_id, uint16_t ssn)
 	return NULL;
 }
 
-/* Send one encoded record; a send failure takes the link (and with it the worker) down. */
+/* The link SCCP-user traffic uses: the data link (split links; NULL while detached), or the one link (legacy). */
+static struct aworker_ipc_link *user_link(void)
+{
+	return aworker_split_links ? g_w.data : g_w.link;
+}
+
+/* Send one encoded SCCP-user record; a send failure takes its link down (legacy: and with it the worker; split: that
+ * detaches). Without a data link (detached) the record is dropped. */
 static void link_send(struct msgb *rec, const char *what)
+{
+	struct aworker_ipc_link *l = user_link();
+	uint32_t seq = 0;
+	int rc;
+
+	if (!l) {
+		LOGAW(LOGL_NOTICE, "not attached to a BSC: dropping %s\n", what);
+		msgb_free(rec);
+		return;
+	}
+	rc = aworker_ipc_link_send(l, rec, &seq);
+	if (rc < 0)
+		LOGAW(LOGL_ERROR, "cannot send %s to the %s: %s\n", what, aworker_split_links ? "BSC" : "main process",
+		      strerror(-rc));
+}
+
+/* Send a control record (CS7_INFO, STATE, GOODBYE) on the link to the main process / Supervisor. */
+static void ctrl_send(struct msgb *rec, const char *what)
 {
 	uint32_t seq = 0;
 	int rc;
@@ -201,7 +232,7 @@ static struct msgb *data_to_msgb(const struct aworker_ipc_data *d)
 	if (!msg) {
 		LOGAW(LOGL_FATAL, "cannot allocate a %u octet msgb for a transmit request; closing link\n",
 		      d->len);
-		aworker_ipc_link_close(g_w.link);
+		aworker_ipc_link_close(user_link());
 		return NULL;
 	}
 	if (d->len)
@@ -263,7 +294,7 @@ static void handle_user_bind(const struct aworker_ipc_msg *m)
 
 	if (user_by_ref(m->user_ref)) {
 		LOGAW(LOGL_ERROR, "USER_BIND with user_ref %u already in use; closing link\n", m->user_ref);
-		aworker_ipc_link_close(g_w.link);
+		aworker_ipc_link_close(user_link());
 		return;
 	}
 
@@ -449,30 +480,57 @@ static void handle_tx(const struct aworker_ipc_msg *m)
  ***********************************************************************/
 
 static void send_cs7_info(void);
+static void handle_attach(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m);
+static void handle_detach(const struct aworker_ipc_msg *m);
 
 static void w_ready_cb(struct aworker_ipc_link *link, const struct aworker_ipc_hello *peer)
 {
 	LOGAW(LOGL_INFO, "IPC handshake with the main process complete (pid %u, ident '%s')\n", peer->pid,
 	      peer->ident);
+	g_w.boot_nonce = peer->id.boot_nonce;
 	send_cs7_info();
 }
 
-static void w_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m)
+/* SCCP-user records: on the one link (legacy) or on the data link (split). */
+static bool user_rx(const struct aworker_ipc_msg *m)
 {
 	switch (m->type) {
 	case AWORKER_IPC_MT_USER_BIND:
 		handle_user_bind(m);
-		return;
+		return true;
 	case AWORKER_IPC_MT_USER_UNBIND:
 		handle_user_unbind(m);
-		return;
+		return true;
 	case AWORKER_IPC_MT_TX_UNITDATA:
 	case AWORKER_IPC_MT_TX_CONN_REQ:
 	case AWORKER_IPC_MT_TX_CONN_RESP:
 	case AWORKER_IPC_MT_TX_DATA:
 	case AWORKER_IPC_MT_TX_DISCONN:
 		handle_tx(m);
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void w_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m)
+{
+	/* Split links: the control link carries no SCCP-user records (its class set refuses them already). */
+	if (!aworker_split_links && user_rx(m))
 		return;
+	switch (m->type) {
+	case AWORKER_IPC_MT_ATTACH:
+		if (aworker_split_links) {
+			handle_attach(link, m);
+			return;
+		}
+		break;
+	case AWORKER_IPC_MT_DETACH:
+		if (aworker_split_links) {
+			handle_detach(m);
+			return;
+		}
+		break;
 	case AWORKER_IPC_MT_GOODBYE:
 		LOGAW(LOGL_NOTICE, "the main process says GOODBYE (reason %u); shutting down\n",
 		      m->u.goodbye_reason);
@@ -480,12 +538,138 @@ static void w_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_msg 
 		aworker_ipc_link_close(link);
 		return;
 	default:
-		/* aworker_ipc_dec() already rejected everything a worker may not receive. */
-		LOGAW(LOGL_ERROR, "unexpected %s from the main process; closing link\n",
-		      aworker_ipc_msg_type_name(m->type));
-		aworker_ipc_link_close(link);
+		break;
+	}
+	/* aworker_ipc_dec() already rejected everything a worker may not receive; ATTACH/DETACH are only for split links. */
+	LOGAW(LOGL_ERROR, "unexpected %s from the main process; closing link\n", aworker_ipc_msg_type_name(m->type));
+	aworker_ipc_link_close(link);
+}
+
+/***********************************************************************
+ * Split links: attaching to and detaching from a BSC session (S2-5)
+ ***********************************************************************/
+
+static void send_state(uint32_t session_id, uint8_t state, uint8_t cause, uint16_t users_unbound)
+{
+	struct msgb *rec;
+
+	if (aworker_ipc_enc_state(g_w.ctx, &rec, session_id, state, cause, users_unbound) < 0) {
+		LOGAW(LOGL_ERROR, "cannot encode STATE\n");
 		return;
 	}
+	ctrl_send(rec, "STATE");
+}
+
+/* Minimal detach (S2-5): unbind every SCCP user, close the data link, report. SS7/ASP/SCTP stay as they are. */
+static void detach(uint8_t cause)
+{
+	struct aworker_wuser *wu, *wu2;
+	uint32_t session_id = g_w.session_id;
+	unsigned int n = 0;
+
+	if (!g_w.data)
+		return;
+	llist_for_each_entry_safe(wu, wu2, &g_w.users, entry) {
+		LOGWU(wu, LOGL_NOTICE, "SCCP user unbound (detach)\n");
+		user_free(wu);
+		n++;
+	}
+	/* Freed here even from within its own call-back: the link defers that until the call-back returns. */
+	aworker_ipc_link_free(g_w.data);
+	g_w.data = NULL;
+	g_w.session_id = 0;
+	LOGAW(LOGL_NOTICE, "detached from session %u (%s): %u SCCP user(s) unbound; SS7 and SCTP unchanged\n",
+	      session_id, aworker_ipc_state_cause_name(cause), n);
+	send_state(session_id, AWORKER_IPC_ATT_DETACHED, cause, (uint16_t)OSMO_MIN(n, 0xffff));
+}
+
+static void d_ready_cb(struct aworker_ipc_link *link, const struct aworker_ipc_hello *peer)
+{
+	LOGAW(LOGL_NOTICE, "data link of session %u up (BSC pid %u, ident '%s')\n", g_w.session_id, peer->pid,
+	      peer->ident);
+}
+
+static void d_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m)
+{
+	if (user_rx(m))
+		return;
+	/* The data link's class set admits nothing else but LINK records, which the link handles itself. */
+	LOGAW(LOGL_ERROR, "unexpected %s on the data link; closing it\n", aworker_ipc_msg_type_name(m->type));
+	aworker_ipc_link_close(link);
+}
+
+static void d_closed_cb(struct aworker_ipc_link *link, const struct aworker_ipc_link_close_info *info)
+{
+	bool eof = info->reason == AWORKER_IPC_CLOSE_PEER_EOF;
+
+	if (link != g_w.data)
+		return;
+	LOGAW(eof ? LOGL_NOTICE : LOGL_ERROR, "data link of session %u closed: %s (%d)%s\n", g_w.session_id,
+	      aworker_ipc_close_reason_name(info->reason), info->err, eof ? ": the BSC end is gone" : "");
+	detach(eof ? AWORKER_IPC_SC_DATA_EOF : AWORKER_IPC_SC_DATA_ERROR);
+}
+
+static const struct aworker_ipc_link_ops d_link_ops = {
+	.ready_cb = d_ready_cb,
+	.rx_cb = d_rx_cb,
+	.closed_cb = d_closed_cb,
+};
+
+static void handle_attach(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m)
+{
+	struct aworker_ipc_link_cfg cfg = {
+		.role = AWORKER_IPC_ROLE_WORKER,
+		.worker_idx = (uint16_t)g_w.idx,
+		.pid = (uint32_t)getpid(),
+		.ident = aworker_program_name,
+		.log_cat = aworker_log_cat,
+		.classes = AWORKER_IPC_CLASS_DATA,
+		/* Only the BSC end of this very session, for this very process, completes the handshake. */
+		.id = { .boot_nonce = g_w.boot_nonce, .incarnation = m->u.attach.incarnation,
+			.session_id = m->u.attach.session_id },
+	};
+	int fd, rc;
+
+	if (g_w.data) {
+		/* The descriptor is not taken: the link closes it when this call-back returns. */
+		LOGAW(LOGL_ERROR, "ATTACH to session %u refused: attached to session %u (ATTACH only while"
+		      " DETACHED)\n", m->u.attach.session_id, g_w.session_id);
+		send_state(m->u.attach.session_id, AWORKER_IPC_ATT_ATTACHED, AWORKER_IPC_SC_ATTACH_REFUSED, 0);
+		return;
+	}
+	if (!aworker_incarnation || m->u.attach.incarnation != aworker_incarnation) {
+		LOGAW(LOGL_ERROR, "ATTACH to session %u refused: it is for incarnation %u, this process is %u\n",
+		      m->u.attach.session_id, m->u.attach.incarnation, aworker_incarnation);
+		send_state(m->u.attach.session_id, AWORKER_IPC_ATT_DETACHED, AWORKER_IPC_SC_ATTACH_REFUSED, 0);
+		return;
+	}
+	fd = aworker_ipc_link_take_fd(link);
+	cfg.pid = (uint32_t)getpid();
+	rc = aworker_ipc_link_alloc(&g_w.data, g_w.ctx, fd, &cfg, &d_link_ops, NULL);
+	if (rc < 0) {
+		/* aworker_ipc_link_alloc() leaves the descriptor to us on failure. */
+		close(fd);
+		g_w.data = NULL;
+		LOGAW(LOGL_ERROR, "ATTACH to session %u refused: cannot set up the data link: %s\n",
+		      m->u.attach.session_id, strerror(-rc));
+		send_state(m->u.attach.session_id, AWORKER_IPC_ATT_DETACHED, AWORKER_IPC_SC_ATTACH_REFUSED, 0);
+		return;
+	}
+	g_w.session_id = m->u.attach.session_id;
+	LOGAW(LOGL_NOTICE, "attached to session %u\n", g_w.session_id);
+	send_state(g_w.session_id, AWORKER_IPC_ATT_ATTACHED, AWORKER_IPC_SC_ATTACH_OK, 0);
+}
+
+static void handle_detach(const struct aworker_ipc_msg *m)
+{
+	if (g_w.data && g_w.session_id == m->u.detach.session_id) {
+		detach(AWORKER_IPC_SC_DETACH_REQ);
+		return;
+	}
+	/* Idempotent: not attached to that session (any more). */
+	LOGAW(LOGL_INFO, "DETACH from session %u: not attached to it%s\n", m->u.detach.session_id,
+	      g_w.data ? " (attached to another session)" : "");
+	send_state(m->u.detach.session_id, AWORKER_IPC_ATT_DETACHED, AWORKER_IPC_SC_DETACH_REQ, 0);
 }
 
 static void w_closed_cb(struct aworker_ipc_link *link, const struct aworker_ipc_link_close_info *info)
@@ -690,7 +874,7 @@ static void send_cs7_info(void)
 	if (!rec)
 		return;
 	g_w.cs7_info = NULL;
-	link_send(rec, "CS7_INFO");
+	ctrl_send(rec, "CS7_INFO");
 }
 
 static void worker_cleanup(void)
@@ -699,6 +883,10 @@ static void worker_cleanup(void)
 
 	llist_for_each_entry_safe(wu, wu2, &g_w.users, entry)
 		user_free(wu);
+	if (g_w.data) {
+		aworker_ipc_link_free(g_w.data);
+		g_w.data = NULL;
+	}
 	msgb_free(g_w.cs7_info);
 	g_w.cs7_info = NULL;
 	if (g_w.link) {
@@ -707,7 +895,7 @@ static void worker_cleanup(void)
 		if (!g_w.link_down && aworker_ipc_link_get_state(g_w.link) == AWORKER_IPC_LINK_READY) {
 			struct msgb *rec;
 			if (aworker_ipc_enc_goodbye(g_w.ctx, &rec, AWORKER_IPC_GOODBYE_SHUTDOWN) == 0)
-				link_send(rec, "GOODBYE");
+				ctrl_send(rec, "GOODBYE");
 		}
 		aworker_ipc_link_free(g_w.link);
 		g_w.link = NULL;
@@ -776,6 +964,9 @@ void aworker_run(void *ctx, int fd, unsigned int worker_idx, const char *cfg_fil
 		.log_cat = aworker_log_cat,
 		/* What this process knows of its identity: its start number, if bsc-aworker's Supervisor passed it. */
 		.id = { .incarnation = aworker_incarnation },
+		/* Split links: the control link only (ATTACH brings a descriptor); legacy: control and data. */
+		.classes = aworker_split_links ? AWORKER_IPC_CLASS_CONTROL : 0,
+		.fd_passing = aworker_split_links,
 	};
 	int rc;
 

@@ -17,7 +17,7 @@ Status: **proposal for review**. Nothing in this document is implemented. Phase 
 > Supervisor does. §17 is superseded as noted there. The models, recovery questions, scheduling, connection-loss
 > analysis and the 2b–2e designs remain valid.
 >
-> **Status (2026-11-17, HEAD `b4d890241`):** S1, S2-1 and S2-2 steps 1–8 are implemented: the inline form and worker
+> **Status (2026-11-18, after S2-2 step 10):** S1, S2-1 and S2-2 (all ten steps) are implemented and verified: the inline form and worker
 > configuration snapshots work in legacy mode, with osmo-bsc still the workers' parent. The Supervisor executable
 > `bsc-aworker` and supervisor mode are not implemented yet (S2-3 onwards). Record: `PHASE2_IMPLEMENTATION_PLAN.md`
 > §12 and §14.5.

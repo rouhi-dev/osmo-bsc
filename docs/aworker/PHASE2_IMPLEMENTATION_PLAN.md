@@ -11,8 +11,8 @@ below). Baseline: `a-worker-pool` at `e54578f2c` (Phase 1).
 > S1 is closed and accepted (uncommitted on `fa01448ea`). The S2-0 review (§14) records the approved decisions, the
 > implementation subphases S2-1 … S2-8 and their mapping to the phases of §13.
 >
-> **Status (2026-11-17, HEAD `b4d890241`):** S1 and S2-1 are closed and accepted; S2-2 steps 1–8 are implemented,
-> verified and committed (§12, §14.5); this document revision is S2-2 step 9; step 10 (full verification) is pending.
+> **Status (2026-11-18):** S1 and S2-1 are closed and accepted; S2-2 steps 1–10 are done: implemented, documented
+> (step 9) and finally verified (step 10, §14.5); acceptance by the project owner is pending.
 > S2-3 … S2-8 have not started. The executable name is `bsc-aworker` (decision B3).
 
 ## 0. Approved decisions this plan implements
@@ -549,8 +549,8 @@ default is now 60 s; an explicit `startup-timeout` still replaces it. The manual
   and accepted. The planned worker-owned `route-table` filter was dropped: `route-table` is no osmo-bsc command (SG
   role only, SUP §4.1). Limitations carried into S2-2 and resolved there: the C8 hook needed a real-binary test (R-2),
   `show startup-config` in inline mode (D-8), and the missing official transcript runner (D-10).
-* **S2-2** (single read, worker snapshots, legacy mode): steps 1–8 implemented and verified; record and results in
-  §14.5.
+* **S2-2** (single read, worker snapshots, legacy mode): steps 1–8 implemented and verified, step 9 documentation
+  (`b48979738`), step 10 final verification passed; record and results in §14.5.
 * **Commits:** `15c749359` "aworker: implement shared config and worker snapshots" (S1, S2-1 and S2-2 steps 1–6),
   `5f4483f0c` "aworker: integrate snapshots with pool workers" (step 7), `b4d890241` "aworker: record the config path
   in inline mode (D-8)" (step 8). The first one combines several subphases, against the "one change per commit" rule of
@@ -807,8 +807,8 @@ not "do not merge".
 * **Existing tests:** P1–P20 (file form, unchanged argv), T1–T11, legacy E2E (file form).
 * **Acceptance:** both legacy forms pass E2E; no file access by an inline-form worker (verified, e.g. by moving the
   file away after start).
-* **Status:** steps 1–8 of the approved sequence implemented and verified; step 9 is this documentation; step 10
-  pending. Decisions, tests, results and limitations: §14.5.
+* **Status:** all ten steps of the approved sequence done; the final verification (step 10) passed; acceptance by the
+  project owner pending. Decisions, tests, results and limitations: §14.5.
 
 #### S2-3: standalone `bsc-aworker` (no sessions)
 
@@ -840,7 +840,7 @@ not "do not merge".
 * **Decided at the S2-3 design review (B1–B5, §14.2):** the name `bsc-aworker` (`bin_PROGRAMS = bsc-aworker`); the
   worker role reuses the S2-2 contract `--aworker-fd`, `--aworker-index`, `--aworker-snapshot-fd` with strict
   validation (index 0–15 as digits), hidden from `bsc-aworker`'s public help; identity prefixes only in the new
-  executable. S2-3 starts only after S2-2 is accepted (step 10) and S2-3 is authorized.
+  executable. S2-3 starts only after S2-2 is accepted (its final verification, step 10, has passed) and S2-3 is authorized.
 
 #### S2-4: IPC v2 and fd-passing primitives
 
@@ -949,7 +949,7 @@ not "do not merge".
 | D-S9 | Detach release timeout | **unresolved** | S2-6 sign-off | §13.4 measurements |
 | D-S7 | Supervisor TCP port | deferred | only if a TCP interface is ever added | — |
 
-### 14.5 S2-2 implementation record (steps 1–8; step 9 = this revision; step 10 pending)
+### 14.5 S2-2 implementation record (steps 1–10)
 
 **Approved decisions** (second S2-2 review, implementation authorization, and the final decisions of 2026-11-17):
 
@@ -1010,6 +1010,34 @@ its workers); `real_s22.py` 72/72 normal, 73/73 ASan; E2E legacy 46/46, inline 4
 * Moving a snapshot descriptor above fd 2 (osmo-bsc started with a standard stream closed) is not exercised by a test.
 * P1–P20 contain pre-existing unguarded `kill(winfo(..).pid, …)` calls; with a worker that has no process (pid 0)
   they would signal the test's process group. Only reachable under mutants; the new P21–P30 guard it.
+* Runtime configuration input is not checked against the pool rules: the BSC's interactive `configure terminal` and
+  CTRL `apply-config-file` can still create an ASP in the BSC process, in any pool mode (pre-existing since Phase 1;
+  the checks run at startup only). Not changed in S2-2.
+* In snapshot mode a parse error is logged as "cannot parse the worker config file 'configuration snapshot (fd N)'"
+  (cosmetic: there is no file, and the descriptor is already closed then).
 * D-S10 (B2): `wq` mode unverified; the durable shared-file regression test belongs to S2-3.
-* Step 10 (full normal and ASan/UBSan verification, mutation run, legacy E2E, git and artifact report) is pending; its
-  report also records the incidents of the S2-2 work (kept in the step evidence).
+
+**Step 10, final verification (2026-11-17/18, HEAD `b48979738`):**
+* Clean builds of exactly the committed tree (`git archive`, autoreconf, the same configure options as before), normal
+  and ASan/UBSan: no compiler warning in A-worker code (the only warning, in `neighbor_ident.c`, is upstream and
+  untouched); `make check` 19/19 in both.
+* Every A-worker test run directly, three times each, in both builds: identical to its `.ok`; no sanitizer report from
+  any process (per-process sanitizer logs, forked and exec'd workers included).
+* Real binary from the clean builds: `real_s22.py` 72/72 normal (identical to the step-8 golden) and 73/73 ASan;
+  E2E legacy 46/46 and inline 49/49; `vtyrun.py` 5/5 transcripts in both builds.
+* Mutations, every step's final spec on the final code: 177 of 180 caught (step 1: 16/16, 2: 16/16, 3: 23/23,
+  4: 30/31, 5: 40/42, 6: 22/22, 7: 22/22, 8: 8/8). Survivors N10, F8, F9 are the accepted ones; F29 and F24 are
+  excluded because they create or delete directories in the real `/dev/shm` and `/tmp`. Superseded spec versions
+  (before the step-5 adaptations, L16) no longer apply to the code and were not run.
+* No leftover processes, listeners or snapshot directories; the worktree equals the commit.
+
+**Incidents during S2-2** (details in the step evidence under `~/dev/osmo-bsc-a-worker-recheck/`):
+* Step 1: `make -n -B` re-ran autotools and reset `.deps` files in the old build directories; all later work used fresh
+  build directories, the old ones were not used or changed again.
+* Step 5: mutation F29 left four private directories in the real `/dev/shm` and `/tmp`, and mutation F24 then deleted
+  them although they were to be preserved (a recorded preservation deviation; no stand-ins were recreated).
+* Step 7: a new test helper sent `kill(0, SIGKILL)` for a worker without a process under a mutant, killing the mutation
+  driver; the mutated source was restored by hand and verified, the helper guarded, the run repeated.
+* 2026-11-17 16:57 and overnight: host reboots. `/tmp` is emptied at boot (tmpfiles rule), so the 641 preserved
+  `/tmp/aworker_*` test directories were lost (not recoverable); the interrupted step-10 mutation run left one mutant
+  in the worktree, restored from the driver's on-disk copy (identical to the commit) before resuming.

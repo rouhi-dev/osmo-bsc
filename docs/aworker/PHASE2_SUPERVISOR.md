@@ -4,10 +4,10 @@
 and 2 of itself. Where it conflicts with `PHASE2_ARCHITECTURE.md`, this document wins (that document's revision note
 says so). The phased plan is `PHASE2_IMPLEMENTATION_PLAN.md` §13 and §14.
 
-**Implementation status (2026-11-17, HEAD `b4d890241`, S2-2 step 9).** Implemented: S1 (source separation into
+**Implementation status (2026-11-18, after S2-2 step 10).** Implemented: S1 (source separation into
 `libaworker.la`), S2-1 (inline form, view builder, BSC view, refusal of every configuration write in inline mode)
-and S2-2 steps 1–8 (single-read configuration, worker snapshots in **legacy mode**: osmo-bsc remains the workers'
-parent). S2-2 step 10 (full verification) is pending. **Not implemented:** the `bsc-aworker` executable (S2-3),
+and S2-2 (single-read configuration, worker snapshots in **legacy mode**: osmo-bsc remains the workers' parent; all
+ten steps done, the final verification of step 10 passed, acceptance by the project owner pending). **Not implemented:** the `bsc-aworker` executable (S2-3),
 supervisor mode, sessions, fd passing, the detached worker, the BSC session client and the operator channel
 (S2-3 … S2-8). Where this document describes the Supervisor, it describes the target, not existing code. What exists
 is marked **as implemented** below; plan §12 and §14.5 have the record and the verification results.

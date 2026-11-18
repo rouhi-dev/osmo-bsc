@@ -39,3 +39,19 @@ libaworker_la_LIBADD = \
 	$(LIBOSMOVTY_LIBS) \
 	$(LIBOSMOSIGTRAN_LIBS) \
 	$(NULL)
+
+# The A-worker Supervisor (S2-3): a program of its own, linked against libaworker and the Osmocom libraries only --
+# nothing of osmo-bsc. It also runs its workers, by re-executing itself (docs/aworker/PHASE2_SUPERVISOR.md).
+bin_PROGRAMS = bsc-aworker
+
+bsc_aworker_SOURCES = \
+	aworker_main.c \
+	$(NULL)
+
+bsc_aworker_LDADD = \
+	libaworker.la \
+	$(LIBOSMOCORE_LIBS) \
+	$(LIBOSMOGSM_LIBS) \
+	$(LIBOSMOVTY_LIBS) \
+	$(LIBOSMOSIGTRAN_LIBS) \
+	$(NULL)

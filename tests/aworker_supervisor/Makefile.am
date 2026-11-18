@@ -20,10 +20,17 @@ AM_LDFLAGS = \
 
 EXTRA_DIST = \
 	aworker_supervisor_test.ok \
+	aworker_supervisor_proc_test.ok \
 	$(NULL)
 
 check_PROGRAMS = \
 	aworker_supervisor_test \
+	aworker_supervisor_proc_test \
+	$(NULL)
+
+# Runs the real bsc-aworker (given as its argument); needs nothing but libc.
+aworker_supervisor_proc_test_SOURCES = \
+	aworker_supervisor_proc_test.c \
 	$(NULL)
 
 aworker_supervisor_test_SOURCES = \
@@ -42,3 +49,5 @@ aworker_supervisor_test_LDADD = \
 .PHONY: update_exp
 update_exp:
 	$(builddir)/aworker_supervisor_test > $(srcdir)/aworker_supervisor_test.ok
+	$(builddir)/aworker_supervisor_proc_test $(top_builddir)/src/a-worker/bsc-aworker \
+		> $(srcdir)/aworker_supervisor_proc_test.ok

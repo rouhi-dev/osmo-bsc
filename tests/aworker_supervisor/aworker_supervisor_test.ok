@@ -1,0 +1,37 @@
+C: the Supervisor's configuration (aworker_pool_supervisor_read_config())
+  inline pool of two workers, with BSC-only sections:
+    result 0; supervisor mode yes; workers 2 (0->cs7 0, 1->cs7 1); restart-delay 3; cs7 instances in this process 0; log file target yes
+  (only the log targets and 'a-worker-pool' are parsed: no cs7 instance in the Supervisor; its 'log file' target exists)
+  file form ('worker N config-file FILE'):
+    result -EINVAL; supervisor mode no; workers 0; restart-delay 5; cs7 instances in this process 0; log file target no
+    says: the Supervisor accepts only the inline form
+  both forms in one pool:
+    result -EINVAL; supervisor mode no; workers 0; restart-delay 5; cs7 instances in this process 0; log file target no
+    says: all workers of a pool use the same form
+  no 'a-worker-pool' section:
+    result -EINVAL; supervisor mode no; workers 0; restart-delay 5; cs7 instances in this process 0; log file target no
+    says: it configures no A-worker pool
+  'workers 0':
+    result -EINVAL; supervisor mode no; workers 0; restart-delay 5; cs7 instances in this process 0; log file target no
+    says: it configures no A-worker pool
+  'workers 2' with only worker 0 declared:
+    result -EINVAL; supervisor mode no; workers 0; restart-delay 5; cs7 instances in this process 0; log file target no
+    says: worker 1 has no 'worker 1 cs7-instance <N>'
+  'on-worker-failure shutdown' (D-S8):
+    result -EINVAL; supervisor mode no; workers 2 (0->cs7 0, 1->cs7 1); restart-delay 3; cs7 instances in this process 0; log file target yes
+    says: 'on-worker-failure shutdown' is not allowed for the Supervisor (D-S8)
+  'on-worker-failure restart':
+    result 0; supervisor mode yes; workers 2 (0->cs7 0, 1->cs7 1); restart-delay 3; cs7 instances in this process 0; log file target yes
+  no such file:
+    result -EINVAL; supervisor mode no; workers 0; restart-delay 5; cs7 instances in this process 0; log file target no
+    says: cannot read it: No such file or directory
+  an asp in a cs7 instance no worker owns:
+    result -EINVAL; supervisor mode no; workers 0; restart-delay 5; cs7 instances in this process 0; log file target no
+    says: cs7 instance 5
+  an invalid 'a-worker-pool' command:
+    result -EINVAL; supervisor mode no; workers 2 (0->cs7 0, 1->cs7 1); restart-delay 5; cs7 instances in this process 0; log file target yes
+    says: cannot be parsed
+  an invalid command in a log target:
+    result -EINVAL; supervisor mode no; workers 0; restart-delay 5; cs7 instances in this process 0; log file target yes
+    says: cannot be parsed
+PASSED

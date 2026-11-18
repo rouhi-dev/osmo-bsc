@@ -253,6 +253,7 @@ AC_OUTPUT(
     tests/aworker_proc/Makefile
     tests/aworker_snapshot/Makefile
     tests/aworker_worker/Makefile
+    tests/aworker_supervisor/Makefile
     tests/bsc/Makefile
     tests/codec_pref/Makefile
     tests/gsm0408/Makefile

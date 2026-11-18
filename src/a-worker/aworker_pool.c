@@ -148,6 +148,7 @@ bool aworker_pool_enabled(void)
  * it is refused; if it does not, it is handled as before. */
 static struct {
 	char *path;				/*!< the file classified, NULL if none yet */
+	int read_rc;				/*!< aworker_cfg_read_stable()'s result for it */
 	bool pool;				/*!< it configures an active pool: src and model are authoritative */
 	struct aworker_cfg_source *src;
 	struct aworker_cfg_model *model;
@@ -181,6 +182,7 @@ static int main_cfg_load(const char *config_file)
 	OSMO_ASSERT(g_main.path);
 
 	rc = aworker_cfg_read_stable(NULL, config_file, AWORKER_CFG_SOURCE_MAX, &g_main.src);
+	g_main.read_rc = rc;
 	if (rc == 0) {
 		rc = aworker_cfg_model_build_buf(NULL, config_file, g_main.src->buf, g_main.src->len, &g_main.model);
 		if (rc < 0)
@@ -306,6 +308,73 @@ int aworker_pool_read_config(const char *config_file)
 		     " without those nodes.\n", config_file);
 	}
 	return rc;
+}
+
+/* Supervisor mode: set by aworker_pool_supervisor_read_config(). */
+static bool g_supervisor;
+
+bool aworker_pool_supervisor_mode(void)
+{
+	return g_supervisor;
+}
+
+int aworker_pool_supervisor_read_config(const char *config_file)
+{
+	const struct aworker_cfg_model *m;
+	struct aworker_cfg_problem p[16];
+	char why[300];
+	unsigned int n, i;
+	size_t len;
+	char *view;
+	int rc;
+
+	rc = main_cfg_load(config_file);
+	if (rc < 0)
+		return rc;	/* a pool configuration that cannot be read in one stable pass: said already */
+	if (g_main.read_rc < 0 && !g_main.pool) {
+		snprintf(why, sizeof(why), "cannot read it: %s", strerror(-g_main.read_rc));
+		return main_cfg_refuse(config_file, why);
+	}
+	if (!g_main.pool)
+		return main_cfg_refuse(config_file, "it configures no A-worker pool ('a-worker-pool' with 'workers' 1 or"
+				       " more): the Supervisor has nothing to run");
+	m = g_main.model;
+
+	/* D-S1: the inline form only; and the rules of the inline form. */
+	n = aworker_cfg_model_check(m, true, p, ARRAY_SIZE(p));
+	for (i = 0; i < n && i < ARRAY_SIZE(p); i++) {
+		fprintf(stderr, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
+		LOGP(aworker_log_cat, LOGL_FATAL, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
+	}
+	if (n > ARRAY_SIZE(p))
+		fprintf(stderr, "%s: %u more problem(s) not shown\n", config_file, n - (unsigned int)ARRAY_SIZE(p));
+	if (n)
+		return -EINVAL;
+	for (i = 0; i < m->num_workers && i < AWORKER_CFG_VIEW_MAX_WORKERS; i++) {
+		if (!m->decl[i].inl) {
+			snprintf(why, sizeof(why), "'workers %u' is configured, but worker %u has no 'worker %u cs7-instance"
+				 " <N>': the Supervisor starts every worker from this file", m->num_workers, i, i);
+			return main_cfg_refuse(config_file, why);
+		}
+	}
+
+	/* The Supervisor's view: the log targets and 'a-worker-pool', nothing else. */
+	view = aworker_cfg_model_view(NULL, m, AWORKER_CFG_VIEW_SUPERVISOR, 0, &len);
+	if (!view)
+		return main_cfg_refuse(config_file, "cannot build the Supervisor's view of it");
+	rc = parse_text(view, len);
+	talloc_free(view);
+	if (rc < 0)
+		return main_cfg_refuse(config_file, "its log or 'a-worker-pool' configuration cannot be parsed (see above)");
+
+	/* D-S8: nothing to shut down -- the BSC is a separate process. */
+	if (g_cfg.on_failure == AWORKER_FAILURE_SHUTDOWN)
+		return main_cfg_refuse(config_file, "'on-worker-failure shutdown' is not allowed for the Supervisor (D-S8):"
+				       " the BSC is a separate process it does not shut down. Use 'on-worker-failure"
+				       " restart'");
+
+	g_supervisor = true;
+	return 0;
 }
 
 int aworker_pool_prescan_config(const char *config_file)

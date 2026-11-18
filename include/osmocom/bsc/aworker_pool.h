@@ -181,6 +181,16 @@ int aworker_pool_read_config(const char *config_file);
  * configuration file was parsed as a view (the inline form): the BSC holds only its part of the configuration, so any
  * file written from it lacks the workers' nodes -- and written over osmo-bsc.cfg, it would delete them. */
 const char *aworker_pool_config_write_refusal(void);
+/*! Supervisor mode (bsc-aworker; decisions D-S1, D-S8, D-S10): read \a config_file once (aworker_cfg_read_stable()),
+ * check it -- an 'a-worker-pool' with at least one worker, every worker in the inline form 'worker <N> cs7-instance
+ * <X>' with its cs7 instance in this file, the rules of aworker_cfg_model_check() for supervisor mode -- and parse
+ * only the Supervisor's view of it (the log targets and 'a-worker-pool'; nothing of the BSC, and no cs7 instance).
+ * 'on-worker-failure shutdown' is refused: there is no BSC process for it to shut down. The pool started afterwards
+ * (aworker_pool_start()) is run by the Supervisor: aworker_pool_supervisor_mode() is true from here on.
+ * \returns 0, or -EINVAL with every problem printed to stderr and logged. */
+int aworker_pool_supervisor_read_config(const char *config_file);
+/*! Whether aworker_pool_supervisor_read_config() set up this process as the Supervisor. */
+bool aworker_pool_supervisor_mode(void);
 /*! For vty_app_info.config_is_consistent, which libosmovty asks before every 'write file [PATH]', 'write',
  * 'write memory' and 'copy running-config startup-config', and before it records PATH. Says why and \returns 0
  * if aworker_pool_config_write_refusal() refuses, 1 otherwise. */

@@ -9,6 +9,7 @@ SUBDIRS = \
 	aworker_proc \
 	aworker_snapshot \
 	aworker_worker \
+	aworker_supervisor \
 	bsc \
 	codec_pref \
 	gsm0408 \

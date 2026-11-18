@@ -188,6 +188,43 @@ static bool type_is_tx(uint8_t t)
 	return t >= AWORKER_IPC_MT_TX_UNITDATA && t <= AWORKER_IPC_MT_TX_DISCONN;
 }
 
+unsigned int aworker_ipc_msg_class(uint8_t msg_type)
+{
+	switch (msg_type) {
+	case AWORKER_IPC_MT_HELLO:
+	case AWORKER_IPC_MT_ECHO_REQ:
+	case AWORKER_IPC_MT_ECHO_RSP:
+		return AWORKER_IPC_CLASS_LINK;
+	case AWORKER_IPC_MT_GOODBYE:
+	case AWORKER_IPC_MT_CS7_INFO:
+		return AWORKER_IPC_CLASS_CONTROL;
+	case AWORKER_IPC_MT_USER_BIND:
+	case AWORKER_IPC_MT_USER_UNBIND:
+	case AWORKER_IPC_MT_USER_BIND_RESULT:
+	case AWORKER_IPC_MT_TX_UNITDATA:
+	case AWORKER_IPC_MT_TX_CONN_REQ:
+	case AWORKER_IPC_MT_TX_CONN_RESP:
+	case AWORKER_IPC_MT_TX_DATA:
+	case AWORKER_IPC_MT_TX_DISCONN:
+	case AWORKER_IPC_MT_SCU_UP:
+	case AWORKER_IPC_MT_TX_FAILED:
+		return AWORKER_IPC_CLASS_DATA;
+	default:
+		return 0;
+	}
+}
+
+const char *aworker_ipc_class_name(unsigned int cls)
+{
+	switch (cls) {
+	case AWORKER_IPC_CLASS_LINK: return "link";
+	case AWORKER_IPC_CLASS_CONTROL: return "control";
+	case AWORKER_IPC_CLASS_DATA: return "data";
+	case AWORKER_IPC_CLASS_SESSION: return "session";
+	default: return "unknown";
+	}
+}
+
 bool aworker_ipc_type_valid_for(uint8_t msg_type, enum aworker_ipc_role receiver)
 {
 	int r;

@@ -257,5 +257,26 @@ V1-V6: protocol 2.0: versions and the identity in HELLO
   V6 different incarnation: refused (incompatible)
   V6 different boot nonce: refused (incompatible)
   V6 different session: refused (incompatible)
+K1-K4: message classes per channel
+  K1 HELLO            link
+  K1 ECHO_REQ         link
+  K1 ECHO_RSP         link
+  K1 GOODBYE          control
+  K1 CS7_INFO         control
+  K1 USER_BIND        data
+  K1 USER_UNBIND      data
+  K1 USER_BIND_RESULT data
+  K1 TX_UNITDATA      data
+  K1 TX_CONN_REQ      data
+  K1 TX_CONN_RESP     data
+  K1 TX_DATA          data
+  K1 TX_DISCONN       data
+  K1 SCU_UP           data
+  K1 TX_FAILED        data
+  K1 15 known types, each in exactly one class; the 241 other values in none
+  K2 data-only link: sending GOODBYE (control) refused, nothing sent, the link stays up
+  K2 data-only link receiving CS7_INFO (control): closed (class), not delivered
+  K3 control-only link receiving USER_BIND (data): closed (class), not delivered
+  K4 default link: control and data both delivered; a session-only link still answers ECHO (link)
 talloc blocks at the end: unchanged
 PASSED

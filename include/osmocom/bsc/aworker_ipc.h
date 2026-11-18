@@ -77,6 +77,14 @@
  *                     post_conn u8 | reserved u8[3] = 0
  * conn_id is <= AWORKER_IPC_CONN_ID_MAX (24 bit SCCP local reference, all-ones excluded).
  *
+ * Classes (since 2.0; aworker_ipc_msg_class()). Every message type belongs to exactly one class, and a link carries
+ * a configured set of classes (aworker_ipc_link.h); a record of another class closes it:
+ *   LINK     HELLO, ECHO_REQ, ECHO_RSP: every link
+ *   CONTROL  GOODBYE, CS7_INFO: Supervisor (or osmo-bsc's pool) <-> worker
+ *   DATA     USER_BIND, USER_UNBIND, USER_BIND_RESULT, TX_*, SCU_UP, TX_FAILED: BSC <-> worker
+ *   SESSION  (no message yet): BSC or operator <-> Supervisor
+ * The worker link of osmo-bsc's pool and of bsc-aworker carries CONTROL and DATA (the default).
+ *
  * SCU_UP parameters, per allowed (primitive, operation); every field of the osmo_scu_*_param struct:
  *   N-CONNECT.ind/.cnf  called ADDR | calling ADDR | responding ADDR | sccp_class u32 | importance u32 | conn_id u32
  *   N-DATA.ind          conn_id u32 | importance u32
@@ -143,6 +151,18 @@ enum aworker_ipc_msg_type {
 	AWORKER_IPC_MT_SCU_UP = 0x30,
 	AWORKER_IPC_MT_TX_FAILED = 0x31,
 };
+
+/*! Message classes: bit values, so that a set of them is an OR. */
+enum aworker_ipc_class {
+	AWORKER_IPC_CLASS_LINK = 0x01,
+	AWORKER_IPC_CLASS_CONTROL = 0x02,
+	AWORKER_IPC_CLASS_DATA = 0x04,
+	AWORKER_IPC_CLASS_SESSION = 0x08,
+};
+
+/*! The class of a message type; 0 for an unknown type. */
+unsigned int aworker_ipc_msg_class(uint8_t msg_type);
+const char *aworker_ipc_class_name(unsigned int cls);
 
 enum aworker_ipc_goodbye_reason {
 	AWORKER_IPC_GOODBYE_SHUTDOWN = 1,

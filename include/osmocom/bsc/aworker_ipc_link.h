@@ -32,6 +32,10 @@
  * ready_cb is called) and -ENOTCONN once closed. Received sequence numbers must increase by exactly 1.
  * ECHO_REQ is answered by the link itself; all other messages after HELLO are passed to rx_cb.
  *
+ * Classes (aworker_ipc.h): a link carries the LINK class and the classes of cfg->classes (0: CONTROL and DATA, the
+ * worker link as it always was). A received record of another class closes the link (AWORKER_IPC_CLOSE_CLASS);
+ * aworker_ipc_link_send() refuses to send one (-EINVAL; nothing is sent, the link stays up).
+ *
  * Fail closed: every receive error, peer EOF, oversized/truncated record (MSG_TRUNC or > AWORKER_IPC_MAX_FRAME),
  * decode error, sequence error, send error, partial send, full transmit queue or allocation failure closes the link:
  * the socket is closed and the transmit queue discarded, so a partially sent record can never be followed by its
@@ -76,6 +80,7 @@ enum aworker_ipc_close_reason {
 	AWORKER_IPC_CLOSE_TX_SEQ,		/*!< send completions out of order */
 	AWORKER_IPC_CLOSE_TX_QUEUE_FULL,	/*!< transmit queue full */
 	AWORKER_IPC_CLOSE_NO_MEMORY,		/*!< allocation failure */
+	AWORKER_IPC_CLOSE_CLASS,		/*!< a record of a class this link does not carry; err = msg type */
 };
 
 const char *aworker_ipc_close_reason_name(enum aworker_ipc_close_reason reason);
@@ -102,6 +107,7 @@ struct aworker_ipc_link_cfg {
 	uint32_t pid;			/*!< sent in HELLO, informational */
 	const char *ident;		/*!< sent in HELLO, informational (<= 64 printable ASCII characters) */
 	struct aworker_ipc_identity id;	/*!< sent in HELLO; checked against the peer's (0 fields: not asserted) */
+	unsigned int classes;		/*!< enum aworker_ipc_class set besides LINK; 0: CONTROL | DATA */
 	unsigned int txqueue_max;	/*!< 0: default (1024 records) */
 	int log_cat;			/*!< logging category */
 };

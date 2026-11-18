@@ -40,6 +40,7 @@ struct aworker_ipc_link {
 	int log_cat;
 	char ident[AWORKER_IPC_MAX_IDENT + 1];
 	struct aworker_ipc_identity id;
+	unsigned int classes;		/* allowed classes, LINK included */
 	const struct aworker_ipc_link_ops *ops;
 	void *priv;
 
@@ -76,6 +77,7 @@ static const struct value_string close_reason_names[] = {
 	{ AWORKER_IPC_CLOSE_TX_SEQ, "tx-seq" },
 	{ AWORKER_IPC_CLOSE_TX_QUEUE_FULL, "tx-queue-full" },
 	{ AWORKER_IPC_CLOSE_NO_MEMORY, "no-memory" },
+	{ AWORKER_IPC_CLOSE_CLASS, "class" },
 	{ 0, NULL }
 };
 
@@ -247,6 +249,13 @@ static void handle_rx(struct aworker_ipc_link *link, int res, struct msgb *msg, 
 		return;
 	}
 	link->rx_records++;
+	if (!(aworker_ipc_msg_class(m.type) & link->classes)) {
+		LOG_LINK(link, LOGL_ERROR, "received %s, of class %s, which this link does not carry\n",
+			 aworker_ipc_msg_type_name(m.type), aworker_ipc_class_name(aworker_ipc_msg_class(m.type)));
+		msgb_free(msg);
+		link_fail(link, AWORKER_IPC_CLOSE_CLASS, m.type);
+		return;
+	}
 	if (m.seq != link->rx_next_seq) {
 		LOG_LINK(link, LOGL_ERROR, "received %s with seq %u, expected %u\n", aworker_ipc_msg_type_name(m.type),
 			 m.seq, link->rx_next_seq);
@@ -421,6 +430,8 @@ int aworker_ipc_link_alloc(struct aworker_ipc_link **out, void *ctx, int fd, con
 	link->log_cat = cfg->log_cat;
 	OSMO_STRLCPY_ARRAY(link->ident, ident);
 	link->id = cfg->id;
+	link->classes = AWORKER_IPC_CLASS_LINK
+			| (cfg->classes ? cfg->classes : AWORKER_IPC_CLASS_CONTROL | AWORKER_IPC_CLASS_DATA);
 	link->ops = ops;
 	link->priv = priv;
 	link->state = AWORKER_IPC_LINK_HELLO_WAIT;
@@ -496,6 +507,12 @@ int aworker_ipc_link_send(struct aworker_ipc_link *link, struct msgb *msg, uint3
 	if (rc < 0 || check.type == AWORKER_IPC_MT_HELLO) {
 		LOG_LINK(link, LOGL_ERROR, "refusing to send invalid record: %s\n",
 			 rc < 0 ? aworker_ipc_err_name(rc) : "HELLO is sent by the link");
+		msgb_free(msg);
+		return -EINVAL;
+	}
+	if (!(aworker_ipc_msg_class(check.type) & link->classes)) {
+		LOG_LINK(link, LOGL_ERROR, "refusing to send %s: class %s, which this link does not carry\n",
+			 aworker_ipc_msg_type_name(check.type), aworker_ipc_class_name(aworker_ipc_msg_class(check.type)));
 		msgb_free(msg);
 		return -EINVAL;
 	}

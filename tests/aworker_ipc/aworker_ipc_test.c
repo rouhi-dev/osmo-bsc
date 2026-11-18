@@ -1315,6 +1315,19 @@ static int tl_alloc_id(struct tl *t, const char *name, int fd, enum aworker_ipc_
 	return aworker_ipc_link_alloc(&t->link, ctx, fd, &cfg, &tl_ops, t);
 }
 
+static int tl_alloc_cls(struct tl *t, const char *name, int fd, enum aworker_ipc_role role, unsigned int classes)
+{
+	struct aworker_ipc_link_cfg cfg = {
+		.role = role, .worker_idx = 1, .pid = 1000 + role, .ident = "test", .log_cat = DLGLOBAL,
+		.classes = classes,
+	};
+	memset(t, 0, sizeof(*t));
+	t->name = name;
+	t->fd = fd;
+	t->order_ok = true;
+	return aworker_ipc_link_alloc(&t->link, ctx, fd, &cfg, &tl_ops, t);
+}
+
 static void tl_free(struct tl *t)
 {
 	if (t->link)
@@ -1967,6 +1980,114 @@ static void test_v1_v6_version_identity(void)
 	id_link_case("V6 different session", id, (struct aworker_ipc_identity){ .session_id = 4 }, false);
 }
 
+/***********************************************************************
+ * K1-K4: message classes per channel
+ ***********************************************************************/
+
+/* A pair of links; m carries m_classes, w w_classes; both READY afterwards. */
+static void cls_pair(struct tl *m, struct tl *w, unsigned int m_classes, unsigned int w_classes)
+{
+	int sv[2];
+
+	mk_pair(sv);
+	CHECK(tl_alloc_cls(m, "main", sv[0], AWORKER_IPC_ROLE_MAIN, m_classes) == 0);
+	CHECK(tl_alloc_cls(w, "worker", sv[1], AWORKER_IPC_ROLE_WORKER, w_classes) == 0);
+	PUMP_UNTIL(m->ready && w->ready);
+	CHECK(m->ready && w->ready);
+}
+
+static struct msgb *cs7_info_rec(void)
+{
+	struct aworker_ipc_cs7_info info = {
+		.count = 1, .e[0] = { .cs7_id = 0, .primary_pc = 185, .asp_proto = OSMO_SS7_ASP_PROT_M3UA, .num_as = 1 },
+	};
+	struct msgb *msg;
+	OSMO_ASSERT(aworker_ipc_enc_cs7_info(ctx, &msg, &info) == 0);
+	return msg;
+}
+
+static void test_k1_k4_classes(void)
+{
+	static const uint8_t types[] = {
+		AWORKER_IPC_MT_HELLO, AWORKER_IPC_MT_ECHO_REQ, AWORKER_IPC_MT_ECHO_RSP, AWORKER_IPC_MT_GOODBYE,
+		AWORKER_IPC_MT_CS7_INFO, AWORKER_IPC_MT_USER_BIND, AWORKER_IPC_MT_USER_UNBIND,
+		AWORKER_IPC_MT_USER_BIND_RESULT, AWORKER_IPC_MT_TX_UNITDATA, AWORKER_IPC_MT_TX_CONN_REQ,
+		AWORKER_IPC_MT_TX_CONN_RESP, AWORKER_IPC_MT_TX_DATA, AWORKER_IPC_MT_TX_DISCONN, AWORKER_IPC_MT_SCU_UP,
+		AWORKER_IPC_MT_TX_FAILED,
+	};
+	size_t blocks = talloc_total_blocks(ctx);
+	struct msgb *msg;
+	struct tl m, w;
+	unsigned int i, t, n_known = 0;
+
+	printf("K1-K4: message classes per channel\n");
+
+	/* K1: every type in exactly one class; unknown types in none */
+	for (i = 0; i < ARRAY_SIZE(types); i++) {
+		unsigned int c = aworker_ipc_msg_class(types[i]);
+		printf("  K1 %-16s %s\n", aworker_ipc_msg_type_name(types[i]), aworker_ipc_class_name(c));
+		CHECK(c && !(c & (c - 1)));
+	}
+	for (t = 0; t < 256; t++) {
+		bool known = aworker_ipc_type_valid_for(t, AWORKER_IPC_ROLE_MAIN)
+			     || aworker_ipc_type_valid_for(t, AWORKER_IPC_ROLE_WORKER);
+		n_known += known;
+		CHECK(known == (aworker_ipc_msg_class(t) != 0));
+	}
+	CHECK(n_known == ARRAY_SIZE(types));
+	printf("  K1 %u known types, each in exactly one class; the 241 other values in none\n", n_known);
+
+	/* K2: a DATA-only main side: sending a CONTROL record is refused, the link stays up; receiving one closes it */
+	cls_pair(&m, &w, AWORKER_IPC_CLASS_DATA, 0);
+	CHECK(aworker_ipc_enc_goodbye(ctx, &msg, AWORKER_IPC_GOODBYE_SHUTDOWN) == 0);
+	CHECK(aworker_ipc_link_send(m.link, msg, NULL) == -EINVAL);
+	pump(5);
+	CHECK(!m.closed && aworker_ipc_link_get_state(m.link) == AWORKER_IPC_LINK_READY);
+	printf("  K2 data-only link: sending GOODBYE (control) refused, nothing sent, the link stays up\n");
+	CHECK(aworker_ipc_link_send(w.link, cs7_info_rec(), NULL) == 0);
+	PUMP_UNTIL(m.closed);
+	CHECK(m.closed == 1 && m.ci.reason == AWORKER_IPC_CLOSE_CLASS && m.ci.err == AWORKER_IPC_MT_CS7_INFO);
+	CHECK(m.rx == 0);
+	printf("  K2 data-only link receiving CS7_INFO (control): closed (%s), not delivered\n",
+	       aworker_ipc_close_reason_name(m.ci.reason));
+	tl_free(&m);
+	tl_free(&w);
+	pump(2);
+
+	/* K3: a CONTROL-only worker side receiving a DATA record */
+	cls_pair(&m, &w, 0, AWORKER_IPC_CLASS_CONTROL);
+	CHECK(aworker_ipc_enc_user_bind(ctx, &msg, 1, 0, 254, "BSSAP") == 0);
+	CHECK(aworker_ipc_link_send(m.link, msg, NULL) == 0);
+	PUMP_UNTIL(w.closed);
+	CHECK(w.closed == 1 && w.ci.reason == AWORKER_IPC_CLOSE_CLASS && w.rx == 0);
+	printf("  K3 control-only link receiving USER_BIND (data): closed (%s), not delivered\n",
+	       aworker_ipc_close_reason_name(w.ci.reason));
+	tl_free(&m);
+	tl_free(&w);
+	pump(2);
+
+	/* K4: the default (0) carries CONTROL and DATA, and ECHO (LINK) works on a restricted link */
+	cls_pair(&m, &w, 0, 0);
+	CHECK(aworker_ipc_link_send(w.link, cs7_info_rec(), NULL) == 0);
+	CHECK(aworker_ipc_enc_user_bind(ctx, &msg, 1, 0, 254, "BSSAP") == 0);
+	CHECK(aworker_ipc_link_send(m.link, msg, NULL) == 0);
+	PUMP_UNTIL(m.rx == 1 && w.rx == 1);
+	CHECK(m.rx == 1 && w.rx == 1 && !m.closed && !w.closed);
+	tl_free(&m);
+	tl_free(&w);
+	pump(2);
+	cls_pair(&m, &w, AWORKER_IPC_CLASS_SESSION, AWORKER_IPC_CLASS_SESSION);
+	CHECK(aworker_ipc_enc_echo(ctx, &msg, false, 42) == 0);
+	CHECK(aworker_ipc_link_send(m.link, msg, NULL) == 0);
+	pump(20);
+	CHECK(!m.closed && !w.closed);
+	printf("  K4 default link: control and data both delivered; a session-only link still answers ECHO (link)\n");
+	tl_free(&m);
+	tl_free(&w);
+	pump(2);
+	CHECK(talloc_total_blocks(ctx) == blocks);
+}
+
 int main(int argc, char **argv)
 {
 	size_t blocks;
@@ -1998,6 +2119,7 @@ int main(int argc, char **argv)
 	test_l13_fd_types();
 	test_l14_l19_injection();
 	test_v1_v6_version_identity();
+	test_k1_k4_classes();
 
 	printf("talloc blocks at the end: %s\n", talloc_total_blocks(ctx) == blocks ? "unchanged" : "LEAK");
 	CHECK(talloc_total_blocks(ctx) == blocks);

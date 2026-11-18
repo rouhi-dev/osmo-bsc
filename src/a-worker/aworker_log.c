@@ -23,6 +23,9 @@
 #include <osmocom/bsc/debug.h>
 
 int aworker_log_cat = DAWORKER;
+const char *aworker_program_name = "osmo-bsc";
+const char *aworker_log_prefix = "";
+unsigned int aworker_incarnation;
 
 const struct log_info_cat osmo_bsc_categories[Debug_LastEntry] = {
 	[DRLL] = {

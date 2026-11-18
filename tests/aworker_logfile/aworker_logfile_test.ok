@@ -1,0 +1,5 @@
+4 processes appending 2500 lines each (10 to 4000 octets) to one 'log file' at the same time
+  default (nonblocking-io): writers all ended normally; no malformed line; every line present exactly once
+  blocking-io: writers all ended normally; no malformed line; every line present exactly once
+  wq: not tested; no claim
+PASSED

@@ -166,7 +166,7 @@ static int main_cfg_refuse(const char *config_file, const char *why)
 {
 	/* Logging is not configured yet at this point, so say it on stderr as well. */
 	fprintf(stderr, "%s: %s\n", config_file, why);
-	LOGP(aworker_log_cat, LOGL_FATAL, "%s: %s\n", config_file, why);
+	LOGPAW(LOGL_FATAL, "%s: %s\n", config_file, why);
 	return -EINVAL;
 }
 
@@ -211,8 +211,8 @@ static int main_cfg_load(const char *config_file)
 		snprintf(why, sizeof(why), "an 'a-worker-pool' configuration must be read from a regular file");
 	else
 		snprintf(why, sizeof(why), "the file changed while it was being read; refusing to start the A-worker"
-			 " pool from a configuration that may be inconsistent. Start osmo-bsc again once the file is"
-			 " no longer being written");
+			 " pool from a configuration that may be inconsistent. Start %s again once the file is"
+			 " no longer being written", aworker_program_name);
 	return main_cfg_refuse(config_file, why);
 }
 
@@ -229,7 +229,7 @@ static int prescan_inline(const char *config_file, const struct aworker_cfg_mode
 	for (i = 0; i < n && i < ARRAY_SIZE(p); i++) {
 		/* Logging is not configured yet at this point, so say it on stderr as well. */
 		fprintf(stderr, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
-		LOGP(aworker_log_cat, LOGL_FATAL, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
+		LOGPAW(LOGL_FATAL, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
 	}
 	if (n > ARRAY_SIZE(p))
 		fprintf(stderr, "%s: %u more problem(s) not shown\n", config_file, n - (unsigned int)ARRAY_SIZE(p));
@@ -301,7 +301,7 @@ int aworker_pool_read_config(const char *config_file)
 	 * (aworker_pool_config_write_refusal()); the workers never open it -- they have their snapshots. */
 	if (rc == 0) {
 		host_config_set(config_file);
-		LOGP(aworker_log_cat, LOGL_NOTICE, "'%s' uses the inline A-worker form: parsed without the asp / as /"
+		LOGPAW(LOGL_NOTICE, "'%s' uses the inline A-worker form: parsed without the asp / as /"
 		     " listen nodes of the worker-owned cs7 instances, which belong to the workers."
 		     " Writing the configuration (VTY 'write file [PATH]', 'write', 'write memory', 'copy"
 		     " running-config startup-config'; CTRL 'write-config-file') is refused, as it would write it"
@@ -344,7 +344,7 @@ int aworker_pool_supervisor_read_config(const char *config_file)
 	n = aworker_cfg_model_check(m, true, p, ARRAY_SIZE(p));
 	for (i = 0; i < n && i < ARRAY_SIZE(p); i++) {
 		fprintf(stderr, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
-		LOGP(aworker_log_cat, LOGL_FATAL, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
+		LOGPAW(LOGL_FATAL, "%s:%u: %s\n", config_file, p[i].lineno, p[i].msg);
 	}
 	if (n > ARRAY_SIZE(p))
 		fprintf(stderr, "%s: %u more problem(s) not shown\n", config_file, n - (unsigned int)ARRAY_SIZE(p));
@@ -407,7 +407,7 @@ int aworker_pool_prescan_config(const char *config_file)
 		" 'worker <N> config-file FILE', and keep only 'point-code', 'point-code format' and the"
 		" 'sccp-address' book in the main configuration file.\n",
 		config_file, c->node_lineno, c->node, c->id, c->lineno, scan.num_workers);
-	LOGP(aworker_log_cat, LOGL_FATAL,
+	LOGPAW(LOGL_FATAL,
 	     "%s:%u: '%s' is not allowed inside 'cs7 instance %u' (line %u) when 'a-worker-pool' is configured\n",
 	     config_file, c->node_lineno, c->node, c->id, c->lineno);
 	return -EINVAL;
@@ -450,7 +450,7 @@ static int ownership_build(const struct aworker_pool_cfg *cfg, struct ownership 
 			int prev = id < AWORKER_POOL_MAX_CS7_ID ? own->owner[id] : -1;
 
 			if (cfg->cfg_file[i]) {
-				LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': worker %u has both 'config-file' and"
+				LOGPAW(LOGL_FATAL, "'a-worker-pool': worker %u has both 'config-file' and"
 				     " 'cs7-instance'; a worker uses exactly one form\n", i);
 				rc = -EINVAL;
 				continue;
@@ -458,7 +458,7 @@ static int ownership_build(const struct aworker_pool_cfg *cfg, struct ownership 
 			if (id >= AWORKER_POOL_MAX_CS7_ID)
 				continue;	/* refused by the VTY */
 			if (prev >= 0 && prev != (int)i) {
-				LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': cs7 instance %u is assigned to worker %d"
+				LOGPAW(LOGL_FATAL, "'a-worker-pool': cs7 instance %u is assigned to worker %d"
 				     " and to worker %u; each cs7 instance belongs to exactly one worker\n", id, prev, i);
 				rc = -EINVAL;
 				continue;
@@ -471,7 +471,7 @@ static int ownership_build(const struct aworker_pool_cfg *cfg, struct ownership 
 			continue;
 		src = aworker_cfg_scan(cfg->cfg_file[i], &scan);
 		if (src < 0) {
-			LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u: cannot read its config file '%s': %s; which cs7"
+			LOGPAW(LOGL_ERROR, "aworker %u: cannot read its config file '%s': %s; which cs7"
 			     " instances it owns is unknown\n", i, cfg->cfg_file[i], strerror(-src));
 			own->unreadable[i] = true;
 			own->num_unreadable++;
@@ -489,7 +489,7 @@ static int ownership_build(const struct aworker_pool_cfg *cfg, struct ownership 
 			}
 			prev = own->owner[sc->id];
 			if (prev >= 0 && prev != (int)i) {
-				LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': cs7 instance %u is configured in two worker"
+				LOGPAW(LOGL_FATAL, "'a-worker-pool': cs7 instance %u is configured in two worker"
 				     " config files: worker %d '%s' (line %u) and worker %u '%s' (line %u). Each cs7"
 				     " instance must be configured, with its asp / as, in exactly one worker config"
 				     " file.\n", sc->id, prev, cfg->cfg_file[prev], own->lineno[sc->id], i,
@@ -525,17 +525,17 @@ int aworker_pool_check_ownership(const struct aworker_pool_msc_ref *mscs, unsign
 			continue;
 		if (own.num_unreadable) {
 			/* It may be in a file we could not read: that worker fails on its own when it starts. */
-			LOGP(aworker_log_cat, LOGL_ERROR, "'a-worker-pool': msc %d uses cs7 instance %u, which none of the"
+			LOGPAW(LOGL_ERROR, "'a-worker-pool': msc %d uses cs7 instance %u, which none of the"
 			     " readable worker config files configures (%u could not be read)\n", mscs[i].nr, id,
 			     own.num_unreadable);
 			continue;
 		}
 		if (pool_is_inline(&g_cfg))
-			LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': msc %d uses cs7 instance %u, but no worker"
+			LOGPAW(LOGL_FATAL, "'a-worker-pool': msc %d uses cs7 instance %u, but no worker"
 			     " owns that instance, so no A-worker would ever serve this msc. Add 'worker <N> cs7-instance"
 			     " %u'.\n", mscs[i].nr, id, id);
 		else
-			LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': msc %d uses cs7 instance %u, but no worker config"
+			LOGPAW(LOGL_FATAL, "'a-worker-pool': msc %d uses cs7 instance %u, but no worker config"
 			     " file configures that instance with an asp / as, so no A-worker would ever serve this msc."
 			     " Add 'cs7 instance %u' with its asp to exactly one worker config file.\n", mscs[i].nr, id,
 			     id);
@@ -563,7 +563,7 @@ int aworker_pool_check_main_cs7(void)
 		for (p = OSMO_SS7_ASP_PROT_SUA; p < _NUM_OSMO_SS7_ASP_PROT; p++) {
 			if (!osmo_ss7_as_find_by_proto(inst, p))
 				continue;
-			LOGP(aworker_log_cat, LOGL_FATAL,
+			LOGPAW(LOGL_FATAL,
 			     "'a-worker-pool' is configured, but 'cs7 instance %u' of the main process has the"
 			     " %s Application Server. The A-workers own the SIGTRAN stack; the main process"
 			     " must only configure 'point-code', 'point-code format' and the 'sccp-address' book."
@@ -623,9 +623,15 @@ static void worker_fail(struct aworker *w, enum aworker_fail_reason reason, cons
 	osmo_strlcpy(w->fail_detail, detail, sizeof(w->fail_detail));
 	w->failed_at = time(NULL);
 	osmo_timer_del(&w->restart_timer);
-	LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u (pid %ld): FAILED (%s): %s. It is not restarted; osmo-bsc and the"
-	     " other workers continue. Fix the cause, then 'a-worker-pool reset worker %u'.\n", w->idx,
-	     (long)w->last_pid, aworker_fail_reason_name(reason), w->fail_detail, w->idx);
+	if (g_supervisor)
+		/* No reset command yet: the operator channel comes with sessions (S2-5). */
+		LOGPAW(LOGL_ERROR, "aworker %u (pid %ld): FAILED (%s): %s. It is not restarted; %s and the other workers"
+		       " continue. Fix the cause, then restart %s.\n", w->idx, (long)w->last_pid,
+		       aworker_fail_reason_name(reason), w->fail_detail, aworker_program_name, aworker_program_name);
+	else
+		LOGPAW(LOGL_ERROR, "aworker %u (pid %ld): FAILED (%s): %s. It is not restarted; %s and the"
+		     " other workers continue. Fix the cause, then 'a-worker-pool reset worker %u'.\n", w->idx,
+		     (long)w->last_pid, aworker_fail_reason_name(reason), w->fail_detail, aworker_program_name, w->idx);
 }
 
 /* Restart backoff: the delay before the restart after the step-th consecutive unplanned loss (step 0: the first).
@@ -711,7 +717,7 @@ static void worker_schedule_restart(struct aworker *w)
 	osmo_clock_gettime(CLOCK_MONOTONIC, &w->restart_at[w->num_restart_at++]);
 
 	if (w->stable_at_loss && w->backoff_step) {
-		LOGP(aworker_log_cat, LOGL_NOTICE, "aworker %u: it was READY for at least stable-time (%u s) before it was"
+		LOGPAW(LOGL_NOTICE, "aworker %u: it was READY for at least stable-time (%u s) before it was"
 		     " lost: the restart delay starts over at restart-delay\n", w->idx, pool->cfg.stable_time);
 		w->backoff_step = 0;
 	}
@@ -719,7 +725,7 @@ static void worker_schedule_restart(struct aworker *w)
 	w->restart_delay_s = restart_delay_for(&pool->cfg, w->backoff_step);
 	if (w->backoff_step < 32)
 		w->backoff_step++;
-	LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u (pid %ld): worker lost (%s); restarting in %u s (unplanned restart"
+	LOGPAW(LOGL_ERROR, "aworker %u (pid %ld): worker lost (%s); restarting in %u s (unplanned restart"
 	     " %u in a row)\n", w->idx, (long)w->last_pid, w->lost_reason, w->restart_delay_s, w->backoff_step);
 	w->state = AWORKER_ST_RESTARTING;
 	osmo_timer_schedule(&w->restart_timer, w->restart_delay_s, 0);
@@ -765,14 +771,14 @@ static void worker_apply_policy(struct aworker *w, bool config_error)
 			worker_fail(w, fail, detail);
 			return;
 		}
-		LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u: worker lost (%s)\n", w->idx, why);
+		LOGPAW(LOGL_ERROR, "aworker %u: worker lost (%s)\n", w->idx, why);
 		return;
 	}
 
 	switch (pool->cfg.on_failure) {
 	case AWORKER_FAILURE_SHUTDOWN:
 		/* The explicit opt-in: any worker failure ends osmo-bsc, including one restarting cannot fix. */
-		LOGP(aworker_log_cat, LOGL_FATAL, "aworker %u (pid %ld): worker lost (%s) and 'on-worker-failure"
+		LOGPAW(LOGL_FATAL, "aworker %u (pid %ld): worker lost (%s) and 'on-worker-failure"
 		     " shutdown' is configured; shutting down osmo-bsc\n", w->idx, pid,
 		     fail != AWORKER_FAIL_NONE ? detail : why);
 		g_fatal = true;
@@ -1132,7 +1138,7 @@ static int link_create(struct aworker *w, int fd)
 		.role = AWORKER_IPC_ROLE_MAIN,
 		.worker_idx = w->idx,
 		.pid = (uint32_t)getpid(),
-		.ident = "osmo-bsc",
+		.ident = aworker_program_name,
 		.log_cat = aworker_log_cat,
 	};
 	int rc;
@@ -1228,7 +1234,7 @@ void aworker_pool_set_exec(const char *argv0, int argc, char **argv)
 		path[len] = '\0';
 		g_exec_path = talloc_strdup(NULL, path);
 	} else {
-		g_exec_path = talloc_strdup(NULL, argv0 ? argv0 : "osmo-bsc");
+		g_exec_path = talloc_strdup(NULL, argv0 ? argv0 : aworker_program_name);
 	}
 	OSMO_ASSERT(g_exec_path);
 
@@ -1238,9 +1244,9 @@ void aworker_pool_set_exec(const char *argv0, int argc, char **argv)
 		close(g_exec_fd);
 	g_exec_fd = fd_above_stdio(open("/proc/self/exe", O_RDONLY | O_CLOEXEC), true);
 	if (g_exec_fd < 0)
-		LOGP(aworker_log_cat, LOGL_NOTICE, "cannot open /proc/self/exe (%s): workers will be started from the path '%s',"
-		     " so replacing that file while osmo-bsc runs would make a restarted worker a different binary\n",
-		     strerror(errno), g_exec_path);
+		LOGPAW(LOGL_NOTICE, "cannot open /proc/self/exe (%s): workers will be started from the path '%s',"
+		     " so replacing that file while %s runs would make a restarted worker a different binary\n",
+		     strerror(errno), g_exec_path, aworker_program_name);
 
 	g_exec_log_argv = talloc_zero_array(g_exec_path, char *, argc + 1);
 	OSMO_ASSERT(g_exec_log_argv);
@@ -1305,7 +1311,14 @@ static void close_fds_by_proc(const int *keep, unsigned int n_keep)
 			/* Not even /proc: we cannot see which descriptors are open, so close the whole range. */
 			static const char msg[] = "osmo-bsc: aworker: no close_range() and no /proc/self/fd; closing"
 						  " descriptors up to RLIMIT_NOFILE\n";
-			if (write(2, msg, sizeof(msg) - 1) < 0) {}
+			static const char msg_sup[] = "bsc-aworker: aworker: no close_range() and no /proc/self/fd;"
+						      " closing descriptors up to RLIMIT_NOFILE\n";
+			/* Between fork() and exec(): no formatting, only a fixed text per program. */
+			if (g_supervisor) {
+				if (write(2, msg_sup, sizeof(msg_sup) - 1) < 0) {}
+			} else {
+				if (write(2, msg, sizeof(msg) - 1) < 0) {}
+			}
 			close_fds_by_rlimit(keep, n_keep);
 			return;
 		}
@@ -1346,10 +1359,11 @@ static void child_close_fds(const int *keep, unsigned int n_keep)
  * other one -- the other workers' snapshots and anything else of the main process (child_close_fds()). Only the IPC
  * socket and the snapshot are made inheritable; g_exec_fd stays close-on-exec, so after exec() the worker holds
  * exactly stdio, the IPC socket and (inline form) its own snapshot, which it closes once it has read it. */
-static void child_exec_worker(unsigned int idx, const char *cfg_file, int snap_fd, int fd, pid_t parent)
+static void child_exec_worker(unsigned int idx, const char *cfg_file, int snap_fd, int fd, pid_t parent,
+			      unsigned int incarnation)
 {
 	char **argv;
-	char fdstr[16], idxstr[16], snapstr[16];
+	char fdstr[16], idxstr[16], snapstr[16], incstr[16];
 	unsigned int n = 0, i, j;
 	int keep[3], n_keep = 0;
 	int flags;
@@ -1402,8 +1416,9 @@ static void child_exec_worker(unsigned int idx, const char *cfg_file, int snap_f
 	snprintf(fdstr, sizeof(fdstr), "%d", fd);
 	snprintf(idxstr, sizeof(idxstr), "%u", idx);
 	snprintf(snapstr, sizeof(snapstr), "%d", snap_fd);
+	snprintf(incstr, sizeof(incstr), "%u", incarnation);
 
-	argv = calloc(g_exec_log_argc + 8, sizeof(*argv));
+	argv = calloc(g_exec_log_argc + 10, sizeof(*argv));
 	if (!argv)
 		_exit(AWORKER_EXIT_CONFIG);
 	argv[n++] = g_exec_path;
@@ -1421,6 +1436,11 @@ static void child_exec_worker(unsigned int idx, const char *cfg_file, int snap_f
 		argv[n++] = (char *)"--aworker-snapshot-fd";
 		argv[n++] = snapstr;
 	}
+	if (g_supervisor) {
+		/* bsc-aworker only (B5): the worker names its incarnation in its log lines. */
+		argv[n++] = (char *)"--aworker-incarnation";
+		argv[n++] = incstr;
+	}
 	argv[n] = NULL;
 
 	/* Same command line and environment as execv() would use, but from the binary image we were started from. */
@@ -1429,7 +1449,7 @@ static void child_exec_worker(unsigned int idx, const char *cfg_file, int snap_f
 	else
 		execv(g_exec_path, argv);
 	/* exec only returns on failure, and we have no usable logging left here. */
-	fprintf(stderr, "osmo-bsc: aworker %u: cannot execute '%s'%s: %s\n", idx, g_exec_path,
+	fprintf(stderr, "%s: aworker %u: cannot execute '%s'%s: %s\n", aworker_program_name, idx, g_exec_path,
 		g_exec_fd >= 0 ? " (from the descriptor opened at startup)" : "", strerror(errno));
 	_exit(AWORKER_EXIT_CONFIG);
 }
@@ -1460,7 +1480,7 @@ static int worker_spawn(struct aworker *w)
 		if (rc < 0) {
 			char detail[sizeof(w->fail_detail)];
 			snprintf(detail, sizeof(detail), "its configuration snapshot is no longer the one made at startup"
-				 " (%s); not starting it from that. Restart osmo-bsc", strerror(-rc));
+				 " (%s); not starting it from that. Restart %s", strerror(-rc), aworker_program_name);
 			worker_fail(w, AWORKER_FAIL_CONFIG, detail);
 			return rc;
 		}
@@ -1472,14 +1492,14 @@ static int worker_spawn(struct aworker *w)
 
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sp) < 0) {
 		rc = -errno;
-		LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u: socketpair() failed: %s\n", w->idx, strerror(-rc));
+		LOGPAW(LOGL_ERROR, "aworker %u: socketpair() failed: %s\n", w->idx, strerror(-rc));
 		return rc;
 	}
 
 	pid = fork();
 	if (pid < 0) {
 		rc = -errno;
-		LOGP(aworker_log_cat, LOGL_ERROR, "aworker %u: fork() failed: %s\n", w->idx, strerror(-rc));
+		LOGPAW(LOGL_ERROR, "aworker %u: fork() failed: %s\n", w->idx, strerror(-rc));
 		close(sp[0]);
 		close(sp[1]);
 		return rc;
@@ -1487,7 +1507,7 @@ static int worker_spawn(struct aworker *w)
 
 	if (pid == 0) {
 		close(sp[0]);
-		child_exec_worker(w->idx, cfg_file, snap ? snap->fd : -1, sp[1], parent);
+		child_exec_worker(w->idx, cfg_file, snap ? snap->fd : -1, sp[1], parent, w->starts + 1);
 		/* not reached */
 	}
 
@@ -1575,10 +1595,10 @@ static void ownership_log(const struct aworker_pool *pool)
 	for (id = 0; id < AWORKER_POOL_MAX_CS7_ID; id++) {
 		int w = pool->own.owner[id];
 		if (w >= 0 && pool->cfg.has_cs7_instance[w])
-			LOGP(aworker_log_cat, LOGL_INFO, "cs7 instance %u is expected to be owned by worker %d ('worker %d"
+			LOGPAW(LOGL_INFO, "cs7 instance %u is expected to be owned by worker %d ('worker %d"
 			     " cs7-instance %u')\n", id, w, w, id);
 		else if (w >= 0)
-			LOGP(aworker_log_cat, LOGL_INFO, "cs7 instance %u is expected to be owned by worker %d ('%s', line"
+			LOGPAW(LOGL_INFO, "cs7 instance %u is expected to be owned by worker %d ('%s', line"
 			     " %u)\n", id, w, pool->cfg.cfg_file[w], pool->own.lineno[id]);
 	}
 }
@@ -1614,13 +1634,13 @@ static int inline_source_check(void)
 	if (!g_main.pool || !m || !aworker_cfg_model_is_inline(m)) {
 		for (i = 0; i < g_cfg.num_workers && !g_cfg.has_cs7_instance[i]; i++)
 			;
-		LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': worker %u uses the inline form ('worker %u"
+		LOGPAW(LOGL_FATAL, "'a-worker-pool': worker %u uses the inline form ('worker %u"
 		     " cs7-instance %u'), but no configuration file using that form was read at startup: there is"
 		     " nothing to start its workers from\n", i, i, g_cfg.cs7_instance[i]);
 		return -EINVAL;
 	}
 	if (m->num_workers != g_cfg.num_workers) {
-		LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': %u worker(s) configured, but '%s' as read at startup"
+		LOGPAW(LOGL_FATAL, "'a-worker-pool': %u worker(s) configured, but '%s' as read at startup"
 		     " declares 'workers %u'; refusing to start workers from a configuration that differs from it\n",
 		     g_cfg.num_workers, g_main.path, m->num_workers);
 		return -EINVAL;
@@ -1630,7 +1650,7 @@ static int inline_source_check(void)
 
 		if (g_cfg.cfg_file[i] || !g_cfg.has_cs7_instance[i] || !d->inl || d->file
 		    || d->cs7_id != g_cfg.cs7_instance[i]) {
-			LOGP(aworker_log_cat, LOGL_FATAL, "'a-worker-pool': worker %u is configured differently from"
+			LOGPAW(LOGL_FATAL, "'a-worker-pool': worker %u is configured differently from"
 			     " '%s' as read at startup (there: %s%u); refusing to start workers from a configuration that"
 			     " differs from it\n", i, g_main.path, d->inl ? "cs7-instance " : "no cs7-instance, ",
 			     d->inl ? d->cs7_id : 0);
@@ -1658,7 +1678,7 @@ static int snapshots_make(struct aworker_pool *pool)
 		rc = aworker_snapshot_create(pool, i, view, len, &pool->snap[i]);
 		talloc_free(view);
 		if (rc < 0) {
-			LOGP(aworker_log_cat, LOGL_FATAL, "aworker %u: cannot make its configuration snapshot from '%s':"
+			LOGPAW(LOGL_FATAL, "aworker %u: cannot make its configuration snapshot from '%s':"
 			     " %s\n", i, g_main.path, strerror(-rc));
 			return rc;
 		}
@@ -1667,11 +1687,11 @@ static int snapshots_make(struct aworker_pool *pool)
 		s->fd = fd_above_stdio(s->fd, true);
 		if (s->fd < 0) {
 			rc = -errno;
-			LOGP(aworker_log_cat, LOGL_FATAL, "aworker %u: cannot move its configuration snapshot above the"
+			LOGPAW(LOGL_FATAL, "aworker %u: cannot move its configuration snapshot above the"
 			     " standard streams: %s\n", i, strerror(-rc));
 			return rc;
 		}
-		LOGP(aworker_log_cat, LOGL_INFO, "aworker %u: configuration snapshot made from '%s': %zu octets, %s\n",
+		LOGPAW(LOGL_INFO, "aworker %u: configuration snapshot made from '%s': %zu octets, %s\n",
 		     i, g_main.path, s->len, s->fallback ? "fallback file (see the WARNING)" : "sealed memfd");
 	}
 	return 0;
@@ -1700,7 +1720,7 @@ int aworker_pool_start(void *ctx)
 		if (!g_cfg.cfg_file[i] && g_cfg.has_cs7_instance[i])
 			continue;	/* inline form: checked against the file below */
 		if (!g_cfg.cfg_file[i]) {
-			LOGP(aworker_log_cat, LOGL_FATAL,
+			LOGPAW(LOGL_FATAL,
 			     "'a-worker-pool': 'workers %u' is configured but worker %u has no config file."
 			     " Add 'worker %u config-file FILE'.\n", g_cfg.num_workers, i, i);
 			return -EINVAL;
@@ -1737,7 +1757,7 @@ int aworker_pool_start(void *ctx)
 		}
 	}
 
-	LOGP(aworker_log_cat, LOGL_NOTICE, "A-worker pool started: %u worker(s), on-worker-failure %s,"
+	LOGPAW(LOGL_NOTICE, "A-worker pool started: %u worker(s), on-worker-failure %s,"
 	     " startup-timeout %u s, restart-delay %u s (max %u s), stable-time %u s, max-restarts %u window %u s\n",
 	     pool->num, get_value_string(aworker_failure_policy_names, pool->cfg.on_failure),
 	     pool->cfg.startup_timeout, pool->cfg.restart_delay,
@@ -2004,8 +2024,9 @@ int aworker_pool_reset_worker(unsigned int idx)
 	LOGW(w, LOGL_NOTICE, "reset by the operator (was FAILED: %s: %s); starting it again\n",
 	     aworker_fail_reason_name(w->fail_reason), w->fail_detail);
 	if (g_pool->snap[idx])
-		LOGW(w, LOGL_NOTICE, "it starts from its configuration snapshot made when osmo-bsc started: a change of"
-		     " '%s' since then takes effect only when osmo-bsc is restarted\n", g_main.path);
+		LOGW(w, LOGL_NOTICE, "it starts from its configuration snapshot made when %s started: a change of"
+		     " '%s' since then takes effect only when %s is restarted\n", aworker_program_name, g_main.path,
+		     aworker_program_name);
 	w->fail_reason = AWORKER_FAIL_NONE;
 	w->fail_detail[0] = '\0';
 	w->failed_at = 0;

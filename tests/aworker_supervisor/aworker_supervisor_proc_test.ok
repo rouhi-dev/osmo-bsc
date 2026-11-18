@@ -10,6 +10,8 @@ O: options; the worker role's internal options (B4)
   --aworker-index '+1': exit 2
   --aworker-index 16: exit 2
   -c with the worker role: exit 2
+  --aworker-incarnation 0: exit 2
+  --aworker-incarnation 'x': exit 2
   valid worker options, snapshot descriptor not open: exit 66
 C: configuration errors of the Supervisor role (exit 1)
   no such file: exit 1
@@ -21,10 +23,12 @@ L: the pool run by the Supervisor
   both workers READY: children of the Supervisor, its own image, started with --aworker-fd, --aworker-index and --aworker-snapshot-fd
   the Supervisor holds the two sealed snapshots and not the file; it has no network socket at all (no VTY, CTRL or other server)
   a running worker holds no snapshot and not the file
+  log lines: the Supervisor's begin 'aworker-supervisor: ', a worker's 'aworker <N> inc <start>: '; the IPC peer is 'bsc-aworker'; no line names osmo-bsc
   the file moved away, another put in its place, worker 1 SIGKILLed: its new process READY with the original point code; nothing opened the file; worker 0 untouched
   SIGTERM: both workers got GOODBYE and exited 0 by themselves; the Supervisor exited 0
-  'max-restarts 2 window 300': worker 1 lost twice is FAILED (restart-limit) and not restarted; worker 0 untouched
+  'max-restarts 2 window 300': worker 1 lost twice is FAILED (restart-limit) and not restarted; worker 0 untouched; the message says to restart bsc-aworker (no reset command)
   SIGTERM with a FAILED worker: exit 0, worker 0 gone
   the Supervisor SIGKILLed: both workers end with it
   the executable replaced on disk: worker 0's new process runs the image the Supervisor was started from
+  'log file' configured: the Supervisor writes its lines there; its workers hold no descriptor of it and their lines are on stderr only
 PASSED

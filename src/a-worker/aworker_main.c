@@ -27,8 +27,14 @@
  * it yet (sessions are S2-4 onwards); its workers leave SSN 254 unbound.
  *
  * Worker (internal, not for manual use): a process the Supervisor starts with --aworker-fd N --aworker-index I
- * --aworker-snapshot-fd M (decision B4: the contract of osmo-bsc's inline-form workers, strictly validated). It reads
- * its snapshot, checks it, parses it and runs its cs7 instance (aworker_run()). These options are not in --help.
+ * --aworker-snapshot-fd M (decision B4: the contract of osmo-bsc's inline-form workers, strictly validated), and
+ * --aworker-incarnation K, its start number, which only bsc-aworker passes (B5: its lines begin "aworker <idx> inc
+ * <K>: "). It reads its snapshot, checks it, parses it and runs its cs7 instance (aworker_run()). These options are
+ * not in --help.
+ *
+ * Log lines (D-S10, B2, B5): the Supervisor keeps the log targets of its view, 'log file' included, and marks its
+ * pool lines "aworker-supervisor: ". Workers have no 'log file' (D-2) and log to the stderr they inherit from the
+ * Supervisor.
  *
  * Only libaworker and the Osmocom libraries are linked: nothing of osmo-bsc. */
 
@@ -73,6 +79,7 @@ static int g_aworker_fd = -1;
 static const char *g_aworker_index;
 static int g_snapshot_fd = -1;
 static bool g_aworker_config;
+static const char *g_incarnation;
 
 static const struct log_info log_info = {
 	.cat = osmo_bsc_categories,
@@ -139,6 +146,7 @@ static void handle_options(int argc, char **argv)
 		{ "aworker-index", 1, 0, 2 },
 		{ "aworker-snapshot-fd", 1, 0, 3 },
 		{ "aworker-config", 1, 0, 4 },
+		{ "aworker-incarnation", 1, 0, 5 },
 		{ 0, 0, 0, 0 }
 	};
 	int c;
@@ -179,6 +187,9 @@ static void handle_options(int argc, char **argv)
 		case 4:
 			g_aworker_config = true;
 			break;
+		case 5:
+			g_incarnation = optarg;
+			break;
 		default:
 			fprintf(stderr, "bsc-aworker: invalid option; see 'bsc-aworker --help'\n");
 			exit(2);
@@ -192,7 +203,7 @@ static void handle_options(int argc, char **argv)
 
 static bool worker_role_requested(void)
 {
-	return g_aworker_fd >= 0 || g_aworker_index || g_snapshot_fd >= 0 || g_aworker_config;
+	return g_aworker_fd >= 0 || g_aworker_index || g_snapshot_fd >= 0 || g_aworker_config || g_incarnation;
 }
 
 /* Worker role: check the internal options strictly (B4), then run; never returns. */
@@ -228,6 +239,19 @@ static void worker_role(void)
 			" only its snapshot\n");
 		exit(2);
 	}
+	/* Optional (B5): the start number the Supervisor gave this process, for its log lines. Digits only, 1 or more. */
+	if (g_incarnation) {
+		long inc;
+		end = NULL;
+		errno = 0;
+		inc = g_incarnation[0] >= '0' && g_incarnation[0] <= '9' ? strtol(g_incarnation, &end, 10) : -1;
+		if (errno || !end || *end || inc < 1 || inc > UINT_MAX) {
+			fprintf(stderr, "bsc-aworker: --aworker-incarnation needs a number from 1, not '%s'\n",
+				g_incarnation);
+			exit(2);
+		}
+		aworker_incarnation = (unsigned int)inc;
+	}
 	aworker_run(g_ctx, g_aworker_fd, (unsigned int)idx, NULL, g_snapshot_fd);
 }
 
@@ -256,6 +280,8 @@ static void signal_handler(int signum)
 
 int main(int argc, char **argv)
 {
+	/* Names itself in the A-worker messages and the IPC HELLO (B5). */
+	aworker_program_name = "bsc-aworker";
 	g_ctx = talloc_named_const(NULL, 1, "bsc-aworker");
 	msgb_talloc_ctx_init(g_ctx, 0);
 	osmo_xua_msg_tall_ctx_init(g_ctx);
@@ -284,7 +310,8 @@ int main(int argc, char **argv)
 	if (worker_role_requested())
 		worker_role();	/* never returns */
 
-	/* Supervisor role. */
+	/* Supervisor role: every line of the pool is marked as the Supervisor's (B5). */
+	aworker_log_prefix = "aworker-supervisor: ";
 	if (aworker_pool_supervisor_read_config(g_config_file) < 0) {
 		fprintf(stderr, "bsc-aworker: the configuration is refused. exiting.\n");
 		exit(1);

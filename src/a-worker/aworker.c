@@ -70,6 +70,7 @@ struct aworker_wuser {
 static struct {
 	void *ctx;
 	unsigned int idx;
+	char prefix[48];		/*!< of every LOGAW() line, set first thing in aworker_run() */
 	const char *cfg_file;		/*!< legacy config file, or the snapshot's name (diagnostics) */
 	bool snapshot;			/*!< snapshot mode: the configuration is snap_text, not the file */
 	const char *snap_text;
@@ -84,7 +85,8 @@ static struct {
 	struct msgb *cs7_info;
 } g_w;
 
-#define LOGAW(lvl, fmt, args...) LOGP(aworker_log_cat, lvl, "aworker %u: " fmt, g_w.idx, ## args)
+/* "aworker <idx>: ", or with a known incarnation (bsc-aworker, B5) "aworker <idx> inc <n>: ". */
+#define LOGAW(lvl, fmt, args...) LOGP(aworker_log_cat, lvl, "%s" fmt, g_w.prefix, ## args)
 #define LOGWU(wu, lvl, fmt, args...) \
 	LOGP(aworker_log_cat, lvl, "aworker %u user '%s' (cs7 %u ssn %u, ref %u): " fmt, g_w.idx, (wu)->name, \
 	     (wu)->cs7_id, (wu)->ssn, (wu)->user_ref, ## args)
@@ -770,7 +772,7 @@ void aworker_run(void *ctx, int fd, unsigned int worker_idx, const char *cfg_fil
 	struct aworker_ipc_link_cfg cfg = {
 		.role = AWORKER_IPC_ROLE_WORKER,
 		.worker_idx = (uint16_t)worker_idx,
-		.ident = "osmo-bsc",
+		.ident = aworker_program_name,
 		.log_cat = aworker_log_cat,
 	};
 	int rc;
@@ -778,6 +780,10 @@ void aworker_run(void *ctx, int fd, unsigned int worker_idx, const char *cfg_fil
 	g_w.ctx = talloc_named_const(ctx, 0, "aworker");
 	OSMO_ASSERT(g_w.ctx);
 	g_w.idx = worker_idx;
+	if (aworker_incarnation)
+		snprintf(g_w.prefix, sizeof(g_w.prefix), "aworker %u inc %u: ", worker_idx, aworker_incarnation);
+	else
+		snprintf(g_w.prefix, sizeof(g_w.prefix), "aworker %u: ", worker_idx);
 	g_w.cfg_file = cfg_file ? cfg_file : talloc_asprintf(g_w.ctx, "configuration snapshot (fd %d)", snapshot_fd);
 	OSMO_ASSERT(g_w.cfg_file);
 	g_w.own_cs7 = -1;

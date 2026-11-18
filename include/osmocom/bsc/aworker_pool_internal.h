@@ -122,7 +122,7 @@ struct aworker_pool {
 };
 
 #define LOGW(w, lvl, fmt, args...) \
-	LOGP(aworker_log_cat, lvl, "aworker %u (pid %ld): " fmt, (w)->idx, (long)(w)->pid, ## args)
+	LOGPAW(lvl, "aworker %u (pid %ld): " fmt, (w)->idx, (long)(w)->pid, ## args)
 
 /* The worker that owns cs7 instance cs7_id, or NULL if no ready worker reported it. */
 static inline struct aworker *worker_by_cs7(struct aworker_pool *pool, uint32_t cs7_id)

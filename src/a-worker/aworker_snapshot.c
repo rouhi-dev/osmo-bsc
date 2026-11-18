@@ -188,7 +188,7 @@ static void report_leftovers(int dfd, const char *path)
 		if (fstatat(dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(st.st_mode)
 		    || st.st_uid != geteuid())
 			continue;
-		LOGP(aworker_log_cat, LOGL_NOTICE, "WARNING: %s/%s is left over from an earlier configuration snapshot of"
+		LOGPAW(LOGL_NOTICE, "WARNING: %s/%s is left over from an earlier configuration snapshot of"
 		     " uid %u (its process ended before removing it). It is not removed; remove it once no osmo-bsc or"
 		     " bsc-aworker of this user can be using it.\n", path, de->d_name, (unsigned int)geteuid());
 	}
@@ -311,7 +311,7 @@ static int fallback_in(int dfd, const char *text, size_t len, char *why, size_t 
 
 	fd = fallback_file(pd, false, text, len, why2, sizeof(why2));
 	if (fd < 0) {
-		LOGP(aworker_log_cat, LOGL_INFO, "snapshot fallback: O_TMPFILE not usable (%s); creating a named file"
+		LOGPAW(LOGL_INFO, "snapshot fallback: O_TMPFILE not usable (%s); creating a named file"
 		     " instead\n", why2);
 		fd = fallback_file(pd, true, text, len, why, why_len);
 	}
@@ -344,7 +344,7 @@ static int fallback_snapshot(unsigned int idx, const char *text, size_t len, int
 			osmo_strlcpy(path, env, sizeof(path));
 			path[strcspn(path, ":")] = '\0';
 			if (path[0] != '/') {
-				LOGP(aworker_log_cat, LOGL_NOTICE, "worker %u: snapshot fallback: not using $RUNTIME_DIRECTORY"
+				LOGPAW(LOGL_NOTICE, "worker %u: snapshot fallback: not using $RUNTIME_DIRECTORY"
 				     " '%s': not an absolute path\n", idx, path);
 				continue;
 			}
@@ -353,7 +353,7 @@ static int fallback_snapshot(unsigned int idx, const char *text, size_t len, int
 		}
 		dfd = open_candidate(path, why, sizeof(why));
 		if (dfd < 0) {
-			LOGP(aworker_log_cat, LOGL_NOTICE, "worker %u: snapshot fallback: not using %s: %s\n", idx, path,
+			LOGPAW(LOGL_NOTICE, "worker %u: snapshot fallback: not using %s: %s\n", idx, path,
 			     why);
 			continue;
 		}
@@ -361,7 +361,7 @@ static int fallback_snapshot(unsigned int idx, const char *text, size_t len, int
 		fd = fallback_in(dfd, text, len, why, sizeof(why));
 		close(dfd);
 		if (fd >= 0) {
-			LOGP(aworker_log_cat, LOGL_NOTICE, "WARNING: worker %u: no sealed memfd for the configuration snapshot"
+			LOGPAW(LOGL_NOTICE, "WARNING: worker %u: no sealed memfd for the configuration snapshot"
 			     " (%s); using an unlinked, read-only file made in a private directory under %s instead. This is"
 			     " WEAKER than a sealed memfd: another process of the same user (uid %u) can reopen it through"
 			     " /proc/%d/fd/%d, make it writable and change it, or read it, and root can do anything. It is"
@@ -369,9 +369,9 @@ static int fallback_snapshot(unsigned int idx, const char *text, size_t len, int
 			     path, (unsigned int)geteuid(), (int)getpid(), fd);
 			return fd;
 		}
-		LOGP(aworker_log_cat, LOGL_NOTICE, "worker %u: snapshot fallback: failed in %s: %s\n", idx, path, why);
+		LOGPAW(LOGL_NOTICE, "worker %u: snapshot fallback: failed in %s: %s\n", idx, path, why);
 	}
-	LOGP(aworker_log_cat, LOGL_ERROR, "worker %u: no sealed memfd for the configuration snapshot (%s), and no fallback"
+	LOGPAW(LOGL_ERROR, "worker %u: no sealed memfd for the configuration snapshot (%s), and no fallback"
 	     " directory could be used: no snapshot\n", idx, strerror(-memfd_rc));
 	return -1;
 }

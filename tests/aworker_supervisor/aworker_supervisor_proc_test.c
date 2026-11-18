@@ -45,6 +45,7 @@
 #include <unistd.h>
 
 static const char *g_bin;
+static const char *g_extra_cfg = "";	/* appended to every configuration write_cfg() writes */
 static char g_dir[256];
 static unsigned int g_port;
 static unsigned int failures;
@@ -346,6 +347,7 @@ static void write_cfg(const char *p, unsigned int pc, const char *pool)
 		 " logging filter all 1\n"
 		 " logging color 0\n"
 		 " logging print category 1\n"
+		 " logging print file 0\n"
 		 " logging level set-all notice\n"
 		 " logging level aworker info\n"
 		 " logging filter imsi 001010000000001\n"
@@ -375,8 +377,9 @@ static void write_cfg(const char *p, unsigned int pc, const char *pool)
 		 "%s"
 		 "network\n"
 		 " network country code 001\n"
-		 " mobile network code 01\n",
-		 pc, g_port, pc + 1, g_port, pool ? pool : "");
+		 " mobile network code 01\n"
+		 "%s",
+		 pc, g_port, pc + 1, g_port, pool ? pool : "", g_extra_cfg);
 	write_path(p, text);
 }
 
@@ -471,6 +474,10 @@ static void part_o(void)
 		   "--aworker-snapshot-fd", "901", NULL }, 2, "worker index from 0 to 15");
 	expect_run("-c with the worker role", (const char *[]){ "-c", "x.cfg", "--aworker-fd", "900", "--aworker-index",
 		   "0", "--aworker-snapshot-fd", "901", NULL }, 2, "cannot be combined with the worker role");
+	expect_run("--aworker-incarnation 0", (const char *[]){ "--aworker-fd", "900", "--aworker-index", "0",
+		   "--aworker-snapshot-fd", "901", "--aworker-incarnation", "0", NULL }, 2, "needs a number from 1");
+	expect_run("--aworker-incarnation 'x'", (const char *[]){ "--aworker-fd", "900", "--aworker-index", "0",
+		   "--aworker-snapshot-fd", "901", "--aworker-incarnation", "x", NULL }, 2, "needs a number from 1");
 	expect_run("valid worker options, snapshot descriptor not open", (const char *[]){ "--aworker-fd", "900",
 		   "--aworker-index", "1", "--aworker-snapshot-fd", "901", NULL }, 66, "configuration snapshot refused");
 }
@@ -564,6 +571,23 @@ static void sup_stop(struct sup *s, bool report)
 		printf("  SIGTERM: both workers got GOODBYE and exited 0 by themselves; the Supervisor exited 0\n");
 }
 
+/* How often text names osmo-bsc, not counting source file names in a path below a directory 'osmo-bsc-...' (lines
+ * logged before a worker applied its logging configuration show the file name, and the worktree's directory may be
+ * called so). */
+static unsigned int names_osmo_bsc(const char *text)
+{
+	unsigned int n = 0;
+	const char *at;
+
+	for (at = strstr(text, "osmo-bsc"); at; at = strstr(at + 1, "osmo-bsc")) {
+		const char *slash = strchr(at, '/'), *space = strpbrk(at, " \n");
+		if (at > text && at[-1] == '/' && slash && (!space || slash < space))
+			continue;	/* a directory in a path */
+		n++;
+	}
+	return n;
+}
+
 static void part_l(void)
 {
 	struct sup s;
@@ -601,6 +625,20 @@ static void part_l(void)
 	printf("  a running worker holds no snapshot and not the file\n");
 	CHECK(strstr(slurp(s.log), "A-worker starting: pid") != NULL);
 
+	/* B5: the Supervisor's lines and the workers' lines say who wrote them; nothing says osmo-bsc. */
+	{
+		const char *l = slurp(s.log);
+		ok = strstr(l, "aworker-supervisor: A-worker pool started: 2 worker(s)")
+		     && strstr(l, "aworker-supervisor: aworker 0 (pid ") && strstr(l, "aworker-supervisor: aworker 1 (pid ")
+		     && strstr(l, "aworker 0 inc 1: A-worker starting: pid ") && strstr(l, "aworker 1 inc 1: A-worker starting: pid ")
+		     && strstr(l, "ident 'bsc-aworker')") && names_osmo_bsc(l) == 0;
+		CHECK(ok);
+		if (!ok)
+			printf("    log: %s\n", l);
+	}
+	printf("  log lines: the Supervisor's begin 'aworker-supervisor: ', a worker's 'aworker <N> inc <start>: '; the"
+	       " IPC peer is 'bsc-aworker'; no line names osmo-bsc\n");
+
 	/* L2: the file moved away and another one put in its place: a restarted worker reads the original snapshot,
 	 * and nobody opens the file. */
 	ino = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -623,6 +661,7 @@ static void part_l(void)
 	w1 = wait_ready(s.log, 1, mark, &pc, 20000);
 	CHECK(w1 && w1 != s.w[1] && pc == s.pc[1]);
 	CHECK(ready_pid(s.log, 0, 0, NULL) == w0 && alive(w0));
+	CHECK(strstr(slurp(s.log) + mark, "aworker 1 inc 2: A-worker starting: pid ") != NULL);
 	{
 		char ev[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
 		ssize_t n = read(ino, ev, sizeof(ev));
@@ -654,11 +693,14 @@ static void part_l(void)
 	kill(w1, SIGKILL);
 	snprintf(text, sizeof(text), "aworker 1 (pid %d): FAILED (restart-limit)", (int)w1);
 	CHECK(wait_log(s.log, text, 20000));
+	/* There is no reset command in the Supervisor yet (operator channel: S2-5): the message must not offer one. */
+	CHECK(strstr(slurp(s.log), "Fix the cause, then restart bsc-aworker.") != NULL);
+	CHECK(strstr(slurp(s.log), "a-worker-pool reset worker") == NULL);
 	sleep_ms(1500);
 	CHECK(ready_pid(s.log, 1, 0, NULL) == w1 && !alive(w1));
 	CHECK(ready_pid(s.log, 0, 0, NULL) == w0 && alive(w0));
 	printf("  'max-restarts 2 window 300': worker 1 lost twice is FAILED (restart-limit) and not restarted; worker"
-	       " 0 untouched\n");
+	       " 0 untouched; the message says to restart bsc-aworker (no reset command)\n");
 	kill(s.pid, SIGTERM);
 	{
 		int status = wait_end(s.pid, 20000);
@@ -700,6 +742,28 @@ static void part_l(void)
 		printf("  the executable replaced on disk: worker 0's new process runs the image the Supervisor was started"
 		       " from\n");
 		s.w[0] = w0;
+		sup_stop(&s, false);
+	}
+
+	/* L7: D-S10 (B2): the Supervisor keeps its 'log file' target; workers do not open it and log to stderr. */
+	{
+		char shared[300], extra[512];
+		const char *f;
+
+		path_of(shared, sizeof(shared), "shared.log");
+		snprintf(extra, sizeof(extra), "log file %s\n logging filter all 1\n logging color 0\n"
+			 " logging print category 1\n logging print file 0\n logging level set-all notice\n logging level aworker info\n", shared);
+		g_extra_cfg = extra;
+		CHECK(sup_start(&s, "l7", NULL, NULL));
+		g_extra_cfg = "";
+		CHECK(fdinfo(s.pid, shared).path_links == 1);
+		CHECK(fdinfo(s.w[0], shared).path_links == 0 && fdinfo(s.w[1], shared).path_links == 0);
+		f = slurp(shared);
+		CHECK(strstr(f, "aworker-supervisor: A-worker pool started") && strstr(f, "aworker-supervisor: aworker 1 (pid ")
+		      && !strstr(f, "A-worker starting"));
+		CHECK(strstr(slurp(s.log), "aworker 0 inc 1: A-worker starting") != NULL);
+		printf("  'log file' configured: the Supervisor writes its lines there; its workers hold no descriptor of it"
+		       " and their lines are on stderr only\n");
 		sup_stop(&s, false);
 	}
 }

@@ -2793,6 +2793,36 @@ static void inline_stop(void)
 	aworker_pool_stop();
 }
 
+/* Collect what earlier tests left to this process: it is a child subreaper (P2, P3), so their orphaned fake workers --
+ * including ones a stopped pool SIGKILLed but could not wait for any longer (P1, the start_run() children) -- become its
+ * children and may take a while to end (ASan). P21 and P27 check that stopping a pool leaves no child at all; that
+ * only means something once those are gone. One still alive after 15 s would be a real leak of an earlier test. */
+static void collect_strays(void)
+{
+	unsigned long end = now_ms() + 15000;
+	unsigned int n = 0;
+	int status;
+	pid_t pid;
+
+	for (;;) {
+		pid = __real_waitpid(-1, &status, WNOHANG);
+		if (pid > 0) {
+			n++;
+			continue;
+		}
+		if (pid < 0 && errno == ECHILD)
+			break;
+		if (now_ms() > end) {
+			printf("  (a child of an earlier test is still alive after 15 s)\n");
+			CHECK(false);
+			break;
+		}
+		usleep(10000);
+	}
+	/* stderr: how many there were depends on timing, the test's stdout must not. */
+	fprintf(stderr, "collected %u process(es) left over by earlier tests\n", n);
+}
+
 /* P21: the inline form starts each worker with its own sealed memfd, and with nothing else of the main process. */
 static void test_p21_snapshot_delivered(char **argv)
 {
@@ -2800,6 +2830,7 @@ static void test_p21_snapshot_delivered(char **argv)
 	int status;
 
 	printf("P21: workers of the inline form start from their sealed memfd snapshots\n");
+	collect_strays();
 	open_extra_fds();
 	CHECK(inline_configure() == 0);
 	CHECK(parent_snapshot_fds() == 0);

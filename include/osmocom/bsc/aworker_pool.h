@@ -124,6 +124,7 @@ enum aworker_fail_reason {
 	AWORKER_FAIL_RESTART_LIMIT,	/*!< lost again although 'max-restarts' was reached ('max-restarts N window S') */
 };
 const char *aworker_fail_reason_name(enum aworker_fail_reason reason);
+const char *aworker_state_name(enum aworker_state state);
 
 /*! A read-only snapshot of one worker, for status reporting and tests. */
 struct aworker_pool_worker_info {

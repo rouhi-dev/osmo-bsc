@@ -91,6 +91,12 @@ cat $abs_srcdir/aworker_session/aworker_wsplit_test.ok > expout
 AT_CHECK([$abs_top_builddir/tests/aworker_session/aworker_wsplit_test $abs_top_builddir/src/a-worker/bsc-aworker $abs_top_builddir/src/osmo-bsc/osmo-bsc], [], [expout], [ignore])
 AT_CLEANUP
 
+AT_SETUP([aworker_session])
+AT_KEYWORDS([aworker_session])
+cat $abs_srcdir/aworker_session/aworker_session_test.ok > expout
+AT_CHECK([$abs_top_builddir/tests/aworker_session/aworker_session_test $abs_top_builddir/src/a-worker/bsc-aworker], [], [expout], [ignore])
+AT_CLEANUP
+
 AT_SETUP([aworker_worker])
 AT_KEYWORDS([aworker_worker])
 cat $abs_srcdir/aworker_worker/aworker_worker_test.ok > expout

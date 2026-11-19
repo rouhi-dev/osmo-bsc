@@ -31,6 +31,7 @@ libaworker_la_SOURCES = \
 	aworker_ipc_link.c \
 	aworker_log.c \
 	aworker_pool.c \
+	aworker_session.c \
 	aworker_snapshot.c \
 	aworker_vty.c \
 	$(NULL)

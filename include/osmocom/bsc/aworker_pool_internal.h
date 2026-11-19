@@ -179,3 +179,15 @@ struct aworker_pool_user_hooks {
 };
 
 void aworker_pool_set_user_hooks(const struct aworker_pool_user_hooks *hooks);
+
+/*! What the life cycle tells the Supervisor's session side (aworker_session.c, S2-5). Set once by it; bsc-aworker
+ * only. */
+struct aworker_pool_session_hooks {
+	/*! A worker became READY (after the user side's worker_ready). */
+	void (*worker_ready)(struct aworker *w);
+	/*! A worker was lost (worker_lost(), before its process is collected; w->starts is still its incarnation). */
+	void (*worker_lost)(struct aworker *w);
+	/*! STATE received from a worker. */
+	void (*rx_state)(struct aworker *w, const struct aworker_ipc_msg *m);
+};
+void aworker_pool_set_session_hooks(const struct aworker_pool_session_hooks *hooks);

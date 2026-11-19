@@ -113,6 +113,11 @@ static const struct value_string fail_reason_names[] = {
 	{ 0, NULL }
 };
 
+const char *aworker_state_name(enum aworker_state state)
+{
+	return get_value_string(state_names, state);
+}
+
 const char *aworker_fail_reason_name(enum aworker_fail_reason reason)
 {
 	return get_value_string(fail_reason_names, reason);
@@ -599,6 +604,13 @@ void aworker_pool_set_user_hooks(const struct aworker_pool_user_hooks *hooks)
 	g_user_hooks = hooks;
 }
 
+static const struct aworker_pool_session_hooks *g_session_hooks;
+
+void aworker_pool_set_session_hooks(const struct aworker_pool_session_hooks *hooks)
+{
+	g_session_hooks = hooks;
+}
+
 struct aworker_pool *aworker_pool_get(void)
 {
 	return g_pool;
@@ -956,6 +968,8 @@ static void worker_lost(struct aworker *w, const char *why)
 	 * every SCCP connection of its cs7 instances is torn down by the users' 'unavailable' call-back. */
 	if (g_user_hooks)
 		g_user_hooks->worker_lost(w);
+	if (g_session_hooks)
+		g_session_hooks->worker_lost(w);
 
 	if (w->pid > 0) {
 		w->last_pid = w->pid;
@@ -1077,6 +1091,8 @@ static void handle_cs7_info(struct aworker *w, const struct aworker_ipc_msg *m)
 
 	if (g_user_hooks)
 		g_user_hooks->worker_ready(pool);
+	if (g_session_hooks)
+		g_session_hooks->worker_ready(w);
 }
 
 
@@ -1118,6 +1134,13 @@ static void link_rx_cb(struct aworker_ipc_link *link, const struct aworker_ipc_m
 		LOGW(w, LOGL_NOTICE, "worker says GOODBYE (reason %u)\n", m->u.goodbye_reason);
 		aworker_ipc_link_close(link);
 		return;
+	case AWORKER_IPC_MT_STATE:
+		/* Only the Supervisor's sessions ATTACH workers; anywhere else STATE is a protocol violation. */
+		if (g_session_hooks) {
+			g_session_hooks->rx_state(w, m);
+			return;
+		}
+		/* fall through */
 	default:
 		/* aworker_ipc_dec() already rejected everything the main process may not receive. */
 		LOGW(w, LOGL_ERROR, "unexpected %s from worker; closing link\n",
@@ -1158,6 +1181,8 @@ static int link_create(struct aworker *w, int fd)
 		.log_cat = aworker_log_cat,
 		/* This pool, and the start number of the process the link is for (starts counts it below). */
 		.id = { .boot_nonce = w->pool->boot_nonce, .incarnation = w->starts + 1 },
+		/* bsc-aworker (S2-5): its workers have split links, this is the control link; osmo-bsc's carries both. */
+		.classes = g_supervisor ? AWORKER_IPC_CLASS_CONTROL : 0,
 	};
 	int rc;
 

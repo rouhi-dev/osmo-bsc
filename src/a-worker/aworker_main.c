@@ -68,7 +68,9 @@
 
 #include <osmocom/bsc/aworker.h>
 #include <osmocom/bsc/aworker_log.h>
+#include <osmocom/bsc/aworker_canon.h>
 #include <osmocom/bsc/aworker_pool.h>
+#include <osmocom/bsc/aworker_session.h>
 
 static void *g_ctx;
 static const char *g_config_file = "osmo-bsc.cfg";
@@ -80,6 +82,8 @@ static const char *g_aworker_index;
 static int g_snapshot_fd = -1;
 static bool g_aworker_config;
 static const char *g_incarnation;
+/* Hidden test hooks (--aworker-test-hook NAME[=VALUE]; aworker_session.h), never used in production. */
+static struct aworker_session_test_hooks g_th = { .fence_signal = -1, .peer_uid = -1 };
 
 static const struct log_info log_info = {
 	.cat = osmo_bsc_categories,
@@ -147,6 +151,7 @@ static void handle_options(int argc, char **argv)
 		{ "aworker-snapshot-fd", 1, 0, 3 },
 		{ "aworker-config", 1, 0, 4 },
 		{ "aworker-incarnation", 1, 0, 5 },
+		{ "aworker-test-hook", 1, 0, 6 },
 		{ 0, 0, 0, 0 }
 	};
 	int c;
@@ -189,6 +194,20 @@ static void handle_options(int argc, char **argv)
 			break;
 		case 5:
 			g_incarnation = optarg;
+			break;
+		case 6:
+			if (!strncmp(optarg, "detach-delay-ms=", 16))
+				g_th.detach_delay_ms = atoi(optarg + 16);
+			else if (!strcmp(optarg, "no-pidfd"))
+				g_th.no_pidfd = true;
+			else if (!strncmp(optarg, "fence-signal=", 13))
+				g_th.fence_signal = atoi(optarg + 13);
+			else if (!strncmp(optarg, "peer-uid=", 9))
+				g_th.peer_uid = atol(optarg + 9);
+			else {
+				fprintf(stderr, "bsc-aworker: unknown test hook '%s'\n", optarg);
+				exit(2);
+			}
 			break;
 		default:
 			fprintf(stderr, "bsc-aworker: invalid option; see 'bsc-aworker --help'\n");
@@ -327,6 +346,24 @@ int main(int argc, char **argv)
 	osmo_init_ignore_signals();
 
 	aworker_pool_set_exec(argv[0], argc, argv);
+	/* The session socket (S2-5, N5), if configured: claimed before any worker starts, so that a second Supervisor
+	 * on the same socket never starts workers of its own. */
+	if (aworker_pool_cfg()->supervisor_socket) {
+		char why[256], *doc;
+		size_t len;
+
+		doc = aworker_pool_canon_document(g_ctx, &len, why, sizeof(why));
+		if (!doc) {
+			fprintf(stderr, "bsc-aworker: no canonical configuration document (%s). exiting.\n", why);
+			exit(1);
+		}
+		if (aworker_session_start(g_ctx, aworker_pool_cfg()->supervisor_socket, doc, len, &g_th) < 0) {
+			fprintf(stderr, "bsc-aworker: cannot claim the session socket. exiting.\n");
+			aworker_session_stop();
+			exit(1);
+		}
+		talloc_free(doc);
+	}
 	if (aworker_pool_start(g_ctx) < 0) {
 		fprintf(stderr, "bsc-aworker: cannot start the A-worker pool. exiting.\n");
 		exit(1);
@@ -335,7 +372,8 @@ int main(int argc, char **argv)
 	while (!osmo_select_shutdown_done())
 		osmo_select_main_ctx(0);
 
-	/* GOODBYE to every worker, then collect them (aworker_pool_stop()). */
+	/* The BSC told and the socket closed first; then GOODBYE to every worker, and collect them. */
+	aworker_session_stop();
 	aworker_pool_stop();
 	exit(aworker_pool_shutdown_was_fatal() ? 1 : 0);
 }

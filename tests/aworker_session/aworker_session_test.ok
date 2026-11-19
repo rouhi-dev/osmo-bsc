@@ -1,0 +1,74 @@
+X1: the socket (N5)
+  socket mode 0600, lock file 0600
+  a second Supervisor on the same socket exits 1 before starting workers
+  stopped: the socket is removed, the lock file stays
+  a leftover socket is removed once the lock is held
+  a regular file at the path: refused, left alone
+  a directory writable by its group: refused
+  a missing directory: refused, not created
+X2: a peer of another uid is refused before anything is read
+  our connection: closed by the Supervisor, handshake never done
+  an operator of that uid is refused the same way
+  STATUS before any session:
+    pool: 2 worker(s)
+    session: NONE
+    CLOSING entered: 0
+    worker 0: READY, incarnation 1, none
+    worker 1: READY, incarnation 1, none
+X3: SESSION_OPEN admitted: ACCEPT, WORKER_UP per worker, data links, ATTACHED
+  session 1, boot nonce set, WORKER_UP 2, incarnations 1/1, attached attached/attached
+  STATUS:
+    pool: 2 worker(s)
+    session: ACTIVE, id 1, fencing available, ECHO misses N
+    CLOSING entered: 0
+    worker 0: READY, incarnation 1, attached session 1
+    worker 1: READY, incarnation 1, attached session 1
+X4: a second BSC is busy; other refusals
+  second BSC: busy (session 1 is ACTIVE)
+  version 2: version (session protocol version 2 asked for; this Supervisor speaks 1)
+  document not sealed: bad-document (the document is not a memfd with all four seals)
+  document length: bad-document (the length differs)
+  another configuration: config-mismatch (line 7, part P (a-worker-pool): ours 'P restart-delay 1', theirs 'P restart-delay 2')
+X5: the operator cannot open a session on its connection; unknown operations close it
+  SESSION_OPEN after OP_REQUEST: connection closed
+  operation 9: connection closed by the Supervisor
+X6: session ids are never reused; 100 attach/detach cycles leave the Supervisor's descriptors as they were
+  next session: 2
+  100 cycles: Supervisor descriptors unchanged
+X7: an UNRESPONSIVE BSC: nothing happens to the workers, and no second BSC is admitted
+  second BSC while UNRESPONSIVE: busy (session 103 is UNRESPONSIVE)
+  STATUS while the BSC is stopped:
+    pool: 2 worker(s)
+    session: UNRESPONSIVE, id 103, fencing available, ECHO misses N
+    CLOSING entered: 102
+    worker 0: READY, incarnation 1, attached session 103
+    worker 1: READY, incarnation 1, attached session 103
+  answering again: ACTIVE
+X8: fencing: SIGKILL through the pidfd, exit confirmed, CLOSING once, then a new BSC is admitted
+  FENCE_SESSION: rc 0, fenced (exit confirmed, or its EOF first)
+  FENCE_SESSION without a session: rc -2 (no session to fence (CLOSED))
+  a new BSC: admitted
+X10: a worker lost: WORKER_DOWN for it only; its replacement is attached again
+  WORKER_DOWN: worker 0 0, worker 1 1 (lost); WORKER_UP for worker 1 incarnation 2
+X11: SESSION_CLOSE immediately followed by EOF: CLOSING entered once
+  exactly one more CLOSING (was 106)
+X9: the BSC is SIGKILLed: each worker sees EOF on its data link by itself (DETACH delayed by 3 s)
+  worker 0: its data endpoint is held by 1 process (the worker), the BSC end by the BSC only
+  worker 1: its data endpoint is held by 1 process (the worker), the BSC end by the BSC only
+  both workers reported data-eof within 2.5 s (the delayed DETACH was not needed)
+  afterwards nobody holds either end
+X9b: SESSION_OPEN while the last session is CLOSING (its DETACHes delayed): busy
+  a new BSC: busy (the last session is CLOSING)
+  then the delayed DETACHes close the workers' data links: CLOSED
+X12: fencing refused without a pidfd: the session is left as it is
+  FENCE_SESSION: rc -95 (not supported)
+X13: fencing not confirmed: FENCE_FAILED, nothing admitted
+  FENCE_SESSION: rc -110 (FENCE_FAILED)
+  a second BSC: busy (session 1 is FENCING (FENCE_FAILED))
+  the BSC's end then closes it
+X14: operator RESET_WORKER and POOL_SHUTDOWN; the BSC is told
+  RESET_WORKER 0: rc -16 (the worker is not FAILED; nothing to reset)
+  POOL_SHUTDOWN: rc 0 (shutting the pool down)
+  the BSC got SESSION_CLOSE(shutdown)
+  the Supervisor exits 0; socket removed
+PASSED

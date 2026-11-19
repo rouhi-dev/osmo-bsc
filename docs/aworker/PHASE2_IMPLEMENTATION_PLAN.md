@@ -11,9 +11,10 @@ below). Baseline: `a-worker-pool` at `e54578f2c` (Phase 1).
 > S1 is closed and accepted (uncommitted on `fa01448ea`). The S2-0 review (§14) records the approved decisions, the
 > implementation subphases S2-1 … S2-8 and their mapping to the phases of §13.
 >
-> **Status (2026-11-18):** S1, S2-1 and S2-2 are closed and accepted (S2-2 record: §14.5). S2-3, the standalone
-> Supervisor `bsc-aworker`, is implemented and verified (§14.6), and so is S2-4, IPC protocol 2.0 with descriptor
-> passing (§14.7); S2-5 … S2-8 have not started. The executable name is `bsc-aworker` (decision B3).
+> **Status (2026-11-19):** S1, S2-1 and S2-2 are closed and accepted (S2-2 record: §14.5). S2-3, the standalone
+> Supervisor `bsc-aworker` (§14.6), and S2-4, IPC protocol 2.0 with descriptor passing (§14.7), are accepted. S2-5,
+> sessions, the control/data split, fencing and the operator channel, is implemented and verified (§14.8); S2-6 … S2-8
+> have not started. The executable name is `bsc-aworker` (decision B3).
 
 ## 0. Approved decisions this plan implements
 
@@ -554,12 +555,14 @@ default is now 60 s; an explicit `startup-timeout` still replaces it. The manual
 * **S2-3** (standalone `bsc-aworker`): stages 1–5 implemented, verified and committed one by one; record in §14.6.
 * **S2-4** (IPC 2.0 and descriptor passing): stages 1–4 implemented, verified and committed one by one; record in
   §14.7.
+* **S2-5** (sessions, control/data split, fencing, operator channel): stages 1–6 implemented, verified and committed
+  one by one; record in §14.8.
 * **Commits:** `15c749359` "aworker: implement shared config and worker snapshots" (S1, S2-1 and S2-2 steps 1–6),
   `5f4483f0c` "aworker: integrate snapshots with pool workers" (step 7), `b4d890241` "aworker: record the config path
   in inline mode (D-8)" (step 8). The first one combines several subphases, against the "one change per commit" rule of
   §13.1, by the project owner's decision: they share files and dependencies, and a split commit would not build.
   Pushed to `origin` on 2026-11-17 (`e54578f2c..b4d890241`, together with the 2a-1 … 2a-5 commits). The later commits
-  (S2-2 steps 9–10, S2-3, S2-4) are local, not pushed.
+  (S2-2 steps 9–10, S2-3, S2-4, S2-5) are local, not pushed.
 
 ## 13. Revised plan: standalone Supervisor (S1 closed; S2 in progress, see §12 and §14)
 
@@ -728,7 +731,7 @@ S2-1.
 | D-S2 | Worker configuration snapshots as **sealed memfd**, with a **tested unlinked-file fallback** | APPROVED |
 | N3 | The **existing legacy worker argv contract** (`--aworker-fd N --aworker-index N --aworker-config FILE`, parsed by `osmo_bsc_main.c` and by the P-test fake worker) stays **unchanged**. The standalone executable may use its own role/argv contract | APPROVED |
 | N4 | **Split** the lifecycle public header from the BSC-specific (SCCP user) public header **during S2-3**. No mechanical move of other S1 functionality (`aworker_pool_check_main_cs7()`, `show`/`reset` VTY commands stay where S1 put them) | APPROVED |
-| D-S5 | Prefer **deterministic canonical-document comparison** over hash-only comparison, **subject to defining its exact contents** (CD-1, §14.4) | APPROVED (contents open) |
+| D-S5 | Prefer **deterministic canonical-document comparison** over hash-only comparison, **subject to defining its exact contents** (CD-1, §14.4) | APPROVED; contents decided 2026-11-18 (CD-1, §14.4) |
 | D-S6 | **No runtime management VTY server** in the Supervisor. **Configuration VTY command registration remains** where it is needed to parse the configuration | APPROVED |
 | D-S8 | `on-worker-failure shutdown` is a global configuration error in supervisor mode; legacy unchanged | APPROVED (unchanged) |
 | D-S11 | The standalone Supervisor architecture supersedes the earlier statements | APPROVED (unchanged) |
@@ -745,8 +748,8 @@ Decisions after the S2-2 implementation start, at the S2-3 design review (2026-1
 
 The S2-2 decisions (D-1 … D-13, SR, FD, U-1 … U-6 and the final decisions of 2026-11-17) are in §14.5.
 
-**Not approved, still open:** D-S9, D-S12, N5, and the canonical document contents (CD-1). D-S3 and D-S4 remain as
-before (§14.4). D-S10 is resolved by B2.
+**Not approved, still open:** D-S9. D-S12, N5 and the canonical document contents (CD-1) were decided on 2026-11-18,
+before S2-5 (§14.4). D-S3 and D-S4 remain as before (§14.4). D-S10 is resolved by B2.
 
 ### 14.3 Subphases
 
@@ -909,6 +912,7 @@ not "do not merge".
   * descriptor accounting in the Supervisor across 100 attach/detach cycles (no growth);
   * operator channel: unauthorized client rejected (per N5), operator cannot change configuration.
 * **Acceptance:** all of the above; CD-1, D-S12 and N5 resolved before this subphase starts.
+* **Status:** CD-1, D-S12 and N5 decided 2026-11-18; implemented and verified; record, tests and limitations: §14.8.
 
 #### S2-6: detached-worker release
 
@@ -948,9 +952,9 @@ not "do not merge".
 
 | ID | Question | Current position | Must be resolved before | Required content / evidence |
 |---|---|---|---|---|
-| **CD-1** | Exact contents of the canonical configuration document (D-S5 contents; D-S3/D-S4 detail) | proposal SUP §4.6 (H/P/C); C is syntactic, not effective (see SUP §4.6 note) | **S2-5** | explicit values; effective defaults (explicit in P; how defaults of cs7 commands are represented in C); normalized ordering and representation; per-worker cs7 and transport configuration; pool and Supervisor settings; treatment of semantically identical but differently formatted or spelled configurations. Raw-file comparison is **not** acceptable. |
-| **D-S12** | Session ECHO keys and values | keys proposed, values open | **S2-5** (keys and initial values); values confirmed by S2-8 measurements | interval and miss threshold; state transitions per SUP §9.2 |
-| **N5** | Session/operator socket security | open | **S2-5** | socket directory and file ownership and mode; peer authorization (`SO_PEERCRED` uid/gid policy, session vs operator role); stale socket handling (only after acquiring the lock, never while another Supervisor holds it); lock semantics (`flock` exclusive non-blocking on a lock file for the Supervisor's lifetime; path); rejection of unauthorized local clients before any processing; abstract-namespace sockets excluded or justified. umask alone is **not** a sufficient policy. |
+| **CD-1** | Exact contents of the canonical configuration document (D-S5 contents; D-S3/D-S4 detail) | **DECIDED 2026-11-18:** the H/P/C document of SUP §4.6, C syntactic (a spelling difference is a safe false mismatch); implemented in S2-5 (`aworker_canon.h`) | **S2-5** | explicit values; effective defaults (explicit in P; how defaults of cs7 commands are represented in C); normalized ordering and representation; per-worker cs7 and transport configuration; pool and Supervisor settings; treatment of semantically identical but differently formatted or spelled configurations. Raw-file comparison is **not** acceptable. |
+| **D-S12** | Session ECHO keys and values | **DECIDED 2026-11-18:** `session-echo-interval` 2 s, `session-echo-misses` 3 (initial values; effects as SUP §9.2) | **S2-5** (keys and initial values); values confirmed by S2-8 measurements | interval and miss threshold; state transitions per SUP §9.2 |
+| **N5** | Session/operator socket security | **DECIDED 2026-11-18:** peers of the Supervisor's uid or root, both roles; `flock`ed `PATH.lock`; no `supervisor-socket`, no socket (SUP §9.4) | **S2-5** | socket directory and file ownership and mode; peer authorization (`SO_PEERCRED` uid/gid policy, session vs operator role); stale socket handling (only after acquiring the lock, never while another Supervisor holds it); lock semantics (`flock` exclusive non-blocking on a lock file for the Supervisor's lifetime; path); rejection of unauthorized local clients before any processing; abstract-namespace sockets excluded or justified. umask alone is **not** a sufficient policy. |
 | D-S10 | Logging | **resolved by B2** (SUP §7), with limitations; the durable test exists since S2-3 (`tests/aworker_logfile`) | — | `wq` mode unverified, no claim made |
 | D-S3 | Config mismatch → BSC exits | approved direction, detail proposed | S2-7 (behaviour); CD-1 first | — |
 | D-S9 | Detach release timeout | **unresolved** | S2-6 sign-off | §13.4 measurements |
@@ -1130,4 +1134,72 @@ main process is refused by both. Unchanged: P1–P30, T1–T12, `aworker_supervi
 * The boot nonce is random per pool start of either program; osmo-bsc's workers assert no identity (legacy).
 * Foreign control messages other than SCM_RIGHTS are handled (link closed, descriptors closed) but not exercised by a
   test: an AF_UNIX peer cannot send another type without the receiver enabling it.
+
+### 14.8 S2-5 implementation record (sessions, control/data split, fencing, operator channel)
+
+**Decisions taken before S2-5 (user, 2026-11-18):**
+* **N5:** a peer (BSC or operator) must have the Supervisor's effective uid, or be root, checked with `SO_PEERCRED`
+  before anything is read; `PATH.lock` held with an exclusive non-blocking `flock` for the Supervisor's lifetime, a
+  leftover socket removed only after that, absolute paths only (no abstract namespace), directories never created;
+  **without `supervisor-socket` there is no socket at all** (bsc-aworker as in S2-3).
+* **CD-1:** the H/P/C canonical document of SUP §4.6, part C syntactic.
+* **D-S12:** `session-echo-interval` 2 s, `session-echo-misses` 3 (initial values; S2-8 confirms them).
+
+| Stage | Content | Commit | Mutations (caught / run) |
+|---|---|---|---|
+| 1 | keys `supervisor-socket`, `session-echo-interval`, `session-echo-misses` (written only when set); canonical document and exact comparison (`aworker_canon.c`) | `0c8b8d3c7` | 15/15 (one after adding a case) |
+| 2 | IPC: roles Supervisor/client; STATE (control); SESSION_OPEN/ACCEPT/REJECT/CLOSE, WORKER_UP/DOWN/STATE, OP_REQUEST/RESULT (session class); TEXT | `6ec6acc21` | 15/15 (two after adding boundary cases) |
+| 3 | `bsc-aworker` workers: control link, ATTACH/DETACH, data link per session, minimal detach; osmo-bsc's workers unchanged | `92e725f1a` | 15/15 (one after adding the legacy worker case) |
+| 4 | the Supervisor's session socket (N5), session state machine, attach flow, session ECHO, fencing, operator operations | `ba5f36fd9` | 18/21; E8, E20 equivalent, E10 not observable (below) |
+| 5 | operator client `bsc-aworker --control PATH status \| reset-worker N \| fence-session \| pool-shutdown` | `d3754a59c` | 7/7 |
+| 6 | documentation (this record; SUP §4.6, §5.2, §8.1, §9 as implemented) | (this revision) | — |
+
+**Tests added:** `tests/aworker_canon` (N1–N8: both readers give the same document; defaults explicit; formatting,
+logging and unowned cs7 instances not part of it; every difference found at its line and part; file form refused);
+`tests/aworker_session/aworker_wsplit` (W1–W11: the real worker against a scripted Supervisor and BSC; ATTACH
+refused while attached and for another incarnation, the descriptor closed unused; DETACH idempotent; data-link EOF and
+handshake failures for another session or boot; the worker's descriptor count after each detach; osmo-bsc's legacy
+worker unchanged); `tests/aworker_session/aworker_session` (X1–X15: the real Supervisor, with the BSC scripted in this
+process or, where it must be stopped, killed or fenced, as a process of its own):
+* socket rules (mode, lock, second Supervisor refused before it starts workers, leftover socket, regular file, open or
+  missing directory), a foreign uid refused before any record (simulated with a test hook: no root needed);
+* admission and every refusal (busy, version, unsealed or wrong-length document, configuration mismatch naming line and
+  part); an operator connection cannot open a session; an unknown operation closes the connection;
+* session ids never reused; **100 attach/detach cycles without growth of the Supervisor's descriptors**;
+* UNRESPONSIVE (BSC stopped): workers untouched, a second BSC refused, ACTIVE again when it answers;
+* fencing: confirmed (SIGKILL through the pidfd; the dead BSC's EOF may win the race, as SUP §9.1 allows), refused
+  without a pidfd, FENCE_FAILED when the exit is not confirmed (nothing admitted until the BSC's end);
+* **process-level EOF (clarification A):** the BSC process is SIGKILLed while the Supervisor's DETACH is held back
+  3 s; both workers report data-EOF themselves within 2.5 s; before the kill, `/proc/*/fd` shows each worker's data
+  endpoint held by exactly one process (the worker, neither Supervisor nor BSC) and the BSC end by the BSC only; after
+  it, by nobody;
+* a worker lost: WORKER_DOWN for it only, the session and the other worker untouched, the replacement attached again;
+* SESSION_CLOSE followed at once by EOF: CLOSING entered exactly once; SESSION_OPEN while CLOSING: busy;
+* operator RESET_WORKER, POOL_SHUTDOWN (the BSC gets SESSION_CLOSE(shutdown), the socket is removed, the lock file
+  stays) and the `--control` client's exit codes.
+`tests/aworker_ipc` S1–S7, `aworker_cfg_write` and `aworker_pool.vty` were extended for the codec and the keys.
+
+**Mutation survivors (stage 4):** E8 (the guard at CLOSING's entry weakened) and E20 (admission without the
+"worker still detaching" check) are equivalent: every caller of the CLOSING entry is already guarded by the
+session's connection being freed in it, and CLOSED is only reached once every worker detached. A combined mutation
+that also keeps the connection (E8b) is caught. E10 (ATTACHED without waiting for WORKER_UP to be written) cannot be
+observed: the record is written long before the worker's STATE can arrive, and the link closes the Supervisor's copy
+of the BSC end on completion in either case.
+
+**Incident:** a mutation re-run was interrupted on 2026-11-18 and the host restarted; the run had left mutation E9 in
+the then uncommitted `aworker_session.c`. It was restored from the driver's saved original (SHA-256 verified), both
+builds were rebuilt, and the re-run was repeated detached. Nothing committed was affected.
+
+**Known limitations:**
+* osmo-bsc has no session client yet (S2-7): the BSC side is scripted in the tests; the same-pool warning of SUP
+  still applies.
+* Detach is minimal (S2-5): SCCP users are unbound, connections are not released first (S2-6, D-S9).
+* Worker ECHO (2a-6) stays gated after S7, so "worker ECHO loss affects only that worker" is not testable yet; what
+  is tested is that session ECHO never touches the workers and that a lost worker affects only itself.
+* WORKER_STATE is sent when a worker is ATTACHED; other pool state changes are visible through STATUS only.
+* The fencing confirmation bound is fixed (3 s). Between the BSC's `connect()` and `pidfd_open()` its pid could in
+  principle be reused; the Supervisor only keeps the pidfd if the connection is still alive afterwards.
+* `--aworker-test-hook` (detach delay, no pidfd, fence signal, peer uid) exists in the production binary; it is hidden,
+  needs a command-line option, and is only used by the tests.
+* The legacy and inline E2E and the VTY transcripts are run in the final verification (network namespace).
 

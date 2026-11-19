@@ -1341,7 +1341,10 @@ int main(int argc, char **argv)
 	OSMO_ASSERT(n > 0);
 	g_self[n] = '\0';
 
-	snprintf(g_dir, sizeof(g_dir), "%s/aworker_session.XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+	/* Socket paths must stay below sun_path's 108 octets: the longest made here is <dir>/missing/s.sock, so a TMPDIR
+	 * longer than 50 characters is not used. */
+	snprintf(g_dir, sizeof(g_dir), "%s/aworker_session.XXXXXX",
+		 getenv("TMPDIR") && strlen(getenv("TMPDIR")) <= 50 ? getenv("TMPDIR") : "/tmp");
 	OSMO_ASSERT(mkdtemp(g_dir));
 	snprintf(g_sock, sizeof(g_sock), "%s/s.sock", g_dir);
 	snprintf(g_cfg, sizeof(g_cfg), "%s/osmo-bsc.cfg", g_dir);

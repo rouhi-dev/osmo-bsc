@@ -64,8 +64,8 @@ static unsigned int failures;
 static const char *g_bin;
 static char g_self[512];
 static char g_dir[256];
-static char g_sock[300];
-static char g_cfg[300];
+static char g_sock[400];
+static char g_cfg[400];
 static char *g_doc;
 static size_t g_doc_len;
 
@@ -767,7 +767,7 @@ static void bsc_kill(struct bsc *b)
 
 static void x_socket(void)
 {
-	char d2[400], cfg2[400], sock2[400], t[AWORKER_IPC_MAX_TEXT + 1];
+	char d2[512], cfg2[512], sock2[512], t[AWORKER_IPC_MAX_TEXT + 1];
 	struct sup s1, s2;
 	struct stat st;
 	int fd;
@@ -819,7 +819,7 @@ static void x_socket(void)
 	/* the directory must be ours and writable by nobody else */
 	snprintf(d2, sizeof(d2), "%s/open", g_dir);
 	OSMO_ASSERT(mkdir(d2, 0700) == 0 && chmod(d2, 0770) == 0);
-	snprintf(sock2, sizeof(sock2), "%s/s.sock", d2);
+	snprintf(sock2, sizeof(sock2), "%.400s/s.sock", d2);
 	snprintf(cfg2, sizeof(cfg2), "%s/open.cfg", g_dir);
 	write_cfg(cfg2, sock2, NULL);
 	sup_start(&s2, cfg2, "x1-dir", NULL);
@@ -1234,6 +1234,89 @@ static void x_shutdown(void)
 	cli_free(&c);
 }
 
+/* bsc-aworker --control SOCK args...: exit code; stdout and stderr into out/err. */
+static int cli(const char *sock, const char *a1, const char *a2, char *out, size_t olen, char *err, size_t elen)
+{
+	char fo[400], fe[400];
+	int status, fd;
+	pid_t pid;
+	FILE *f;
+	size_t n;
+
+	snprintf(fo, sizeof(fo), "%s/cli.out", g_dir);
+	snprintf(fe, sizeof(fe), "%s/cli.err", g_dir);
+	pid = fork();
+	OSMO_ASSERT(pid >= 0);
+	if (pid == 0) {
+		fd = open(fo, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		dup2(fd, 1);
+		fd = open(fe, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		dup2(fd, 2);
+		close_range(3, ~0U, 0);
+		if (a2)
+			execl(g_bin, g_bin, "--control", sock, a1, a2, (char *)NULL);
+		else
+			execl(g_bin, g_bin, "--control", sock, a1, (char *)NULL);
+		_exit(98);
+	}
+	WAIT_FOR(waitpid(pid, &status, WNOHANG) == pid, 20000);
+	f = fopen(fo, "r");
+	n = f ? fread(out, 1, olen - 1, f) : 0;
+	out[n] = '\0';
+	if (f)
+		fclose(f);
+	f = fopen(fe, "r");
+	n = f ? fread(err, 1, elen - 1, f) : 0;
+	err[n] = '\0';
+	if (f)
+		fclose(f);
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void x_cli(void)
+{
+	char hookbuf[48], out[4096], err[1024], miss[400];
+	const char *peer_hook[2] = { hookbuf, NULL };
+	struct sup s;
+	int rc;
+
+	printf("X15: the operator client, bsc-aworker --control\n");
+	sup_start(&s, g_cfg, "x15", NULL);
+	CHECK(wait_status("worker 1: READY", 15000));
+	rc = cli(g_sock, "status", NULL, out, sizeof(out), err, sizeof(err));
+	printf("  status: exit %d, %s\n", rc, strstr(out, "pool: 2 worker(s)\nsession: NONE") ? "pool and session shown"
+	       : out);
+	CHECK(rc == 0 && strstr(out, "pool: 2 worker(s)\nsession: NONE") && strstr(out, "worker 1: READY"));
+	rc = cli(g_sock, "reset-worker", "0", out, sizeof(out), err, sizeof(err));
+	printf("  reset-worker 0: exit %d (%s)\n", rc, strstr(err, "not FAILED") ? "not FAILED" : err);
+	CHECK(rc == 1 && strstr(err, "not FAILED"));
+	rc = cli(g_sock, "reset-worker", "16", out, sizeof(out), err, sizeof(err));
+	printf("  reset-worker 16: exit %d\n", rc);
+	CHECK(rc == 2 && strstr(err, "needs a worker index"));
+	rc = cli(g_sock, "write-config", NULL, out, sizeof(out), err, sizeof(err));
+	printf("  write-config: exit %d (no such operation)\n", rc);
+	CHECK(rc == 2 && strstr(err, "unknown operation"));
+	snprintf(miss, sizeof(miss), "%s/missing.sock", g_dir);
+	rc = cli(miss, "status", NULL, out, sizeof(out), err, sizeof(err));
+	printf("  no Supervisor at the path: exit %d\n", rc);
+	CHECK(rc == 2 && strstr(err, "cannot connect"));
+	rc = cli(g_sock, "pool-shutdown", NULL, out, sizeof(out), err, sizeof(err));
+	printf("  pool-shutdown: exit %d (%s); Supervisor exit %d\n", rc, out[0] ? "answered" : err, sup_wait(&s, 15000));
+	CHECK(rc == 0 && strstr(out, "shutting the pool down"));
+
+	snprintf(hookbuf, sizeof(hookbuf), "peer-uid=%u", (unsigned int)geteuid() + 1);
+	sup_start(&s, g_cfg, "x15-uid", peer_hook);
+	{
+		struct stat st;
+		WAIT_FOR(stat(g_sock, &st) == 0, 10000);
+	}
+	pump_ms(300);
+	rc = cli(g_sock, "status", NULL, out, sizeof(out), err, sizeof(err));
+	printf("  as a user the Supervisor does not accept: exit %d\n", rc);
+	CHECK(rc == 3 && strstr(err, "same user or root only"));
+	sup_stop(&s);
+}
+
 int main(int argc, char **argv)
 {
 	struct sup s;
@@ -1296,6 +1379,7 @@ int main(int argc, char **argv)
 
 	x_fence_variants();
 	x_shutdown();
+	x_cli();
 
 	if (!failures) {
 		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_dir);

@@ -71,4 +71,12 @@ X14: operator RESET_WORKER and POOL_SHUTDOWN; the BSC is told
   POOL_SHUTDOWN: rc 0 (shutting the pool down)
   the BSC got SESSION_CLOSE(shutdown)
   the Supervisor exits 0; socket removed
+X15: the operator client, bsc-aworker --control
+  status: exit 0, pool and session shown
+  reset-worker 0: exit 1 (not FAILED)
+  reset-worker 16: exit 2
+  write-config: exit 2 (no such operation)
+  no Supervisor at the path: exit 2
+  pool-shutdown: exit 0 (answered); Supervisor exit 0
+  as a user the Supervisor does not accept: exit 3
 PASSED

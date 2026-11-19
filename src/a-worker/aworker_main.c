@@ -47,6 +47,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <osmocom/core/application.h>
 #include <osmocom/core/fsm.h>
@@ -69,6 +71,8 @@
 #include <osmocom/bsc/aworker.h>
 #include <osmocom/bsc/aworker_log.h>
 #include <osmocom/bsc/aworker_canon.h>
+#include <osmocom/bsc/aworker_ipc.h>
+#include <osmocom/bsc/aworker_ipc_link.h>
 #include <osmocom/bsc/aworker_pool.h>
 #include <osmocom/bsc/aworker_session.h>
 
@@ -82,6 +86,9 @@ static const char *g_aworker_index;
 static int g_snapshot_fd = -1;
 static bool g_aworker_config;
 static const char *g_incarnation;
+/* Operator client mode (S2-5): --control PATH OPERATION [ARG] */
+static const char *g_control;
+static bool g_log_level_given;
 /* Hidden test hooks (--aworker-test-hook NAME[=VALUE]; aworker_session.h), never used in production. */
 static struct aworker_session_test_hooks g_th = { .fence_signal = -1, .peer_uid = -1 };
 
@@ -120,6 +127,13 @@ static void print_help(void)
 	printf("  -s --disable-color		Disable coloring log in stderr.\n");
 	printf("  -T --timestamp		Print a timestamp in the debug output.\n");
 	printf("  -e --log-level number		Set a global loglevel.\n");
+	printf("\nOperator client (to a running Supervisor's 'supervisor-socket'; same user or root only):\n");
+	printf("  bsc-aworker --control PATH status		The pool, the BSC session and every worker.\n");
+	printf("  bsc-aworker --control PATH reset-worker N	Start a FAILED worker again.\n");
+	printf("  bsc-aworker --control PATH fence-session	Kill the attached BSC (SIGKILL) and close its session.\n");
+	printf("  bsc-aworker --control PATH pool-shutdown	Stop the Supervisor and its workers.\n");
+	printf("  Exit code: 0 done; 1 the Supervisor refused the operation; 2 usage or no connection; 3 the Supervisor\n"
+	       "  refused this client.\n");
 }
 
 static int parse_fd(const char *opt, const char *arg)
@@ -152,6 +166,7 @@ static void handle_options(int argc, char **argv)
 		{ "aworker-config", 1, 0, 4 },
 		{ "aworker-incarnation", 1, 0, 5 },
 		{ "aworker-test-hook", 1, 0, 6 },
+		{ "control", 1, 0, 7 },
 		{ 0, 0, 0, 0 }
 	};
 	int c;
@@ -179,6 +194,7 @@ static void handle_options(int argc, char **argv)
 			break;
 		case 'e':
 			log_set_log_level(osmo_stderr_target, atoi(optarg));
+			g_log_level_given = true;
 			break;
 		case 1:
 			g_aworker_fd = parse_fd("--aworker-fd", optarg);
@@ -209,15 +225,138 @@ static void handle_options(int argc, char **argv)
 				exit(2);
 			}
 			break;
+		case 7:
+			g_control = optarg;
+			break;
 		default:
 			fprintf(stderr, "bsc-aworker: invalid option; see 'bsc-aworker --help'\n");
 			exit(2);
 		}
 	}
-	if (optind < argc) {
+	if (optind < argc && !g_control) {
 		fprintf(stderr, "bsc-aworker: unexpected argument '%s'; see 'bsc-aworker --help'\n", argv[optind]);
 		exit(2);
 	}
+}
+
+/***********************************************************************
+ * Operator client (--control): one OP_REQUEST, its OP_RESULT printed
+ ***********************************************************************/
+
+static struct {
+	bool ready, closed, done;
+	int32_t rc;
+	char text[AWORKER_IPC_MAX_TEXT + 1];
+} g_cc;
+
+static void cc_ready(struct aworker_ipc_link *link, const struct aworker_ipc_hello *peer)
+{
+	g_cc.ready = true;
+}
+
+static void cc_rx(struct aworker_ipc_link *link, const struct aworker_ipc_msg *m)
+{
+	if (m->type != AWORKER_IPC_MT_OP_RESULT)
+		return;
+	g_cc.done = true;
+	g_cc.rc = m->u.op_result.rc;
+	snprintf(g_cc.text, sizeof(g_cc.text), "%.*s", m->text.len, (const char *)m->text.buf);
+}
+
+static void cc_closed(struct aworker_ipc_link *link, const struct aworker_ipc_link_close_info *info)
+{
+	g_cc.closed = true;
+}
+
+static const struct aworker_ipc_link_ops cc_ops = { .ready_cb = cc_ready, .rx_cb = cc_rx, .closed_cb = cc_closed };
+
+static void control_usage(const char *why)
+{
+	fprintf(stderr, "bsc-aworker: --control: %s; operations: status, reset-worker N (0..%d), fence-session,"
+		" pool-shutdown\n", why, AWORKER_POOL_MAX_WORKERS - 1);
+	exit(2);
+}
+
+static void control_mode(int argc, char **argv)
+{
+	struct aworker_ipc_link_cfg cfg = {
+		.role = AWORKER_IPC_ROLE_CLIENT, .worker_idx = 0, .pid = (uint32_t)getpid(), .ident = "bsc-aworker --control",
+		.log_cat = aworker_log_cat, .classes = AWORKER_IPC_CLASS_SESSION,
+	};
+	struct sockaddr_un sun = { .sun_family = AF_UNIX };
+	struct aworker_ipc_link *link;
+	struct timespec t0, t;
+	const char *what;
+	struct msgb *msg;
+	uint8_t op;
+	uint16_t arg = 0;
+	bool sent = false;
+	int fd;
+
+	if (optind >= argc)
+		control_usage("no operation given");
+	what = argv[optind];
+	if (!strcmp(what, "status") && optind + 1 == argc)
+		op = AWORKER_IPC_OP_STATUS;
+	else if (!strcmp(what, "fence-session") && optind + 1 == argc)
+		op = AWORKER_IPC_OP_FENCE_SESSION;
+	else if (!strcmp(what, "pool-shutdown") && optind + 1 == argc)
+		op = AWORKER_IPC_OP_POOL_SHUTDOWN;
+	else if (!strcmp(what, "reset-worker") && optind + 2 == argc) {
+		char *end = NULL;
+		long v = argv[optind + 1][0] >= '0' && argv[optind + 1][0] <= '9' ? strtol(argv[optind + 1], &end, 10) : -1;
+		if (!end || *end || v < 0 || v >= AWORKER_POOL_MAX_WORKERS)
+			control_usage("reset-worker needs a worker index");
+		op = AWORKER_IPC_OP_RESET_WORKER;
+		arg = (uint16_t)v;
+	} else
+		control_usage("unknown operation or wrong arguments");
+	if (strlen(g_control) >= sizeof(sun.sun_path))
+		control_usage("the socket path is too long");
+
+	/* Quiet unless asked for: the result is what this prints. */
+	if (!g_log_level_given)
+		log_set_log_level(osmo_stderr_target, LOGL_FATAL);
+	osmo_init_ignore_signals();
+	OSMO_STRLCPY_ARRAY(sun.sun_path, g_control);
+	fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+	if (fd < 0 || connect(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+		fprintf(stderr, "bsc-aworker: --control: cannot connect to %s: %s\n", g_control, strerror(errno));
+		exit(2);
+	}
+	if (aworker_ipc_link_alloc(&link, g_ctx, fd, &cfg, &cc_ops, NULL) < 0) {
+		fprintf(stderr, "bsc-aworker: --control: cannot set up the link\n");
+		exit(2);
+	}
+	osmo_clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (!g_cc.done && !g_cc.closed) {
+		osmo_clock_gettime(CLOCK_MONOTONIC, &t);
+		if (t.tv_sec - t0.tv_sec > 15) {
+			fprintf(stderr, "bsc-aworker: --control: no answer from %s\n", g_control);
+			exit(2);
+		}
+		if (g_cc.ready && !sent) {
+			sent = true;
+			if (aworker_ipc_enc_op_request(g_ctx, &msg, op, arg) < 0
+			    || aworker_ipc_link_send(link, msg, NULL) < 0) {
+				fprintf(stderr, "bsc-aworker: --control: cannot send the request\n");
+				exit(2);
+			}
+		}
+		osmo_select_main(1);
+		usleep(1000);
+	}
+	if (!g_cc.done) {
+		fprintf(stderr, "bsc-aworker: --control: the Supervisor at %s closed the connection%s\n", g_control,
+			g_cc.ready ? "" : " before the handshake: this user may not connect to it (same user or root only)");
+		exit(g_cc.ready ? 2 : 3);
+	}
+	if (g_cc.rc < 0) {
+		fprintf(stderr, "bsc-aworker: %s: %s (%s)\n", what, g_cc.text, strerror(-g_cc.rc));
+		exit(1);
+	}
+	printf("%s%s", g_cc.text, g_cc.text[0] && g_cc.text[strlen(g_cc.text) - 1] != '\n' ? "\n" : "");
+	exit(0);
 }
 
 static bool worker_role_requested(void)
@@ -328,6 +467,13 @@ int main(int argc, char **argv)
 	aworker_pool_vty_init(g_ctx);
 
 	handle_options(argc, argv);
+	if (g_control) {
+		if (worker_role_requested() || g_config_given) {
+			fprintf(stderr, "bsc-aworker: --control cannot be combined with -c or the worker role\n");
+			exit(2);
+		}
+		control_mode(argc, argv);	/* never returns */
+	}
 	if (worker_role_requested())
 		worker_role();	/* never returns */
 

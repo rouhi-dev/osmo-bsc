@@ -1201,5 +1201,14 @@ builds were rebuilt, and the re-run was repeated detached. Nothing committed was
   principle be reused; the Supervisor only keeps the pidfd if the connection is still alive afterwards.
 * `--aworker-test-hook` (detach delay, no pidfd, fence signal, peer uid) exists in the production binary; it is hidden,
   needs a command-line option, and is only used by the tests.
-* The legacy and inline E2E and the VTY transcripts are run in the final verification (network namespace).
+* `tests/aworker_cfg_write` (S2-2) fails when TMPDIR is long (about 70 characters): VTY's refusal text no longer
+  fits what the test reads. Pre-existing (the S2-4 binary fails the same way); `make check` does not set TMPDIR.
+
+**Final verification** (clean `git archive` builds of `a9f13caf4`, normal and ASan): no compiler warnings; `make check`
+25/25 on both; every A-worker test (13) run directly 3× on both builds, output identical to its golden, 0 sanitizer
+reports from any process; `real_s22.py` PASS on both (normal byte-identical to the S2-2 golden); VTY transcripts 5/5 on
+both, 0 sanitizer reports; E2E legacy 46/46 and inline 49/49 (network namespace, `run_in_netns.sh`; check lines as in
+S2-4); osmo-bsc `--help` identical to S2-4, `--vty-ref-xml` only adds the four new pool commands; `bsc-aworker` links
+no BSC code; harness files and the old build directories unchanged. A first pass found the session test's socket paths
+too long for a long TMPDIR (test fix `a9f13caf4`).
 
